@@ -6,10 +6,16 @@ interface Env {
 	AI_API_KEY?: string;
 	OPENAI_API_KEY?: string;
 	GEMINI_API_KEY?: string;
+	ADMIN_USER_IDS?: string;
+	ADMIN_USER_ID?: string;
 	account_id?: string;
 	AI_BASE_URL?: string;
 	AI_MODEL?: string;
 	BASE_URL?: string;
 	MODEL?: string;
+	LIMIT_SUMMARY?: string;
+	LIMIT_ASK?: string;
+	LIMIT_QUERY?: string;
+	USER_DAILY_LIMIT?: string;
 	DB: D1Database;
 }
