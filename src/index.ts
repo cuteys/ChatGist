@@ -42,6 +42,12 @@ import {
 	getUserQuotaStatus,
 	cleanOldQuotaRecords,
 } from './quota';
+import {
+	getDatabaseStorageStats,
+	cleanupOldMessagesAndImages,
+	checkAndEnforceStorageLimit,
+	formatBytes,
+} from './storage';
 
 export {
 	toSuperscript,
@@ -282,8 +288,28 @@ async function saveMessage(env: Env, params: {
 				params.groupName
 			)
 			.run();
-	} catch (e) {
+	} catch (e: any) {
 		console.error("Failed to save message:", e);
+		if (e?.message && /storage|full|limit/i.test(e.message)) {
+			try {
+				await checkAndEnforceStorageLimit(env, getTelegramToken(env), 300);
+				await env.DB.prepare(
+					`INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)`
+				)
+					.bind(
+						getMessageLink({ groupId: params.groupId, messageId: params.messageId }),
+						params.groupId,
+						Date.now(),
+						params.userName,
+						params.content,
+						params.messageId,
+						params.groupName
+					)
+					.run();
+			} catch (retryErr) {
+				console.error("Retry save message after emergency cleanup failed:", retryErr);
+			}
+		}
 	}
 }
 
@@ -513,30 +539,12 @@ export default {
 		await initWhitelistTables(env);
 		await initQuotaTables(env);
 
-		// 1. 定期清理：清理 3 天前的配额记录，保留各群最新 3000 条消息，以及清理 24 小时前的旧图片
+		// 1. 定期清理：清理 3 天前配额、各群保留最新 3000 条消息与 100 张图片，并监控存储容量
 		try {
 			await cleanOldQuotaRecords(env);
-			await env.DB.prepare(`
-				DELETE FROM Messages
-				WHERE id IN (
-					SELECT id
-					FROM (
-						SELECT
-							id,
-							ROW_NUMBER() OVER (
-								PARTITION BY groupId
-								ORDER BY timeStamp DESC
-							) as row_num
-						FROM Messages
-					) ranked
-					WHERE row_num > 3000
-				);
-			`).run();
-
-			await env.DB.prepare(`
-				DELETE FROM Messages
-				WHERE timeStamp < ? AND content LIKE 'data:image/%'
-			`).bind(Date.now() - 24 * 60 * 60 * 1000).run();
+			const { textCleaned, imagesCleaned } = await cleanupOldMessagesAndImages(env);
+			console.debug(`Scheduled cleanup completed: ${textCleaned} messages, ${imagesCleaned} images removed.`);
+			await checkAndEnforceStorageLimit(env, getTelegramToken(env));
 		} catch (e) {
 			console.error("Scheduled cleanup failed:", e);
 		}
@@ -718,32 +726,11 @@ export default {
 				const chat = ctx.update.message?.chat;
 				const isGroup = Boolean(chat && (chat.type === 'group' || chat.type === 'supergroup' || chat.type?.includes('group')));
 				if (isGroup) {
-					const groupStartText = escapeMarkdownV2(
-						`👋 你好！我是 ChatGist 群聊智能总结助手。\n\n` +
-						`我会在后台静默记录本群对话并为您提供服务：\n` +
-						`• /summary - 智能提取群聊重点与讨论脉络\n` +
-						`• /ask - 针对近期群聊提问（私聊推送答案）\n` +
-						`• /query - 检索群聊历史记录\n` +
-						`• /help - 查看完整指令指南`
-					);
-					await ctx.reply(groupStartText, "MarkdownV2");
+					await ctx.reply('👋 你好！我是 ChatGist 群聊智能总结助手。\n在群内发送 /summary 可概括消息，/help 查看详细帮助。');
 					return new Response('ok');
 				}
 
-				const privateStartText = escapeMarkdownV2(
-					`👋 你好！欢迎使用 ChatGist 群聊智能助手！\n\n` +
-					`我是专为 Telegram 群组设计的 AI 总结与智能问答助手：\n` +
-					`• 💡 智能概括：提炼群聊核心要点，长篇脉络一键折叠展开\n` +
-					`• 💬 智能问答：基于群聊记录精准回答，支持原消息直达溯源\n` +
-					`• 🛡️ 白名单机制：仅在授权群组中记录与服务，保护群隐私\n\n` +
-					`🚀 快速上手：\n` +
-					`1. 将机器人添加到您的 Telegram 群组中\n` +
-					`2. 授予机器人读取群消息权限（设为管理员）\n` +
-					`3. 超级管理员在群内发送 /addgroup 授权当前群组\n` +
-					`4. 在群内发送 /summary 或 /ask 即可开始体验！\n\n` +
-					`📖 随时发送 /help 可查看完整指令指南与管理说明。`
-				);
-				await ctx.reply(privateStartText, "MarkdownV2");
+				await ctx.reply('👋 你好！欢迎使用 ChatGist 群聊智能助手！\n将我添加到群组并设为管理员即可开始使用，发送 /help 可查看完整指南。');
 				return new Response('ok');
 			})
 			.on('help', async (ctx) => {
@@ -804,6 +791,29 @@ export default {
 				}
 
 				if (admin) {
+					try {
+						const storageStats = await getDatabaseStorageStats(env);
+						const percent = ((storageStats.totalBytes / storageStats.limitBytes) * 100).toFixed(1);
+
+						statusText += `\n💾 数据库存储统计：\n` +
+							`• 数据库总大小：${formatBytes(storageStats.totalBytes)} / 500 MB (${percent}%)\n` +
+							`• 统计群组总数：${storageStats.groupStats.length} 个\n`;
+
+						if (storageStats.groupStats.length > 0) {
+							statusText += `\n👥 各群组消息与空间明细：\n`;
+							storageStats.groupStats.forEach((g, idx) => {
+								const textCount = Math.max(0, g.totalCount - g.imageCount);
+								statusText += `${idx + 1}. 「${g.groupName}」\n` +
+									`   • 文本消息：${textCount} 条 | 图片：${g.imageCount} 张\n` +
+									`   • 占用空间：${formatBytes(g.estimatedBytes)}\n`;
+							});
+						} else {
+							statusText += `\n👥 各群组明细：暂无群组消息记录\n`;
+						}
+					} catch (e: any) {
+						console.error("Failed to get storage stats in /status:", e);
+					}
+
 					try {
 						const token = getTelegramToken(env);
 						const testRes = await fetch(`https://api.telegram.org/bot${token}/sendRichMessage`, {
@@ -1263,12 +1273,12 @@ export default {
 						let file: ArrayBuffer | null = null;
 
 						for (const p of candidatePhotos) {
-							if (p.file_size && p.file_size > 950 * 1024) {
+							if (p.file_size && p.file_size > 512 * 1024) {
 								continue;
 							}
 							try {
 								const buf = await bot.getFile(p.file_id).then((response) => response.arrayBuffer());
-								if (buf.byteLength <= 1024 * 1024) {
+								if (buf.byteLength <= 512 * 1024) {
 									file = buf;
 									break;
 								}

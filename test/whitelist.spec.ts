@@ -424,7 +424,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			expect(sentMessages.length).toBe(1);
 			const decoded = decodeURIComponent(sentMessages[0]).replace(/\+/g, ' ');
 			expect(decoded).toContain('欢迎使用 ChatGist 群聊智能助手');
-			expect(decoded).toContain('快速上手');
+			expect(decoded).toContain('/help 可查看完整指南');
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
