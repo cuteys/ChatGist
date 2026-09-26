@@ -153,9 +153,14 @@ function getBaseUrl(env: Env): string | undefined {
  */
 function getCompletionOptions(model: string) {
 	const isReasoning = model.startsWith("o1") || model.startsWith("o3");
+	if (isReasoning) {
+		return {
+			max_completion_tokens: 4096,
+			reasoning_effort: "none" as const,
+		};
+	}
 	return {
-		max_completion_tokens: 4096,
-		...(isReasoning ? { reasoning_effort: "none" as const } : {}),
+		max_tokens: 4096,
 	};
 }
 
@@ -549,13 +554,24 @@ export default {
 				return new Response("bad request", { status: 400 });
 			}
 
+			// 兼容编辑消息（将 edited_message 规整为 message，以便统一入库与处理）
+			if (!body?.message && body?.edited_message) {
+				body.message = body.edited_message;
+			}
+
+			// 过滤非消息类型的更新（如 my_chat_member、chat_member、message_reaction 等）
+			// 立即返回 200 OK 确认接收，防止 cf-workers-telegram-bot 将未知更新回退到 :message 并因缺少 message 对象报错
+			if (!body?.message) {
+				return new Response("ok");
+			}
+
 			// 兼容带 @botname 的指令（如 /status@chatgist_bot 归一化为 /status）
-			if (body?.message?.text && body.message.text.startsWith("/")) {
+			if (body.message?.text && body.message.text.startsWith("/")) {
 				body.message.text = body.message.text.replace(/^(\/[a-zA-Z0-9_]+)@[a-zA-Z0-9_]+/, "$1");
 			}
 
 			// 群组白名单拦截门禁
-			const msg = body?.message;
+			const msg = body.message;
 			const chat = msg?.chat;
 			const isGroup = chat && (chat.type === "group" || chat.type === "supergroup");
 
@@ -795,7 +811,7 @@ export default {
 				}
 
 				if (isGroup) {
-					const whitelisted = await isGroupWhitelisted(env, chat.id);
+					const whitelisted = await isGroupWhitelisted(env, chat.id.toString());
 					statusText += whitelisted ? '📍 当前群组：已授权（白名单）\n' : '📍 当前群组：未授权\n';
 				}
 
@@ -897,14 +913,16 @@ export default {
 				return new Response('ok');
 			})
 			.on("query", async (ctx) => {
-				const groupId = ctx.update.message!.chat.id;
-				const userId = ctx.update.message!.from!.id.toString();
+				const msg = ctx.update?.message;
+				if (!msg || !msg.chat) return new Response('ok');
+				const groupId = msg.chat.id.toString();
+				const userId = msg.from?.id?.toString() || "";
 				const quota = await checkAndIncrementQuota(env, userId, 'query');
 				if (!quota.allowed) {
 					await ctx.reply(`⚠️ 您今日的 /query 检索次数已达上限（${quota.current}/${quota.limit} 次）。配额将在次日 00:00 自动刷新。`);
 					return new Response('ok');
 				}
-				const messageText = ctx.update.message!.text || "";
+				const messageText = msg.text || "";
 				const keyword = messageText.split(/\s+/).slice(1).join(" ").trim();
 				if (!keyword) {
 					await ctx.reply('⚠️ 请输入要查询的关键词，例如：/query 部署');
@@ -949,8 +967,10 @@ export default {
 					await ctx.reply('未配置 AI_MODEL 环境变量，无法处理请求。');
 					return new Response('ok');
 				}
-				const groupId = ctx.update.message!.chat.id;
-				const userId = ctx.update.message!.from!.id;
+				const msg = ctx.update?.message;
+				if (!msg || !msg.chat) return new Response('ok');
+				const groupId = msg.chat.id.toString();
+				const userId = msg.from?.id?.toString() || "";
 				const quota = await checkAndIncrementQuota(env, userId, 'ask');
 				if (!quota.allowed) {
 					await ctx.reply(`⚠️ 您今日的 /ask 提问次数已达上限（${quota.current}/${quota.limit} 次）。配额将在次日 00:00 自动刷新。`);
@@ -1042,15 +1062,17 @@ export default {
 				return new Response('ok');
 			})
 			.on("summary", async (bot) => {
-				const groupId = bot.update.message!.chat.id;
-				const userId = bot.update.message?.from?.id?.toString() || "";
+				const msg = bot.update?.message;
+				if (!msg || !msg.chat) return new Response('ok');
+				const groupId = msg.chat.id.toString();
+				const userId = msg.from?.id?.toString() || "";
 				const quota = await checkAndIncrementQuota(env, userId, 'summary');
 				if (!quota.allowed) {
 					await bot.reply(`⚠️ 您今日的 /summary 总结次数已达上限（${quota.current}/${quota.limit} 次）。配额将在次日 00:00 自动刷新。`);
 					return new Response('ok');
 				}
 
-				const parts = (bot.update.message?.text || "").trim().split(/\s+/);
+				const parts = (msg.text || "").trim().split(/\s+/);
 				let summary = parts[1];
 				let isDefault = false;
 				if (!summary) {
@@ -1149,7 +1171,10 @@ export default {
 						'MarkdownV2'
 					);
 					if (!res?.ok) {
-						console.error("Failed to send reply", res?.statusText, await res?.text());
+						console.error("Failed to send reply with MarkdownV2, falling back to plain text:", res?.statusText, await res?.text());
+						// MarkdownV2 解析错误时降级为纯文本发送，避免机器人“无反应”
+						const plainText = replyContent.replace(/\\([_*[\]()~`>#+\-=|{}.!])/g, '$1');
+						await bot.reply(plainText);
 					}
 				}
 				catch (e) {
@@ -1160,14 +1185,17 @@ export default {
 				return new Response('ok');
 			})
 			.on(':message', async (bot) => {
-				if (!bot.update.message!.chat.type.includes('group')) {
+				const msg = bot.update?.message;
+				if (!msg || !msg.chat) {
+					return new Response('ok');
+				}
+				if (!msg.chat.type || !msg.chat.type.includes('group')) {
 					await bot.reply('我是群聊总结机器人，请将我添加到群组中使用。\n发送 /help 可查看指令说明。');
 					return new Response('ok');
 				}
 
 				switch (bot.update_type) {
 					case 'message': {
-						const msg = bot.update.message!;
 						const groupId = msg.chat.id.toString();
 						if (!(await isGroupWhitelisted(env, groupId))) {
 							return new Response('ok');
@@ -1190,7 +1218,7 @@ export default {
 						const userName = getUserName(msg);
 						try {
 							await env.DB.prepare(`
-								INSERT OR IGNORE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+								INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)`)
 								.bind(
 									getMessageLink({ groupId, messageId }),
 									groupId,
@@ -1209,7 +1237,6 @@ export default {
 
 					}
 					case "photo": {
-						const msg = bot.update.message!;
 						const groupId = msg.chat.id.toString();
 						if (!(await isGroupWhitelisted(env, groupId))) {
 							return new Response('ok');
@@ -1250,11 +1277,15 @@ export default {
 						}
 						return new Response('ok');
 					}
+					default:
+						return new Response('ok');
 				}
-				return new Response('ok');
 			})
 			.on(":edited_message", async (ctx) => {
-				const msg = ctx.update.edited_message!;
+				const msg = ctx.update?.edited_message || ctx.update?.message;
+				if (!msg || !msg.chat) {
+					return new Response('ok');
+				}
 				const groupId = msg.chat.id.toString();
 				if (!(await isGroupWhitelisted(env, groupId))) {
 					return new Response('ok');
@@ -1268,7 +1299,7 @@ export default {
 					await env.DB.prepare(`
 					INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)`)
 						.bind(
-							getMessageLink({ groupId: groupId.toString(), messageId }),
+							getMessageLink({ groupId, messageId }),
 							groupId,
 							timeStamp,
 							userName,

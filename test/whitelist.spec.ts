@@ -383,6 +383,80 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			globalThis.fetch = originalFetch;
 		}
 	});
+
+	it('should gracefully handle non-message updates like my_chat_member and message_reaction without throwing errors', async () => {
+		const testEnv: Env = {
+			...env,
+			TELEGRAM_BOT_TOKEN: 'test_token',
+		};
+
+		// 1. my_chat_member update (e.g. Bot membership/privacy changes)
+		const reqMyChatMember = new Request('https://chatgist.example.com/', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				update_id: 999,
+				my_chat_member: {
+					chat: { id: -100888888, type: 'supergroup' },
+					from: { id: 10001, first_name: 'Admin' },
+					date: Math.floor(Date.now() / 1000),
+				},
+			}),
+		});
+
+		const resMember = await worker.fetch(reqMyChatMember, testEnv, mockCtx);
+		expect(resMember.status).toBe(200);
+
+		// 2. message_reaction update
+		const reqReaction = new Request('https://chatgist.example.com/', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				update_id: 1000,
+				message_reaction: {
+					chat: { id: -100888888, type: 'supergroup' },
+					message_id: 1234,
+				},
+			}),
+		});
+
+		const resReaction = await worker.fetch(reqReaction, testEnv, mockCtx);
+		expect(resReaction.status).toBe(200);
+	});
+
+	it('should correctly record edited_message into Messages table for authorized group', async () => {
+		const testEnv: Env = {
+			...env,
+			TELEGRAM_BOT_TOKEN: 'test_token',
+		};
+
+		// Whitelist group first
+		await addGroupToWhitelist(testEnv, '-100888888', 'Authorized Group', '10001');
+
+		const reqEdited = new Request('https://chatgist.example.com/', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				update_id: 1001,
+				edited_message: {
+					message_id: 505,
+					from: { id: 88888, first_name: 'Alice' },
+					chat: { id: -100888888, title: 'Authorized Group', type: 'supergroup' },
+					date: Math.floor(Date.now() / 1000),
+					text: 'Updated edited message text',
+				},
+			}),
+		});
+
+		const resEdited = await worker.fetch(reqEdited, testEnv, mockCtx);
+		expect(resEdited.status).toBe(200);
+
+		const row = await env.DB.prepare('SELECT * FROM Messages WHERE messageId = ?')
+			.bind(505)
+			.first();
+		expect(row).toBeDefined();
+		expect((row as any).content).toBe('Updated edited message text');
+	});
 });
 
 
