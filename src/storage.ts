@@ -8,6 +8,7 @@ export interface GroupStorageStat {
 
 export interface DatabaseStorageStats {
 	totalBytes: number;
+	payloadBytes: number;
 	limitBytes: number;
 	groupStats: GroupStorageStat[];
 }
@@ -49,6 +50,8 @@ export async function getDatabaseStorageStats(env: Env): Promise<DatabaseStorage
 		console.error("Failed to query group stats:", e);
 	}
 
+	const payloadBytes = groupStats.reduce((sum, g) => sum + g.estimatedBytes, 0);
+
 	let totalBytes = 0;
 	try {
 		const pcRes: any = await env.DB.prepare("PRAGMA page_count").first();
@@ -63,11 +66,12 @@ export async function getDatabaseStorageStats(env: Env): Promise<DatabaseStorage
 	}
 
 	if (totalBytes === 0) {
-		totalBytes = groupStats.reduce((sum, g) => sum + g.estimatedBytes, 0);
+		totalBytes = payloadBytes;
 	}
 
 	return {
 		totalBytes,
+		payloadBytes,
 		limitBytes,
 		groupStats,
 	};

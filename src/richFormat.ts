@@ -1,8 +1,5 @@
-import telegramifyMarkdown from 'telegramify-markdown';
+// Telegram Rich Message AST 定义与解析器
 
-// ==========================================
-// 1. 类型定义：Telegram 原生 Rich Message AST
-// ==========================================
 
 export type RichTextInline =
 	| { type: 'bold'; text: RichText }
@@ -159,34 +156,6 @@ export function foldText(text: string): string {
 	return `${quotedLines.join('\n')}||`;
 }
 
-export function formatSummaryWithHighlights(rawContent: string): string {
-	const cleaned = removeThematicBreaks(rawContent);
-	const processed = fixLink(processMarkdownLinks(cleaned));
-	const normalized = normalizeSpacing(processed);
-
-	const match = normalized.match(/\n+(?=【💬|##\s*详细|【详细|详细讨论与消息溯源|详细讨论)/i);
-	if (match && match.index !== undefined) {
-		const highlightsPart = normalized.slice(0, match.index).trim();
-		const detailsPart = normalized.slice(match.index).trim();
-
-		const highlightsV2 = normalizeSpacing(telegramifyMarkdown(highlightsPart, 'keep'));
-		const detailsV2 = normalizeSpacing(telegramifyMarkdown(detailsPart, 'keep'));
-
-		const foldedDetails = foldText(detailsV2);
-		return `${highlightsV2}\n\n${foldedDetails}`;
-	}
-
-	const allV2 = normalizeSpacing(telegramifyMarkdown(normalized, 'keep'));
-	return foldText(allV2);
-}
-
-export function formatAnswerMessage(rawContent: string): string {
-	const cleaned = removeThematicBreaks(rawContent);
-	const processed = fixLink(processMarkdownLinks(cleaned));
-	const normalized = normalizeSpacing(processed);
-	const convertedV2 = normalizeSpacing(telegramifyMarkdown(normalized, 'keep'));
-	return foldText(convertedV2);
-}
 
 export function normalizeSpacing(text: string): string {
 	return text
@@ -838,6 +807,7 @@ export async function sendTelegramRichMessage(
 		replyToMessageId?: number;
 		fallbackText?: string;
 		rawMarkdown?: string;
+		replyMarkup?: any;
 	} = {}
 ): Promise<{ ok: boolean; status?: number; error?: string }> {
 	if (!token) {
@@ -856,6 +826,9 @@ export async function sendTelegramRichMessage(
 		payload.reply_parameters = {
 			message_id: options.replyToMessageId,
 		};
+	}
+	if (options.replyMarkup) {
+		payload.reply_markup = options.replyMarkup;
 	}
 
 	// 1. sendRichMessage (blocks AST 模式)
@@ -888,6 +861,7 @@ export async function sendTelegramRichMessage(
 						markdown: options.rawMarkdown,
 					},
 					reply_parameters: options.replyToMessageId ? { message_id: options.replyToMessageId } : undefined,
+					reply_markup: options.replyMarkup,
 				}),
 			});
 
@@ -917,6 +891,7 @@ export async function sendTelegramRichMessage(
 					text: chunk,
 					parse_mode: 'HTML',
 					reply_parameters: options.replyToMessageId ? { message_id: options.replyToMessageId } : undefined,
+					reply_markup: options.replyMarkup,
 				}),
 			});
 			if (!res.ok) {
@@ -947,6 +922,7 @@ export async function sendTelegramRichMessage(
 					chat_id: chatId.toString(),
 					text: chunk,
 					reply_parameters: options.replyToMessageId ? { message_id: options.replyToMessageId } : undefined,
+					reply_markup: options.replyMarkup,
 				}),
 			});
 			if (!res.ok) allOk = false;

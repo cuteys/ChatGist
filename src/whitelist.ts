@@ -65,16 +65,28 @@ export async function isAdmin(env: Env, userId?: string | number): Promise<boole
 	}
 }
 
+let whitelistCache: { set: Set<string>; expireAt: number } | null = null;
+const WHITELIST_CACHE_TTL_MS = 60 * 1000;
+
+export function invalidateWhitelistCache(): void {
+	whitelistCache = null;
+}
+
 export async function isGroupWhitelisted(env: Env, groupId?: string | number): Promise<boolean> {
 	if (!groupId) return false;
 	const gid = groupId.toString().trim();
 	if (!gid) return false;
 
+	const now = Date.now();
+	if (whitelistCache && whitelistCache.expireAt > now) {
+		return whitelistCache.set.has(gid);
+	}
+
 	try {
-		const row = await withAutoInit(env, () =>
-			env.DB.prepare("SELECT groupId FROM WhitelistGroups WHERE groupId = ?").bind(gid).first()
-		);
-		return !!row;
+		const groups = await getWhitelistedGroups(env);
+		const set = new Set(groups.map((g) => g.groupId));
+		whitelistCache = { set, expireAt: now + WHITELIST_CACHE_TTL_MS };
+		return set.has(gid);
 	} catch (e) {
 		console.error("Error checking group whitelist status:", e);
 		return false;
@@ -95,6 +107,7 @@ export async function addGroupToWhitelist(
 				.bind(groupId, groupName || "未命名群组", addedBy, Date.now())
 				.run()
 		);
+		invalidateWhitelistCache();
 		return true;
 	} catch (e) {
 		console.error("Failed to add group to whitelist:", e);
@@ -107,6 +120,7 @@ export async function removeGroupFromWhitelist(env: Env, groupId: string): Promi
 		await withAutoInit(env, () =>
 			env.DB.prepare("DELETE FROM WhitelistGroups WHERE groupId = ?").bind(groupId).run()
 		);
+		invalidateWhitelistCache();
 		return true;
 	} catch (e) {
 		console.error("Failed to remove group from whitelist:", e);

@@ -11,10 +11,12 @@ import {
 	addAdmin,
 	removeAdmin,
 	getAdmins,
+	invalidateWhitelistCache,
 } from '../src/whitelist';
 
 describe('Whitelist and Admin DB operations', () => {
 	beforeEach(async () => {
+		invalidateWhitelistCache();
 		await initWhitelistTables(env);
 		await env.DB.prepare('DELETE FROM WhitelistGroups').run();
 		await env.DB.prepare('DELETE FROM Admins').run();
@@ -96,6 +98,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 	};
 
 	beforeEach(async () => {
+		invalidateWhitelistCache();
 		await testEnv.DB.prepare(`
 			CREATE TABLE IF NOT EXISTS Messages (
 				id TEXT PRIMARY KEY,
