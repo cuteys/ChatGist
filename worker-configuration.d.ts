@@ -3,6 +3,10 @@
 interface Env {
 	SECRET_TELEGRAM_API_TOKEN: string;
 	GEMINI_API_KEY: string;
-	account_id: string;
+	account_id?: string;
+	AI_BASE_URL?: string;
+	AI_MODEL?: string;
+	BASE_URL?: string;
+	MODEL?: string;
 	DB: D1Database;
 }

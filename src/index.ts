@@ -116,19 +116,49 @@ type R = {
 	messageId: number;
 	timeStamp: number;
 }
-const model = "gpt-5.6-luna";
+export const BOT_COMMANDS = [
+	{ command: "summary", description: "概括群聊消息（如 /summary 10 或 /summary 10h）" },
+	{ command: "ask", description: "基于近期群聊记录回答问题（私聊回复答案）" },
+	{ command: "query", description: "搜索群聊历史记录中的关键词" },
+	{ command: "status", description: "检查机器人当前运行状态" },
+	{ command: "help", description: "查看机器人的功能与指令说明" },
+];
+
+export async function registerBotCommands(token: string) {
+	try {
+		const res = await fetch(`https://api.telegram.org/bot${token}/setMyCommands`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ commands: BOT_COMMANDS }),
+		});
+		if (!res.ok) {
+			console.error("Failed to register bot commands:", res.status, await res.text());
+		}
+	} catch (e) {
+		console.error("Failed to register bot commands:", e);
+	}
+}
+
+function getModelName(env: Env): string {
+	return env.AI_MODEL || env.MODEL || "gpt-5.6-luna";
+}
+
+function getBaseUrl(env: Env): string {
+	return env.AI_BASE_URL || env.BASE_URL || "https://api.tokener.ai/v1";
+}
+
 // Share GPT request settings across commands and scheduled summaries.
 const completionOptions = {
 	max_completion_tokens: 4096,
 	reasoning_effort: "none",
 } as const;
+
 function getGenModel(env: Env) {
 	const openai = new OpenAI({
 		apiKey: env.GEMINI_API_KEY,
-		baseURL: "https://api.tokener.ai/v1",
+		baseURL: getBaseUrl(env),
 		timeout: 999999999999,
 	});
-	const account_id = env.account_id;
 	return openai;
 }
 
@@ -175,8 +205,8 @@ function getCommandVar(str: string, delim: string) {
 	return str.slice(str.indexOf(delim) + delim.length);
 }
 
-function messageTemplate(s: string) {
-	return `下面由 ${escapeMarkdownV2(model)} 概括群聊信息\n` + s + `\n本开源项目[地址](https://github\\.com/asukaminato0721/telegram-summary-bot)`;
+function messageTemplate(s: string, modelName: string) {
+	return `下面由 ${escapeMarkdownV2(modelName)} 概括群聊信息\n` + s + `\n本开源项目[地址](https://github\\.com/asukaminato0721/telegram-summary-bot)`;
 }
 /**
  * 
@@ -257,6 +287,7 @@ export default {
 
 		console.debug("Batch:", batch);
 		console.debug("Found groups:", groups.length, JSON.stringify(groups));
+		const model = getModelName(env);
 		for (const [id, group] of groups.entries()) {
 			if (id % 10 !== batch) {
 				continue;
@@ -302,7 +333,7 @@ export default {
 					chat_id: group.groupId,
 					text: messageTemplate(foldText(
 						fixLink(
-							processMarkdownLinks(telegramifyMarkdown(result.choices[0].message.content || "", 'keep'))))),
+							processMarkdownLinks(telegramifyMarkdown(result.choices[0].message.content || "", 'keep')))), model),
 					parse_mode: "MarkdownV2",
 				}),
 			});
@@ -322,9 +353,64 @@ export default {
 		console.debug("cron processed");
 	},
 	fetch: async (request: Request, env: Env, ctx: ExecutionContext) => {
+		if (request.method === "GET") {
+			const url = new URL(request.url);
+			if (url.pathname === "/setcommands") {
+				await registerBotCommands(env.SECRET_TELEGRAM_API_TOKEN);
+				return new Response(JSON.stringify({ ok: true, message: "Commands registered to Telegram", commands: BOT_COMMANDS }), {
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			}
+			return new Response("Telegram Summary Bot is running.");
+		}
+
 		await new TelegramBot(env.SECRET_TELEGRAM_API_TOKEN)
+			.on('start', async (ctx) => {
+				await registerBotCommands(env.SECRET_TELEGRAM_API_TOKEN);
+				const startText = escapeMarkdownV2(`你好！我是群聊总结与问答助手。
+请将我添加到群组中使用。
+
+可用指令说明：
+• /summary <数量/时间> - 概括群聊内容（如 /summary 10 或 /summary 10h）
+• /ask <问题> - 基于群聊记录回答提问（私聊发送答案）
+• /query <关键词> - 检索群聊历史消息
+• /status - 检查机器人运行状态
+• /help - 查看指令使用帮助`);
+				await ctx.reply(startText, "MarkdownV2");
+				return new Response('ok');
+			})
+			.on('help', async (ctx) => {
+				const helpText = escapeMarkdownV2(`群聊总结机器人使用指南：
+
+• /summary <数量/时间>
+  概括群聊消息
+  示例：/summary 20（最新20条）或 /summary 12h（最近12小时）
+
+• /ask <问题>
+  基于群聊近期聊天记录回答问题（私聊回复答案）
+  示例：/ask 大家刚刚在讨论什么？
+
+• /query <关键词>
+  在群聊历史记录中检索关键词
+  示例：/query 部署
+
+• /status
+  检查机器人运行状态
+
+• /help
+  查看本帮助指南
+
+提示：请在 @BotFather 中将机器人隐私模式（Privacy Mode）设为 Disable，并确保在群内拥有读取消息权限。`);
+				await ctx.reply(helpText, "MarkdownV2");
+				return new Response('ok');
+			})
+			.on('setcommands', async (ctx) => {
+				await registerBotCommands(env.SECRET_TELEGRAM_API_TOKEN);
+				await ctx.reply('已向 Telegram 同步注册中文指令列表！');
+				return new Response('ok');
+			})
 			.on('status', async (ctx) => {
-				const res = (await ctx.reply('我家还蛮大的'))!;
+				const res = (await ctx.reply('机器人运行正常（我家还蛮大的）'))!;
 				if (!res.ok) {
 					console.error(`Error sending message:`, res);
 				}
@@ -356,6 +442,7 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 				return new Response('ok');
 			})
 			.on("ask", async (ctx) => {
+				const model = getModelName(env);
 				const groupId = ctx.update.message!.chat.id;
 				const userId = ctx.update.message!.from!.id;
 				const messageText = ctx.update.message!.text || "";
@@ -489,6 +576,7 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 						.all()).results;
 				}
 				if (results.length > 0) {
+					const model = getModelName(env);
 					try {
 						const result = await getGenModel(env).chat.completions.create(
 							{
@@ -517,7 +605,7 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 						let res = await bot.reply(
 							messageTemplate(foldText(
 								fixLink(
-									processMarkdownLinks(telegramifyMarkdown(result.choices[0].message.content || "", 'keep'))))), 'MarkdownV2');
+									processMarkdownLinks(telegramifyMarkdown(result.choices[0].message.content || "", 'keep')))), model), 'MarkdownV2');
 						if (!res?.ok) {
 							console.error("Failed to send reply", res?.statusText, await res?.text());
 						}
@@ -532,7 +620,7 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 			})
 			.on(':message', async (bot) => {
 				if (!bot.update.message!.chat.type.includes('group')) {
-					await bot.reply('I am a bot, please add me to a group to use me.');
+					await bot.reply('我是群聊总结机器人，请将我添加到群组中使用。\n发送 /help 可查看指令说明。');
 					return new Response('ok');
 				}
 

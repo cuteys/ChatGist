@@ -24,6 +24,8 @@ mode = "smart"
 # - https://developers.cloudflare.com/workers/configuration/secrets/
 
 [vars]
+AI_BASE_URL = "https://api.tokener.ai/v1"
+AI_MODEL = "gpt-5.6-luna"
 
 
 # Bind the Workers AI model catalog. Run machine learning models, powered by serverless GPUs, on Cloudflare’s global network
