@@ -471,6 +471,175 @@ describe('Worker fetch whitelist gatekeeping', () => {
 		}
 	});
 
+	it('should reject group-only commands (/summary, /ask, /query) in private chat', async () => {
+		const sentMessages: string[] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			sentMessages.push(url);
+			return new Response(JSON.stringify({ ok: true, result: {} }), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		}) as any;
+
+		try {
+			for (const cmd of ['summary', 'ask', 'query']) {
+				const req = new Request('https://chatgist.example.com/', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						update_id: 15,
+						message: {
+							message_id: 301,
+							from: { id: 77777, first_name: 'David' },
+							chat: { id: 77777, type: 'private' },
+							date: Math.floor(Date.now() / 1000),
+							text: `/${cmd} test`,
+						},
+					}),
+				});
+
+				const res = await worker.fetch(req, testEnv, mockCtx);
+				expect(res.status).toBe(200);
+			}
+
+			expect(sentMessages.length).toBe(3);
+			for (let i = 0; i < 3; i++) {
+				const decoded = decodeURIComponent(sentMessages[i]).replace(/\+/g, ' ');
+				expect(decoded).toContain('仅支持在群聊中使用');
+			}
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should not include rich text status probe in /status output', async () => {
+		const sentMessages: string[] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			sentMessages.push(url);
+			return new Response(JSON.stringify({ ok: true, result: {} }), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		}) as any;
+
+		try {
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 16,
+					message: {
+						message_id: 302,
+						from: { id: 10001, first_name: 'Admin' },
+						chat: { id: 10001, type: 'private' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/status',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnv, mockCtx);
+			expect(res.status).toBe(200);
+
+			expect(sentMessages.length).toBe(1);
+			const decoded = decodeURIComponent(sentMessages[0]).replace(/\+/g, ' ');
+			expect(decoded).not.toContain('原生富文本');
+			expect(decoded).not.toContain('sendRichMessage');
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should reply directly in group for /ask without sending to private message', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		const telegramCalls: Array<{ url: string; body?: any }> = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			const bodyText = init?.body ? (typeof init.body === 'string' ? init.body : await (init.body as any).text?.()) : undefined;
+			let parsedBody: any = undefined;
+			try {
+				if (bodyText) parsedBody = JSON.parse(bodyText);
+			} catch (_) {}
+
+			if (url.includes('/chat/completions')) {
+				return new Response(
+					JSON.stringify({
+						id: 'chatcmpl-test',
+						object: 'chat.completion',
+						created: Math.floor(Date.now() / 1000),
+						model: 'gpt-4o-mini',
+						choices: [
+							{
+								index: 0,
+								message: {
+									role: 'assistant',
+									content: '大家刚才在讨论系统新特性的部署和测试。',
+								},
+								finish_reason: 'stop',
+							},
+						],
+					}),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
+
+			telegramCalls.push({ url, body: parsedBody });
+			return new Response(JSON.stringify({ ok: true, result: { message_id: 888 } }), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		}) as any;
+
+		try {
+			const testEnvWithModel: Env = {
+				...testEnv,
+				AI_MODEL: 'gpt-4o-mini',
+				AI_API_KEY: 'test-key',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 17,
+					message: {
+						message_id: 401,
+						from: { id: 88888, first_name: 'Alice' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/ask 大家刚才在讨论什么？',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
+			expect(res.status).toBe(200);
+
+			// Check that no call was made to private chat 88888
+			const pmCalls = telegramCalls.filter((c) => {
+				const bodyStr = JSON.stringify(c.body || {});
+				return c.url.includes('chat_id=88888') || bodyStr.includes('"chat_id":"88888"') || bodyStr.includes('"chat_id":88888');
+			});
+			expect(pmCalls.length).toBe(0);
+
+			// Check that answer was sent to group
+			const groupSendCalls = telegramCalls.filter((c) => {
+				const bodyStr = JSON.stringify(c.body || {});
+				return c.url.includes(groupId) || bodyStr.includes(groupId);
+			});
+			expect(groupSendCalls.length).toBeGreaterThan(0);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
 	it('should gracefully handle non-message updates like my_chat_member and message_reaction without throwing errors', async () => {
 		const testEnv: Env = {
 			...env,

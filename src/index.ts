@@ -79,7 +79,7 @@ function escapeMarkdownV2(text: string) {
 
 export const BOT_COMMANDS = [
 	{ command: "summary", description: "概括群聊消息（如 /summary 20 或 /summary 12h）" },
-	{ command: "ask", description: "基于群聊记录提问（私聊推送答案）" },
+	{ command: "ask", description: "基于群聊记录提问并回答" },
 	{ command: "query", description: "在群聊历史中检索关键词" },
 	{ command: "quota", description: "查询今日剩余指令使用配额" },
 	{ command: "status", description: "检查运行状态与群组授权" },
@@ -379,7 +379,7 @@ function getRoleHelpText(env: Env, userId: string, superAdmin: boolean, admin: b
 			`• /setcommands - 向 Telegram 同步指令菜单\n\n` +
 			`💬 <b>群聊常用指令：</b>\n` +
 			`• /summary &lt;数量/时间&gt; - 概括群聊消息（如 /summary 20 或 /summary 12h）\n` +
-			`• /ask &lt;问题&gt; - 基于群聊记录提问（私聊推送答案）\n` +
+			`• /ask &lt;问题&gt; - 基于群聊记录提问并回答\n` +
 			`• /query &lt;关键词&gt; - 检索历史消息\n` +
 			`• /quota - 查看今日剩余配额\n` +
 			`• /status - 检查运行状态与群组授权\n\n` +
@@ -391,7 +391,7 @@ function getRoleHelpText(env: Env, userId: string, superAdmin: boolean, admin: b
 			`您已被系统授权为机器人管理员，享有<b>【无限次免流特权】</b>！\n\n` +
 			`💬 <b>群聊可用指令（无使用频次限制）：</b>\n` +
 			`• /summary &lt;数量/时间&gt; - 概括群聊消息（如 /summary 20 或 /summary 12h）\n` +
-			`• /ask &lt;问题&gt; - 基于群聊记录提问（私聊推送答案）\n` +
+			`• /ask &lt;问题&gt; - 基于群聊记录提问并回答\n` +
 			`• /query &lt;关键词&gt; - 检索群聊历史消息\n` +
 			`• /quota - 查看指令免流特权状态\n` +
 			`• /status - 检查运行状态与群组授权\n` +
@@ -403,7 +403,7 @@ function getRoleHelpText(env: Env, userId: string, superAdmin: boolean, admin: b
 		`欢迎使用群聊智能总结与检索助手！\n\n` +
 		`💬 <b>可用群聊指令：</b>\n` +
 		`• /summary &lt;数量/时间&gt; - 概括近期群聊重点（每日限 5 次）\n` +
-		`• /ask &lt;问题&gt; - 基于近期群聊记录回答（每日限 10 次，私聊推送）\n` +
+		`• /ask &lt;问题&gt; - 基于近期群聊记录回答（每日限 10 次）\n` +
 		`• /query &lt;关键词&gt; - 检索群聊历史消息（每日限 20 次）\n` +
 		`• /quota - 快速查看今日剩余配额\n` +
 		`• /status - 检查机器人运行状态及群组授权\n` +
@@ -411,8 +411,18 @@ function getRoleHelpText(env: Env, userId: string, superAdmin: boolean, admin: b
 		`ℹ️ <b>使用须知：</b>\n` +
 		`1. 您的 Telegram 用户 ID 为：<code>${userId}</code>（点击可复制）\n` +
 		`2. 机器人仅在管理员授权的白名单群组中记录与响应；\n` +
-		`3. /ask 首次使用请先私聊机器人发起对话；\n` +
+		`3. /summary、/ask、/query 仅限在授权群聊中使用；\n` +
 		`4. 每日使用额度于北京时间 00:00 自动刷新。`;
+}
+
+async function requireGroupChat(ctx: any, commandName: string): Promise<boolean> {
+	const chat = ctx.update?.message?.chat;
+	const isGroup = Boolean(chat && (chat.type === 'group' || chat.type === 'supergroup' || chat.type?.includes('group')));
+	if (!isGroup) {
+		await ctx.reply(`⚠️ /${commandName} 指令仅支持在群聊中使用。\n请将机器人添加到群组并由管理员授权后在群内使用。`);
+		return false;
+	}
+	return true;
 }
 
 async function requireSuperAdmin(ctx: any, env: Env, userId: string): Promise<boolean> {
@@ -834,29 +844,6 @@ export default {
 					} catch (e: any) {
 						console.error("Failed to get storage stats in /status:", e);
 					}
-
-					try {
-						const token = getTelegramToken(env);
-						const testRes = await fetch(`https://api.telegram.org/bot${token}/sendRichMessage`, {
-							method: 'POST',
-							headers: { 'Content-Type': 'application/json' },
-							body: JSON.stringify({ chat_id: 0, rich_message: { blocks: [] } }),
-						});
-						const testJson: any = await testRes.json().catch(() => null);
-						let richStatus: string;
-						if (testRes.ok) {
-							richStatus = '✅ 正常可用';
-						} else if (testRes.status === 400 && (testJson?.description?.includes('chat not found') || testJson?.description?.includes('chat_id'))) {
-							richStatus = '✅ 接口已就绪 (原生富文本模式)';
-						} else if (testRes.status === 404) {
-							richStatus = 'ℹ️ 接口未开放 (已启用 HTML 折叠降级)';
-						} else {
-							richStatus = `⚠️ 状态异常 (${testJson?.description || testRes.status})`;
-						}
-						statusText += `\n🌐 原生富文本 (sendRichMessage)：${richStatus}\n`;
-					} catch (e: any) {
-						statusText += `\n🌐 原生富文本：⚠️ 探测异常 (${e.message})\n`;
-					}
 				}
 
 				if (!admin) {
@@ -918,6 +905,7 @@ export default {
 				await ctx.reply(`🧹 已成功清除群组 (${targetGid}) 的历史消息记录（共清理 ${count} 条）。`);
 			}))
 			.on("query", async (ctx) => {
+				if (!(await requireGroupChat(ctx, 'query'))) return new Response('ok');
 				const msg = ctx.update?.message;
 				if (!msg || !msg.chat) return new Response('ok');
 				const groupId = msg.chat.id.toString();
@@ -987,6 +975,7 @@ export default {
 				return new Response('ok');
 			})
 			.on("ask", async (ctx) => {
+				if (!(await requireGroupChat(ctx, 'ask'))) return new Response('ok');
 				const model = getModelName(env);
 				if (!model) {
 					await ctx.reply('未配置 AI_MODEL 环境变量，无法处理请求。');
@@ -1004,33 +993,19 @@ export default {
 					return new Response('ok');
 				}
 
-				const isGroup = Boolean(msg.chat.type?.includes('group'));
-				const botToken = getTelegramToken(env);
+				const quota = await checkAndIncrementQuota(env, userId, 'ask');
+				if (!quota.allowed) {
+					await ctx.reply(`⚠️ 您今日的 /ask 提问次数已达上限（${quota.current}/${quota.limit} 次）。配额将在次日 00:00 自动刷新。`);
+					return new Response('ok');
+				}
 
+				const botToken = getTelegramToken(env);
 				await withTemporaryStatus(
-					(text) => isGroup ? ctx.reply(text) : Promise.resolve(null),
+					(text) => ctx.reply(text),
 					botToken,
 					groupId,
-					"⏳ 收到提问，正在分析近期群聊并在私聊中为您推送解答...",
+					"⏳ 收到提问，正在分析近期群聊并解答，请稍候...",
 					async () => {
-						// 先测试私聊是否可达，防止扣减额度后无法送达
-						const testPmRes = await ctx.api.sendMessage(ctx.bot.api.toString(), {
-							chat_id: userId,
-							parse_mode: "",
-							text: "⏳ 正在分析群聊记录并为您解答，请稍候...",
-						} as any);
-						if (!testPmRes.ok) {
-							console.error("Test PM reachability failed:", testPmRes.status, await testPmRes.text());
-							await ctx.reply(`请先在私聊中向机器人发送 /start 发起对话，否则无法私信推送答案。`);
-							return;
-						}
-
-						const quota = await checkAndIncrementQuota(env, userId, 'ask');
-						if (!quota.allowed) {
-							await ctx.reply(`⚠️ 您今日的 /ask 提问次数已达上限（${quota.current}/${quota.limit} 次）。配额将在次日 00:00 自动刷新。`);
-							return;
-						}
-
 						const { results } = await env.DB.prepare(`
 							WITH latest_1000 AS (
 								SELECT * FROM Messages
@@ -1087,13 +1062,17 @@ export default {
 								text: { type: "code", text: model }
 							}
 						);
-						await sendTelegramRichMessage(botToken, userId, richData.blocks, { rawMarkdown: raw });
+						await sendTelegramRichMessage(botToken, groupId, richData.blocks, {
+							rawMarkdown: raw,
+							replyToMessageId: msg.message_id,
+						});
 					}
 				);
 
 				return new Response('ok');
 			})
 			.on("summary", async (bot) => {
+				if (!(await requireGroupChat(bot, 'summary'))) return new Response('ok');
 				const msg = bot.update?.message;
 				if (!msg || !msg.chat) return new Response('ok');
 				const groupId = msg.chat.id.toString();
