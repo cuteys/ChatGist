@@ -279,14 +279,16 @@ export function parseRichInline(text: string): RichText {
 		const fullMatch = match[0];
 
 		if (match[2] && match[3]) {
-			// [text](url) 溯源链接（Telegram RichTextUrl 规范使用 type: 'url'）
+			const linkText = match[2];
 			parts.push({
 				type: 'url',
-				text: match[2],
+				text: linkText.includes('*') || linkText.includes('_') || linkText.includes('`')
+					? parseRichInline(linkText)
+					: linkText,
 				url: fixLink(match[3]),
 			});
 		} else if (fullMatch.startsWith('http://') || fullMatch.startsWith('https://')) {
-			// 裸露的 Telegram 消息链接，直接转化为优雅的 💬 原文
+			// 纯链接文本转换为超链接
 			parts.push({
 				type: 'url',
 				text: '💬 原文',
@@ -294,9 +296,12 @@ export function parseRichInline(text: string): RichText {
 			});
 		} else if (match[4] || match[5]) {
 			// 粗体
+			const boldText = match[4] || match[5];
 			parts.push({
 				type: 'bold',
-				text: match[4] || match[5],
+				text: boldText.includes('[') || boldText.includes('`')
+					? parseRichInline(boldText)
+					: boldText,
 			});
 		} else if (match[6]) {
 			// 行内代码
@@ -632,7 +637,7 @@ export function aggregateMarkdownToRichBlocks(content: string): RichBlock[] {
 }
 
 /**
- * 解析大模型输出：优先直接解析合法 JSON，非 JSON 则交由本地聚合器高保真转换
+ * 解析模型输出：优先解析 JSON AST，否则使用 Markdown 聚合转换为 RichBlock 列表
  */
 export function parseRichMessageResponse(raw: string): { blocks: RichBlock[] } {
 	let clean = (raw || '').trim();
@@ -819,14 +824,6 @@ export function richBlocksToPlainText(blocks: RichBlock[]): string {
 	return lines.join('\n\n').trim();
 }
 
-export function richBlocksToMarkdown(blocks: RichBlock[]): string {
-	return richBlocksToPlainText(blocks);
-}
-
-export function richBlocksToMarkdownV2(blocks: RichBlock[]): string {
-	return richBlocksToPlainText(blocks);
-}
-
 // ==========================================
 // 4. API 发送器：sendTelegramRichMessage
 // ==========================================
@@ -859,7 +856,7 @@ export async function sendTelegramRichMessage(
 		};
 	}
 
-	// 1. 优先调用 Telegram Bot API 10.x 原生 sendRichMessage (blocks AST 模式)
+	// 1. sendRichMessage (blocks AST 模式)
 	try {
 		const res = await fetch(`https://api.telegram.org/bot${token}/sendRichMessage`, {
 			method: 'POST',
@@ -877,7 +874,7 @@ export async function sendTelegramRichMessage(
 		console.warn('sendRichMessage (blocks) network exception:', e);
 	}
 
-	// 2. 次选方案：调用 sendRichMessage 原生支持的 markdown 字段 (Telegram 官方解析引擎)
+	// 2. sendRichMessage (markdown 模式)
 	if (options.rawMarkdown) {
 		try {
 			const mdRes = await fetch(`https://api.telegram.org/bot${token}/sendRichMessage`, {
@@ -903,7 +900,7 @@ export async function sendTelegramRichMessage(
 		}
 	}
 
-	// 3. 第一层降级：Telegram 原生 HTML 模式（原生支持 <blockquote expandable> 折叠抽屉与链接）
+	// 3. HTML 模式降级 (<blockquote expandable>)
 	try {
 		const htmlText = richBlocksToHtml(blocks);
 		const chunks = splitTelegramMessage(htmlText);
@@ -934,7 +931,7 @@ export async function sendTelegramRichMessage(
 		console.warn('sendMessage HTML exception, falling back to plain text:', err);
 	}
 
-	// 4. 终极降级方案：纯文本发送
+	// 4. 纯文本兜底
 	const text = options.fallbackText || richBlocksToPlainText(blocks);
 	const chunks = splitTelegramMessage(text);
 
@@ -1159,7 +1156,7 @@ export function buildAdminsRichBlocks(
 }
 
 /**
- * 构建关键词检索结果原生富文本表格（包含原消息精准跳转定位）
+ * 构建关键词检索结果原生富文本表格（将原消息链接直接内嵌于消息内容中）
  */
 export function buildQueryRichBlocks(
 	keyword: string,
@@ -1172,9 +1169,8 @@ export function buildQueryRichBlocks(
 	const tableRows: RichTableCell[][] = [
 		[
 			{ text: '#', is_header: true, align: 'center', valign: 'middle' },
-			{ text: '发言人', is_header: true, align: 'left', valign: 'middle' },
-			{ text: '消息内容摘要', is_header: true, align: 'left', valign: 'middle' },
-			{ text: '原文定位', is_header: true, align: 'center', valign: 'middle' },
+			{ text: '👤 发言人', is_header: true, align: 'left', valign: 'middle' },
+			{ text: '💬 消息内容（点击直达原文）', is_header: true, align: 'left', valign: 'middle' },
 		],
 	];
 
@@ -1186,12 +1182,11 @@ export function buildQueryRichBlocks(
 		tableRows.push([
 			{ text: `${idx + 1}`, align: 'center', valign: 'middle' },
 			{ text: { type: 'bold', text: r.userName || '匿名' }, align: 'left', valign: 'middle' },
-			{ text: preview, align: 'left', valign: 'middle' },
 			{
 				text: link
-					? [{ type: 'url', text: '🔗 查看原文', url: link }]
-					: '-',
-				align: 'center',
+					? [{ type: 'url', text: preview || '查看原文', url: link }]
+					: preview || '-',
+				align: 'left',
 				valign: 'middle',
 			},
 		]);
@@ -1204,7 +1199,7 @@ export function buildQueryRichBlocks(
 				{
 					type: 'paragraph',
 					text: [
-						'检索关键词：【',
+						'🔍 检索关键词：【',
 						{ type: 'bold', text: keyword },
 						`】 · 匹配消息数：${totalCount} 条`,
 					],
@@ -1214,7 +1209,7 @@ export function buildQueryRichBlocks(
 		{
 			type: 'heading',
 			size: 2,
-			text: `🔍 历史消息检索结果`,
+			text: `📋 历史消息检索结果`,
 		},
 		{
 			type: 'table',
@@ -1227,12 +1222,12 @@ export function buildQueryRichBlocks(
 	if (totalCount > maxDisplay) {
 		blocks.push({
 			type: 'paragraph',
-			text: `ℹ️ 结果较多，当前展示最近 ${maxDisplay} 条记录。点击表格中的「🔗 查看原文」可直接定位并高亮该条群聊发言。`,
+			text: `ℹ️ 结果较多，当前展示最近 ${maxDisplay} 条记录。点击表格中的消息内容可直接定位原消息。`,
 		});
 	} else {
 		blocks.push({
 			type: 'paragraph',
-			text: '💡 点击表格右侧的「🔗 查看原文」可直接在群聊中跳转至具体消息位置。',
+			text: '💡 点击表格中的消息内容可直接在群聊中跳转至具体消息位置。',
 		});
 	}
 

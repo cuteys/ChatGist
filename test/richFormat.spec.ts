@@ -233,10 +233,9 @@ describe('richFormat tests', () => {
 		expect(tableBlock.is_striped).toBe(true);
 		expect(tableBlock.cells.length).toBe(3); // 1 header + 2 rows
 
-		// Check the jump link in row 1, col 3
-		const linkCell = tableBlock.cells[1][3];
+		// Check the jump link in row 1, col 2 (content is hyperlinked)
+		const linkCell = tableBlock.cells[1][2];
 		expect(linkCell.text[0].type).toBe('url');
-		expect(linkCell.text[0].text).toBe('🔗 查看原文');
 		expect(linkCell.text[0].url).toBe('https://t.me/c/123456789/42');
 	});
 
@@ -398,5 +397,23 @@ describe('richFormat tests', () => {
 		expect(html).toContain('折叠抽屉测试');
 		expect(html).toContain('<b>加粗文字</b>');
 		expect(html).toContain('<a href="https://t.me/c/123/456">💬 原文</a>');
+	});
+
+	it('parses nested bold within links and links within bold correctly', async () => {
+		const { parseRichInline } = await import('../src/richFormat');
+
+		// Link inside bold: **[方案A](https://t.me/c/1/2)**
+		const parsedBoldLink = parseRichInline('**[方案A](https://t.me/c/1/2)**') as any;
+		expect(parsedBoldLink.type).toBe('bold');
+		expect(parsedBoldLink.text.type).toBe('url');
+		expect(parsedBoldLink.text.text).toBe('方案A');
+		expect(parsedBoldLink.text.url).toBe('https://t.me/c/1/2');
+
+		// Bold inside link: [**方案B**](https://t.me/c/1/3)
+		const parsedLinkBold = parseRichInline('[**方案B**](https://t.me/c/1/3)') as any;
+		expect(parsedLinkBold.type).toBe('url');
+		expect(parsedLinkBold.text.type).toBe('bold');
+		expect(parsedLinkBold.text.text).toBe('方案B');
+		expect(parsedLinkBold.url).toBe('https://t.me/c/1/3');
 	});
 });
