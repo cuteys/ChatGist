@@ -6,6 +6,9 @@ import {
 	wrapInExpandableQuote,
 	parseDetailsAndFold,
 	formatRichTelegramMessage,
+	normalizeSpacing,
+	normalizeLatexForRichMarkdown,
+	formatForTelegramRichMessage,
 } from '../src/richFormat';
 
 describe('richFormat tests', () => {
@@ -84,5 +87,47 @@ Bob: 收到测试中
 		expect(result).toContain('**>详细讨论 🔽');
 		expect(result).toContain('>详细内容第1行');
 		expect(result).toContain('||');
+	});
+
+	it('normalizes spacing and collapses redundant newlines', () => {
+		const messy = `第一行\n\n\n\n第二行   \n\n\n第三行`;
+		expect(normalizeSpacing(messy)).toBe(`第一行\n\n第二行\n\n第三行`);
+	});
+
+	it('normalizes LaTeX equations for Telegram Rich Markdown', () => {
+		const latex = `公式行：\\[ \\sum_{i=1}^n x_i \\] 与行内 \\( E=mc^2 \\)`;
+		const normalized = normalizeLatexForRichMarkdown(latex);
+		expect(normalized).toContain('$$\n\\sum_{i=1}^n x_i\n$$');
+		expect(normalized).toContain('$E=mc^2$');
+	});
+
+	it('formats text for Telegram Native Tables via formatForTelegramRichMessage', () => {
+		const raw = `
+【💡 核心要点速览】
+- 进展顺利
+
+
+
+【📊 议题简表】
+| 议题分类 | 核心结论 |
+|:---|:---|
+| 图像压缩 | 支持 |
+
+
+<details>
+<summary>💬 点击展开详细讨论与消息溯源</summary>
+1. 讨论过程消息
+</details>
+`;
+		const result = formatForTelegramRichMessage(raw);
+		// Native Table 保持标准 Markdown 管道符语法，未被转化为 ASCII 代码块
+		expect(result).toContain('| 议题分类 | 核心结论 |');
+		expect(result).toContain('|:---|:---|');
+		expect(result).not.toContain('┌');
+		// Details 标签被转化为可折叠引用块
+		expect(result).toContain('**>💬 点击展开详细讨论与消息溯源 🔽');
+		expect(result).toContain('>1. 讨论过程消息||');
+		// 连续空行被压缩
+		expect(result).not.toContain('\n\n\n');
 	});
 });

@@ -198,13 +198,124 @@ export function formatRichTelegramMessage(
 		const formattedInner = telegramifyMarkdown(`${summaryTitle}\n\n${cleanedInner.trim()}`, 'keep');
 		const foldedDetails = wrapInExpandableQuote(formattedInner);
 
-		return formattedSummary ? `${formattedSummary}\n\n${foldedDetails}` : foldedDetails;
+		const combined = formattedSummary ? `${formattedSummary}\n\n${foldedDetails}` : foldedDetails;
+		return normalizeSpacing(combined);
 	}
 
 	const formatted = telegramifyMarkdown(tableConverted, 'keep');
 	if (options.isSummary) {
-		return wrapInExpandableQuote(formatted);
+		return normalizeSpacing(wrapInExpandableQuote(formatted));
 	}
-	return formatted;
+	return normalizeSpacing(formatted);
 }
+
+/**
+ * 消除过量连续空行与多余首尾空白，将连续 3 个及以上换行规整为单行空行（\n\n）
+ */
+export function normalizeSpacing(text: string): string {
+	return text
+		.replace(/\r\n/g, '\n')
+		.replace(/[ \t]+\n/g, '\n')
+		.replace(/\n{3,}/g, '\n\n')
+		.trim();
+}
+
+/**
+ * 转换常用 AI LaTeX 符号，适配 Telegram Rich Markdown
+ */
+export function normalizeLatexForRichMarkdown(text: string): string {
+	const parts = text.split(/(```[\s\S]*?```)/);
+	return parts
+		.map((part, index) => {
+			if (index % 2 === 1) return part;
+			return part
+				.replace(/\\\[\s*([\s\S]*?)\s*\\\]/g, (_m, p1) => `$$\n${p1.trim()}\n$$`)
+				.replace(/\\\(\s*([\s\S]*?)\s*\\\)/g, (_m, p1) => `$${p1.trim()}$`);
+		})
+		.join('');
+}
+
+/**
+ * 为 Telegram Bot API 10.1+ 的 sendRichMessage 准备原生富文本标准 Markdown：
+ * - 保持标准 Markdown 表格结构（| ... |），让 Telegram 原生渲染 Native Tables（富文本原生表格）
+ * - 将 <details> 转换为 Telegram 原生可折叠引用块 **>...||
+ * - 规范化 LaTeX 公式
+ * - 压缩大标题间多余的空行，保证视觉紧凑美观
+ */
+export function formatForTelegramRichMessage(rawContent: string): string {
+	let text = normalizeLatexForRichMarkdown(rawContent);
+
+	const detailsRegex = /<details>([\s\S]*?)<\/details>/gi;
+	text = text.replace(detailsRegex, (_match, innerContent) => {
+		let summaryTitle = '💬 点击展开详细讨论与消息溯源 🔽';
+		let cleanedInner = innerContent;
+		const summaryMatch = innerContent.match(/<summary>([\s\S]*?)<\/summary>/i);
+		if (summaryMatch) {
+			summaryTitle = summaryMatch[1].trim() + ' 🔽';
+			cleanedInner = innerContent.replace(/<summary>[\s\S]*?<\/summary>/i, '');
+		}
+		const trimmedContent = cleanedInner.trim();
+		const lines = `${summaryTitle}\n\n${trimmedContent}`.split('\n');
+		const firstLine = `**>${lines[0]}`;
+		const restLines = lines.slice(1).map((line) => `>${line}`);
+		return `\n\n${firstLine}\n${restLines.join('\n')}||`;
+	});
+
+	return normalizeSpacing(text);
+}
+
+/**
+ * 调用 Telegram Bot API 10.1+ 的 sendRichMessage 端点发送原生富文本
+ */
+export async function sendTelegramRichMessage(
+	token: string,
+	chatId: string | number,
+	markdown: string,
+	replyToMessageId?: number
+): Promise<{ ok: boolean; result?: any; description?: string }> {
+	const url = `https://api.telegram.org/bot${token}/sendRichMessage`;
+	const body: any = {
+		chat_id: chatId.toString(),
+		rich_message: {
+			markdown,
+		},
+	};
+	if (replyToMessageId) {
+		body.reply_parameters = { message_id: replyToMessageId };
+	}
+	try {
+		const res = await fetch(url, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body),
+		});
+		return (await res.json()) as any;
+	} catch (e: any) {
+		return { ok: false, description: e?.message || String(e) };
+	}
+}
+
+/**
+ * 删除 Telegram 聊天中的指定消息（用于清理思考中等临时提示消息）
+ */
+export async function deleteTelegramMessage(
+	token: string,
+	chatId: string | number,
+	messageId: number
+): Promise<boolean> {
+	try {
+		const res = await fetch(`https://api.telegram.org/bot${token}/deleteMessage`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				chat_id: chatId.toString(),
+				message_id: messageId,
+			}),
+		});
+		return res.ok;
+	} catch {
+		return false;
+	}
+}
+
 

@@ -5,7 +5,13 @@ import { Buffer } from 'node:buffer';
 import { isJPEG } from './isJpeg';
 import { extractAllOGInfo } from "./og";
 import { logModelError } from './logModelError';
-import { formatRichTelegramMessage } from './richFormat';
+import {
+	formatRichTelegramMessage,
+	formatForTelegramRichMessage,
+	sendTelegramRichMessage,
+	deleteTelegramMessage,
+	normalizeSpacing,
+} from './richFormat';
 import {
 	initWhitelistTables,
 	isSuperAdmin,
@@ -188,11 +194,11 @@ const SYSTEM_PROMPTS = {
    在开头用 2~4 个精炼要点概括今日群聊最核心的共识、进展或突发热点，使用 📌 或 💡 开头。
 
 2. **【📊 议题简表】（必须输出标准 Markdown 表格）**：
-   梳理本次讨论的核心议题，输出简洁的 Markdown 表格：
+   梳理本次讨论的核心议题，输出紧凑精炼的 Markdown 原生表格：
    | 议题分类 | 核心结论 / 共识 |
-   | :--- | :--- |
+   |:---|:---|
    | ... | ... |
-   （精炼概括，通常包含 2~5 个关键议题）
+   （精炼概括 2~5 个关键议题，表格内容单行简要概括，严禁在表格内换行或填充过多字数）
 
 3. **【💬 详细脉络与讨论溯源】（放入 <details> 标签中实现折叠）**：
    在表格之后，使用 <details> 标签将详细讨论与引用包裹起来，示例：
@@ -203,7 +209,10 @@ const SYSTEM_PROMPTS = {
    若有包含图片内容，请在相应议题中进行生动的描述。
    </details>
 
-4. 整体风格专业干练，捕捉对话真实情绪，层次分明。`,
+4. **【排版与间距严格规范】**：
+   - 紧凑布局：每个大标题之间、表格与标题之间仅保留单个换行空行，严禁输出连续多个空行或大面积空白！
+   - 标题命名规范：一律使用【💡 核心要点速览】、【📊 议题简表】、【💬 详细脉络与讨论溯源】，括号和内部字符之间不留多余空格。
+   - 整体风格专业干练，捕捉对话真实情绪，层次分明。`,
 
 	answerQuestion: `你是一个群聊智能问答助手。你的任务是基于提供的群聊记录精准回答用户的问题。
 群聊记录将按以下格式提供：
@@ -230,8 +239,13 @@ function getCommandVar(str: string, delim: string) {
 }
 
 function messageTemplate(s: string, modelName: string) {
-	const header = modelName ? `下面由 ${escapeMarkdownV2(modelName)} 概括群聊信息\n` : `群聊信息概括如下：\n`;
-	return header + s + `\n本开源项目[地址](https://github\\.com/cuteys/ChatGist)`;
+	const header = modelName ? `下面由 ${escapeMarkdownV2(modelName)} 概括群聊信息\n\n` : `群聊信息概括如下：\n\n`;
+	return normalizeSpacing(header + s + `\n\n本开源项目[地址](https://github\\.com/cuteys/ChatGist)`);
+}
+
+function richMessageTemplate(s: string, modelName: string) {
+	const header = modelName ? `下面由 ${modelName} 概括群聊信息\n\n` : `群聊信息概括如下：\n\n`;
+	return normalizeSpacing(header + s + `\n\n本开源项目 [地址](https://github.com/cuteys/ChatGist)`);
 }
 
 /**
@@ -929,6 +943,18 @@ export default {
 					return new Response('ok');
 				}
 
+				// 立即反馈状态提示
+				let statusMessageId: number | undefined;
+				try {
+					const initRes = await ctx.reply(`🔍 正在检索关键词【${keyword}】，请稍候...`);
+					if (initRes?.ok) {
+						const initData: any = await initRes.json();
+						statusMessageId = initData?.result?.message_id;
+					}
+				} catch (e) {
+					console.error("Failed to send query status", e);
+				}
+
 				const { results } = await env.DB.prepare(`
 					SELECT * FROM Messages
 					WHERE groupId = ? AND content NOT LIKE 'data:image%' AND content GLOB ?
@@ -936,6 +962,10 @@ export default {
 					LIMIT 50`)
 					.bind(groupId, `*${keyword}*`)
 					.all();
+
+				if (statusMessageId) {
+					await deleteTelegramMessage(getTelegramToken(env), groupId, statusMessageId);
+				}
 
 				if (!results || results.length === 0) {
 					await ctx.reply(`🔍 未找到包含关键词【${keyword}】的相关历史消息。`);
@@ -954,7 +984,7 @@ export default {
 					outputLines.push(`\nℹ️ 结果较多，仅展示最近 ${MAX_DISPLAY} 条记录。`);
 				}
 
-				const responseText = outputLines.join('\n');
+				const responseText = normalizeSpacing(outputLines.join('\n'));
 				const res = await ctx.reply(escapeMarkdownV2(responseText), "MarkdownV2");
 				if (!res?.ok) {
 					console.error(`Error sending message:`, res?.status, res?.statusText, await res?.text());
@@ -982,6 +1012,22 @@ export default {
 					await ctx.reply('⚠️ 请输入要问的问题，例如：/ask 大家刚才在讨论什么？');
 					return new Response('ok');
 				}
+
+				// 群内发指令时，在群内回复即时反馈
+				const isGroup = msg.chat.type?.includes('group');
+				let groupAckMessageId: number | undefined;
+				if (isGroup) {
+					try {
+						const ackRes = await ctx.reply("⏳ 收到提问，正在分析近期群聊并在私聊中为您推送解答...");
+						if (ackRes?.ok) {
+							const ackData: any = await ackRes.json();
+							groupAckMessageId = ackData?.result?.message_id;
+						}
+					} catch (e) {
+						console.error("Failed to send ack in group", e);
+					}
+				}
+
 				let res = await ctx.api.sendMessage(ctx.bot.api.toString(), {
 					"chat_id": userId,
 					"parse_mode": "MarkdownV2",
@@ -989,7 +1035,10 @@ export default {
 					reply_to_message_id: -1,
 				});
 				if (!res.ok) {
-					await ctx.reply(`请开启和 bot 的私聊, 不然无法接收消息`);
+					if (groupAckMessageId) {
+						await deleteTelegramMessage(getTelegramToken(env), groupId, groupAckMessageId);
+					}
+					await ctx.reply(`请先在私聊中向机器人发送 /start 发起对话，否则无法私信推送答案。`);
 					return new Response('ok');
 				}
 				const { results } = await env.DB.prepare(`
@@ -1033,6 +1082,9 @@ export default {
 							...getCompletionOptions(model),
 						});
 				} catch (e) {
+					if (groupAckMessageId) {
+						await deleteTelegramMessage(getTelegramToken(env), groupId, groupAckMessageId);
+					}
 					logModelError(e, { command: 'ask', model }, [getApiKey(env), getTelegramToken(env)]);
 					await ctx.reply('回答失败，AI 服务暂时无法完成请求，请稍后重试。');
 					return new Response('ok');
@@ -1055,9 +1107,15 @@ export default {
 					let reason = (await res.json() as any)?.promptFeedback?.blockReason;
 					if (reason) {
 						await ctx.reply(`无法回答, 理由 ${reason}`);
+						if (groupAckMessageId) {
+							await deleteTelegramMessage(getTelegramToken(env), groupId, groupAckMessageId);
+						}
 						return new Response('ok');
 					}
 					await ctx.reply(`发送失败`);
+				}
+				if (groupAckMessageId) {
+					await deleteTelegramMessage(getTelegramToken(env), groupId, groupAckMessageId);
 				}
 				return new Response('ok');
 			})
@@ -1098,6 +1156,18 @@ export default {
 					return new Response('ok');
 				}
 
+				// 立即反馈执行状态，避免用户等待时产生无响应的错觉
+				let statusMessageId: number | undefined;
+				try {
+					const initRes = await bot.reply("⏳ 正在读取群聊记录并生成总结，请稍候...");
+					if (initRes?.ok) {
+						const initData: any = await initRes.json();
+						statusMessageId = initData?.result?.message_id;
+					}
+				} catch (e) {
+					console.error("Failed to send initial status message:", e);
+				}
+
 				if (summary.endsWith("h")) {
 					results = (await env.DB.prepare(`
 						SELECT *
@@ -1124,12 +1194,18 @@ export default {
 				}
 
 				if (!results || results.length === 0) {
+					if (statusMessageId) {
+						await deleteTelegramMessage(getTelegramToken(env), groupId, statusMessageId);
+					}
 					await bot.reply('📋 在指定范围暂无群聊消息记录，无需总结。');
 					return new Response('ok');
 				}
 
 				const model = getModelName(env);
 				if (!model) {
+					if (statusMessageId) {
+						await deleteTelegramMessage(getTelegramToken(env), groupId, statusMessageId);
+					}
 					await bot.reply('未配置 AI_MODEL 环境变量，无法处理请求。');
 					return new Response('ok');
 				}
@@ -1158,26 +1234,57 @@ export default {
 						});
 
 					const raw = result.choices[0].message.content || "";
-					const formatted = formatRichTelegramMessage(
-						processMarkdownLinks(raw),
-						{ isSummary: true }
+					const processedMarkdown = processMarkdownLinks(raw);
+
+					// 1. 优先尝试 Telegram Bot API 原生富文本发送 (支持 Native Tables 原生富文本表格)
+					const richContent = richMessageTemplate(
+						fixLink(formatForTelegramRichMessage(processedMarkdown)),
+						model
 					);
-					let replyContent = messageTemplate(fixLink(formatted), model);
-					if (isDefault) {
-						replyContent = `💡（未指定参数，默认总结近期 50 条消息）\n\n` + replyContent;
-					}
-					let res = await bot.reply(
-						replyContent,
-						'MarkdownV2'
+					const finalRichContent = isDefault
+						? `💡（未指定参数，默认总结近期 50 条消息）\n\n` + richContent
+						: richContent;
+
+					const richRes = await sendTelegramRichMessage(
+						getTelegramToken(env),
+						groupId,
+						finalRichContent,
+						msg.message_id
 					);
-					if (!res?.ok) {
-						console.error("Failed to send reply with MarkdownV2, falling back to plain text:", res?.statusText, await res?.text());
-						// MarkdownV2 解析错误时降级为纯文本发送，避免机器人“无反应”
-						const plainText = replyContent.replace(/\\([_*[\]()~`>#+\-=|{}.!])/g, '$1');
-						await bot.reply(plainText);
+
+					if (richRes.ok) {
+						if (statusMessageId) {
+							await deleteTelegramMessage(getTelegramToken(env), groupId, statusMessageId);
+						}
+					} else {
+						console.error("sendRichMessage failed, fallback to standard reply:", richRes.description);
+						// 2. 降级回退：使用 standard sendMessage
+						const formatted = formatRichTelegramMessage(
+							processedMarkdown,
+							{ isSummary: true }
+						);
+						let replyContent = messageTemplate(fixLink(formatted), model);
+						if (isDefault) {
+							replyContent = `💡（未指定参数，默认总结近期 50 条消息）\n\n` + replyContent;
+						}
+						let res = await bot.reply(
+							replyContent,
+							'MarkdownV2'
+						);
+						if (!res?.ok) {
+							console.error("Failed to send reply with MarkdownV2, falling back to plain text:", res?.statusText, await res?.text());
+							const plainText = replyContent.replace(/\\([_*[\]()~`>#+\-=|{}.!])/g, '$1');
+							await bot.reply(plainText);
+						}
+						if (statusMessageId) {
+							await deleteTelegramMessage(getTelegramToken(env), groupId, statusMessageId);
+						}
 					}
 				}
 				catch (e) {
+					if (statusMessageId) {
+						await deleteTelegramMessage(getTelegramToken(env), groupId, statusMessageId);
+					}
 					logModelError(e, { command: 'summary', model }, [getApiKey(env), getTelegramToken(env)]);
 					await bot.reply('概括失败，暂时无法完成请求，请稍后重试。');
 				}
@@ -1245,19 +1352,44 @@ export default {
 						const groupName = msg.chat.title || "anonymous";
 						const timeStamp = Date.now();
 						const userName = getUserName(msg);
-						const photo = msg.photo![msg.photo!.length - 1];
-						const file = await bot.getFile(photo.file_id).then((response) => response.arrayBuffer());
-						if (!isJPEG(file)) {
-							console.error("not a valid jpeg");
+
+						// 智能降级与压缩机制：
+						// Telegram 会自动生成多档清晰度规格 (从缩略图到高分原图)
+						// 倒序优先选择体积 <= 950KB 的最清晰尺寸，若全部超出则逐级回退，彻底解决大于 1MB 图片无法识别的问题
+						const candidatePhotos = [...(msg.photo || [])].reverse();
+						let file: ArrayBuffer | null = null;
+
+						for (const p of candidatePhotos) {
+							// 若 Telegram 明确标注了文件大小且超过 950KB，跳过该超大档位
+							if (p.file_size && p.file_size > 950 * 1024) {
+								continue;
+							}
+							try {
+								const buf = await bot.getFile(p.file_id).then((response) => response.arrayBuffer());
+								if (buf.byteLength <= 1024 * 1024) {
+									file = buf;
+									break;
+								}
+							} catch (err) {
+								console.error("Error downloading photo tier:", err);
+							}
+						}
+
+						// 极端保底：若候选全超出，则下载 Telegram 最小缩略图 (通常 < 50KB)
+						if (!file && msg.photo && msg.photo.length > 0) {
+							try {
+								file = await bot.getFile(msg.photo[0].file_id).then((response) => response.arrayBuffer());
+							} catch (err) {
+								console.error("Error downloading fallback thumbnail:", err);
+							}
+						}
+
+						if (!file || !isJPEG(file)) {
+							console.error("not a valid jpeg or failed to download photo");
 							return new Response('ok');
 						}
-						// 限制单张存入数据库的图片大小（超出 1MB 不存 Base64，防止撑爆 D1 单行上限）
-						let content: string;
-						if (file.byteLength > 1024 * 1024) {
-							content = `[图片: 大小超出 1MB，已略过预览]`;
-						} else {
-							content = "data:image/jpeg;base64," + Buffer.from(file).toString("base64");
-						}
+
+						const content = "data:image/jpeg;base64," + Buffer.from(file).toString("base64");
 						try {
 							await env.DB.prepare(`
 							INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)`)
