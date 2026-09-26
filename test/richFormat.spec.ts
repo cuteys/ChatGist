@@ -286,4 +286,117 @@ describe('richFormat tests', () => {
 			globalThis.fetch = originalFetch;
 		}
 	});
+
+	it('aggregates structured Markdown with <details>, tables, and checklists into Rich Blocks AST', async () => {
+		const { aggregateMarkdownToRichBlocks } = await import('../src/richFormat');
+
+		const markdown = `
+# 架构讨论深度总结
+
+本期群聊聚焦于 **分布式缓存架构** 与 **故障自愈机制**。
+
+<details>
+<summary>缓存集群与分片机制</summary>
+
+### 1. 核心讨论
+群友讨论了 Redis Cluster 与 Consistent Hashing，详见 [💬 原文](https://t.me/c/123456/101)。
+
+### 2. 方案对比
+| 方案名称 | 吞吐量 | 溯源依据 |
+| :---: | :---: | :---: |
+| **方案A** | 100k QPS | [💬 原文](https://t.me/c/123456/102) |
+| **方案B** | 50k QPS | [💬 原文](https://t.me/c/123456/103) |
+
+</details>
+
+<details>
+<summary>待办事项与操作清单</summary>
+
+- [ ] **灰度验证**：在测试集群开启验证 [💬 原文](https://t.me/c/123456/104)
+- [x] **配置校对**：核对超时参数
+</details>
+`;
+
+		const blocks = aggregateMarkdownToRichBlocks(markdown);
+		expect(blocks.length).toBeGreaterThanOrEqual(3);
+
+		// Top heading & overview
+		expect(blocks[0].type).toBe('heading');
+		expect(blocks[1].type).toBe('paragraph');
+
+		// First details block
+		const details1 = blocks.find((b) => b.type === 'details' && b.summary === '缓存集群与分片机制') as any;
+		expect(details1).toBeDefined();
+
+		// Check table inside details1
+		const table = details1.blocks.find((b: any) => b.type === 'table');
+		expect(table).toBeDefined();
+		expect(table.is_bordered).toBe(true);
+		expect(table.is_striped).toBe(true);
+		expect(table.cells.length).toBe(3); // 1 header + 2 rows
+		const cellContent = table.cells[1][2].text;
+		const linkCell = Array.isArray(cellContent) ? cellContent[0] : cellContent;
+		expect(linkCell.type).toBe('link');
+		expect(linkCell.url).toBe('https://t.me/c/123456/102');
+
+		// Second details block (checklist)
+		const details2 = blocks.find((b) => b.type === 'details' && b.summary === '待办事项与操作清单') as any;
+		expect(details2).toBeDefined();
+		const listBlock = details2.blocks.find((b: any) => b.type === 'list');
+		expect(listBlock).toBeDefined();
+		expect(listBlock.items.length).toBe(2);
+		expect(listBlock.items[0].has_checkbox).toBe(true);
+		expect(listBlock.items[0].is_checked).toBe(false);
+		expect(listBlock.items[1].has_checkbox).toBe(true);
+		expect(listBlock.items[1].is_checked).toBe(true);
+	});
+
+	it('auto-folds standard ## sections into details drawers when <details> tags are not used', async () => {
+		const { aggregateMarkdownToRichBlocks } = await import('../src/richFormat');
+
+		const markdown = `
+# 系统日常总结
+
+总览概述段落，整体平稳运行。
+
+## 议题一：网络延迟优化
+讨论了 BGP 路由与 CDN 节点调度。 [💬 原文](https://t.me/c/999/888)
+
+## 议题二：数据库索引调优
+优化了联合索引顺序。
+`;
+
+		const blocks = aggregateMarkdownToRichBlocks(markdown);
+		const detailsBlocks = blocks.filter((b) => b.type === 'details') as any[];
+		expect(detailsBlocks.length).toBe(2);
+		expect(detailsBlocks[0].summary).toBe('议题一：网络延迟优化');
+		expect(detailsBlocks[1].summary).toBe('议题二：数据库索引调优');
+	});
+
+	it('converts RichBlocks to standard expandable blockquote HTML', async () => {
+		const { richBlocksToHtml } = await import('../src/richFormat');
+
+		const blocks: any[] = [
+			{
+				type: 'details',
+				summary: '折叠抽屉测试',
+				blocks: [
+					{
+						type: 'paragraph',
+						text: [
+							{ type: 'bold', text: '加粗文字' },
+							' 与 ',
+							{ type: 'link', text: '💬 原文', url: 'https://t.me/c/123/456' },
+						],
+					},
+				],
+			},
+		];
+
+		const html = richBlocksToHtml(blocks);
+		expect(html).toContain('<blockquote expandable>');
+		expect(html).toContain('折叠抽屉测试');
+		expect(html).toContain('<b>加粗文字</b>');
+		expect(html).toContain('<a href="https://t.me/c/123/456">💬 原文</a>');
+	});
 });

@@ -254,43 +254,412 @@ export async function deleteTelegramMessage(
 }
 
 // ==========================================
-// 3. AI 直接生成 JSON 的解析器
+// 3. 本地富文本聚合引擎与 Markdown 解析器
 // ==========================================
 
+export function parseRichInline(text: string): RichText {
+	if (!text) return '';
+
+	// 匹配链接、Telegram 消息直达链接、粗体、斜体、行内代码、高亮、指令
+	const tokenRegex = /(\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|https?:\/\/(?:t\.me\/c|tme\.cat)\/[^\s,，。！!？?)]+|\*\*([^*]+)\*\*|__([^_]+)__|`([^`]+)`|==([^=]+)==|\*([^*]+)\*|_([^_]+)_|(?:\/([a-zA-Z0-9_]{1,64})))/g;
+
+	const parts: RichTextPart[] = [];
+	let lastIndex = 0;
+	let match: RegExpExecArray | null;
+
+	while ((match = tokenRegex.exec(text)) !== null) {
+		const matchStart = match.index;
+		const matchEnd = tokenRegex.lastIndex;
+
+		if (matchStart > lastIndex) {
+			parts.push(text.slice(lastIndex, matchStart));
+		}
+
+		const fullMatch = match[0];
+
+		if (match[2] && match[3]) {
+			// [text](url) 溯源链接
+			parts.push({
+				type: 'link',
+				text: match[2],
+				url: fixLink(match[3]),
+			});
+		} else if (fullMatch.startsWith('http://') || fullMatch.startsWith('https://')) {
+			// 裸露的 Telegram 消息链接，直接转化为优雅的 💬 原文
+			parts.push({
+				type: 'link',
+				text: '💬 原文',
+				url: fixLink(fullMatch),
+			});
+		} else if (match[4] || match[5]) {
+			// 粗体
+			parts.push({
+				type: 'bold',
+				text: match[4] || match[5],
+			});
+		} else if (match[6]) {
+			// 行内代码
+			parts.push({
+				type: 'code',
+				text: match[6],
+			});
+		} else if (match[7]) {
+			// 重点标记
+			parts.push({
+				type: 'marked',
+				text: match[7],
+			});
+		} else if (match[8] || match[9]) {
+			// 斜体
+			parts.push({
+				type: 'italic',
+				text: match[8] || match[9],
+			});
+		} else if (match[10]) {
+			// Bot Command
+			parts.push({
+				type: 'bot_command',
+				text: `/${match[10]}`,
+				bot_command: match[10],
+			});
+		} else {
+			parts.push(fullMatch);
+		}
+
+		lastIndex = matchEnd;
+	}
+
+	if (lastIndex < text.length) {
+		parts.push(text.slice(lastIndex));
+	}
+
+	if (parts.length === 0) return '';
+	if (parts.length === 1) return parts[0];
+	return parts;
+}
+
+export function parseMarkdownSectionBlocks(content: string): RichBlock[] {
+	const trimmed = (content || '').trim();
+	if (!trimmed) return [];
+
+	const lines = trimmed.split(/\r?\n/);
+	const blocks: RichBlock[] = [];
+
+	let i = 0;
+	while (i < lines.length) {
+		const rawLine = lines[i];
+		const line = rawLine.trim();
+
+		if (!line) {
+			i++;
+			continue;
+		}
+
+		// 1. 标题 (Heading)
+		const headingMatch = line.match(/^(#{1,6})\s+(.+)$/);
+		if (headingMatch) {
+			const size = Math.min(Math.max(headingMatch[1].length, 1), 6) as 1 | 2 | 3 | 4 | 5 | 6;
+			blocks.push({
+				type: 'heading',
+				size,
+				text: parseRichInline(headingMatch[2].trim()),
+			});
+			i++;
+			continue;
+		}
+
+		// 2. 分割线 (Divider)
+		if (/^[-*_]{3,}$/.test(line)) {
+			blocks.push({ type: 'divider' });
+			i++;
+			continue;
+		}
+
+		// 3. 引用块 (Blockquote)
+		if (line.startsWith('>')) {
+			const quoteLines: string[] = [];
+			while (
+				i < lines.length &&
+				(lines[i].trim().startsWith('>') ||
+					(lines[i].trim() &&
+						quoteLines.length > 0 &&
+						!lines[i].trim().startsWith('#') &&
+						!lines[i].trim().startsWith('|')))
+			) {
+				const ql = lines[i].trim();
+				if (ql.startsWith('>')) {
+					quoteLines.push(ql.replace(/^>\s?/, ''));
+				} else {
+					quoteLines.push(ql);
+				}
+				i++;
+			}
+			const quoteText = quoteLines.join('\n').trim();
+			if (quoteText) {
+				blocks.push({
+					type: 'blockquote',
+					blocks: [
+						{
+							type: 'paragraph',
+							text: parseRichInline(quoteText),
+						},
+					],
+				});
+			}
+			continue;
+		}
+
+		// 4. 表格 (Markdown Pipe Table)
+		if (line.startsWith('|') && line.includes('|', 1)) {
+			const tableLines: string[] = [];
+			while (i < lines.length && lines[i].trim().startsWith('|')) {
+				tableLines.push(lines[i].trim());
+				i++;
+			}
+
+			if (tableLines.length >= 2) {
+				const parseRow = (rowStr: string): string[] => {
+					return rowStr
+						.replace(/^\|/, '')
+						.replace(/\|$/, '')
+						.split('|')
+						.map((c) => c.trim());
+				};
+
+				const headerCells = parseRow(tableLines[0]);
+				let alignRowIdx = 1;
+				let aligns: Array<'left' | 'center' | 'right'> = [];
+
+				if (/^\|?\s*:?-+:?\s*(\||\s*$)/.test(tableLines[1])) {
+					aligns = parseRow(tableLines[1]).map((c) => {
+						const hasLeft = c.startsWith(':');
+						const hasRight = c.endsWith(':');
+						if (hasLeft && hasRight) return 'center';
+						if (hasRight) return 'right';
+						return 'left';
+					});
+					alignRowIdx = 2;
+				}
+
+				const cells: RichTableCell[][] = [];
+				cells.push(
+					headerCells.map((h, colIdx) => ({
+						text: parseRichInline(h),
+						is_header: true,
+						align: aligns[colIdx] || 'center',
+						valign: 'middle',
+					}))
+				);
+
+				for (let r = alignRowIdx; r < tableLines.length; r++) {
+					const rowCols = parseRow(tableLines[r]);
+					if (rowCols.length === 0 || (rowCols.length === 1 && !rowCols[0])) continue;
+					cells.push(
+						rowCols.map((col, colIdx) => ({
+							text: parseRichInline(col),
+							align: aligns[colIdx] || 'left',
+							valign: 'middle',
+						}))
+					);
+				}
+
+				blocks.push({
+					type: 'table',
+					is_bordered: true,
+					is_striped: true,
+					cells,
+				});
+				continue;
+			}
+		}
+
+		// 5. 待办事项与列表 (Checklist & List)
+		const isListLine = (l: string) => /^[-*•]\s+(\[[ xX]\]\s+)?/.test(l) || /^\d+\.\s+/.test(l);
+		if (isListLine(line)) {
+			const items: RichListItem[] = [];
+			while (i < lines.length && isListLine(lines[i].trim())) {
+				const l = lines[i].trim();
+				const checkMatch = l.match(/^[-*•]\s+\[([ xX])\]\s+(.+)$/);
+				if (checkMatch) {
+					const isChecked = checkMatch[1].toLowerCase() === 'x';
+					items.push({
+						label: '•',
+						has_checkbox: true,
+						is_checked: isChecked,
+						blocks: [
+							{
+								type: 'paragraph',
+								text: parseRichInline(checkMatch[2].trim()),
+							},
+						],
+					});
+				} else {
+					const itemText = l.replace(/^[-*•]\s+/, '').replace(/^\d+\.\s+/, '').trim();
+					items.push({
+						label: '•',
+						blocks: [
+							{
+								type: 'paragraph',
+								text: parseRichInline(itemText),
+							},
+						],
+					});
+				}
+				i++;
+			}
+
+			blocks.push({
+				type: 'list',
+				items,
+			});
+			continue;
+		}
+
+		// 6. 普通段落 (Paragraph)
+		const paraLines: string[] = [];
+		while (
+			i < lines.length &&
+			lines[i].trim() &&
+			!lines[i].trim().match(/^#{1,6}\s+/) &&
+			!/^[-*_]{3,}$/.test(lines[i].trim()) &&
+			!lines[i].trim().startsWith('>') &&
+			!lines[i].trim().startsWith('|') &&
+			!isListLine(lines[i].trim())
+		) {
+			paraLines.push(lines[i].trim());
+			i++;
+		}
+
+		if (paraLines.length > 0) {
+			const joined = paraLines.join('\n');
+			blocks.push({
+				type: 'paragraph',
+				text: parseRichInline(joined),
+			});
+		}
+	}
+
+	return blocks;
+}
+
 /**
- * 直接解析大模型输出的 Rich Message JSON
+ * 本地聚合器：将大模型生成的结构化 Markdown 转换为 Telegram 原生 AST
+ * 兼容 <details><summary> 与标准 ## / ### 章节折叠
+ */
+export function aggregateMarkdownToRichBlocks(content: string): RichBlock[] {
+	let raw = (content || '').trim();
+
+	if (raw.startsWith('```')) {
+		raw = raw.replace(/^```(?:markdown|md)?\s*/i, '').replace(/\s*```$/i, '').trim();
+	}
+
+	raw = fixLink(processMarkdownLinks(removeThematicBreaks(raw)));
+
+	// 1. 若包含显式 <details><summary> 标签
+	const detailsRegex = /<details>[\s\S]*?<summary>([\s\S]*?)<\/summary>([\s\S]*?)<\/details>/gi;
+	if (/<details[\s>]/i.test(raw) && /<\/details>/i.test(raw)) {
+		const blocks: RichBlock[] = [];
+		let lastIndex = 0;
+		let match: RegExpExecArray | null;
+
+		while ((match = detailsRegex.exec(raw)) !== null) {
+			const before = raw.slice(lastIndex, match.index).trim();
+			if (before) {
+				blocks.push(...parseMarkdownSectionBlocks(before));
+			}
+
+			const summary = match[1].replace(/<[^>]+>/g, '').trim();
+			const innerContent = match[2].trim();
+			const innerBlocks = parseMarkdownSectionBlocks(innerContent);
+
+			blocks.push({
+				type: 'details',
+				summary: summary || '详细内容',
+				blocks: innerBlocks.length > 0 ? innerBlocks : [{ type: 'paragraph', text: '（无详细内容）' }],
+			});
+
+			lastIndex = detailsRegex.lastIndex;
+		}
+
+		const after = raw.slice(lastIndex).trim();
+		if (after) {
+			blocks.push(...parseMarkdownSectionBlocks(after));
+		}
+
+		return blocks;
+	}
+
+	// 2. 若未包含 <details> 标签，但包含 ## 或 ### 分段
+	const sectionHeadingRegex = /^(#{2,3})\s+(.+)$/gm;
+	const headingMatches: Array<{ index: number; title: string; length: number }> = [];
+	let hMatch: RegExpExecArray | null;
+
+	while ((hMatch = sectionHeadingRegex.exec(raw)) !== null) {
+		headingMatches.push({
+			index: hMatch.index,
+			title: hMatch[2].trim(),
+			length: hMatch[0].length,
+		});
+	}
+
+	if (headingMatches.length > 0) {
+		const blocks: RichBlock[] = [];
+		const preamble = raw.slice(0, headingMatches[0].index).trim();
+		if (preamble) {
+			blocks.push(...parseMarkdownSectionBlocks(preamble));
+		}
+
+		for (let s = 0; s < headingMatches.length; s++) {
+			const current = headingMatches[s];
+			const startPos = current.index + current.length;
+			const endPos = s + 1 < headingMatches.length ? headingMatches[s + 1].index : raw.length;
+			const sectionBody = raw.slice(startPos, endPos).trim();
+
+			const innerBlocks = parseMarkdownSectionBlocks(sectionBody);
+			blocks.push({
+				type: 'details',
+				summary: current.title,
+				blocks: innerBlocks.length > 0 ? innerBlocks : [{ type: 'paragraph', text: '（暂无更多详情）' }],
+			});
+		}
+
+		return blocks;
+	}
+
+	// 3. 普通纯文本回退
+	return parseMarkdownSectionBlocks(raw);
+}
+
+/**
+ * 解析大模型输出：优先直接解析合法 JSON，非 JSON 则交由本地聚合器高保真转换
  */
 export function parseRichMessageResponse(raw: string): { blocks: RichBlock[] } {
 	let clean = (raw || '').trim();
 
-	// 剥离可能存在的 markdown json 代码块包裹 (```json ... ```)
 	if (clean.startsWith('```')) {
 		clean = clean.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
 	}
 
-	try {
-		const parsed = JSON.parse(clean);
-		if (parsed.rich_message && Array.isArray(parsed.rich_message.blocks)) {
-			return parsed.rich_message;
+	if (clean.startsWith('{') || clean.startsWith('[')) {
+		try {
+			const parsed = JSON.parse(clean);
+			if (parsed.rich_message && Array.isArray(parsed.rich_message.blocks)) {
+				return parsed.rich_message;
+			}
+			if (Array.isArray(parsed.blocks)) {
+				return { blocks: parsed.blocks };
+			}
+			if (Array.isArray(parsed)) {
+				return { blocks: parsed };
+			}
+		} catch {
+			// 不是合法 JSON，继续交由本地 Markdown 聚合器处理
 		}
-		if (Array.isArray(parsed.blocks)) {
-			return { blocks: parsed.blocks };
-		}
-		if (Array.isArray(parsed)) {
-			return { blocks: parsed };
-		}
-	} catch (e) {
-		console.warn('parseRichMessageResponse: AI output is not valid JSON, using fallback block', e);
 	}
 
-	// 容错降级：若模型未按 JSON 输出，则转为单个段落（绝不胡乱添加 > 引用破坏）
+	const blocks = aggregateMarkdownToRichBlocks(clean);
 	return {
-		blocks: [
-			{
-				type: 'paragraph',
-				text: clean || '（无概括内容）',
-			},
-		],
+		blocks: blocks.length > 0 ? blocks : [{ type: 'paragraph', text: clean || '（无概括内容）' }],
 	};
 }
 
@@ -317,8 +686,89 @@ export function richTextToString(text: RichText): string {
 	return '';
 }
 
+function escapeHtml(str: string): string {
+	return str
+		.replace(/&/g, '&amp;')
+		.replace(/</g, '&lt;')
+		.replace(/>/g, '&gt;')
+		.replace(/"/g, '&quot;');
+}
+
+export function richTextToHtml(text: RichText): string {
+	if (typeof text === 'string') return escapeHtml(text);
+	if (Array.isArray(text)) {
+		return text.map(richTextToHtml).join('');
+	}
+	if (typeof text === 'object' && text !== null) {
+		switch (text.type) {
+			case 'bold':
+				return `<b>${richTextToHtml(text.text)}</b>`;
+			case 'italic':
+				return `<i>${richTextToHtml(text.text)}</i>`;
+			case 'code':
+				return `<code>${escapeHtml(text.text)}</code>`;
+			case 'marked':
+				return `<b>[${escapeHtml(text.text)}]</b>`;
+			case 'link':
+				return `<a href="${escapeHtml(text.url)}">${escapeHtml(text.text)}</a>`;
+			case 'bot_command':
+				return `<code>${escapeHtml(text.text)}</code>`;
+		}
+	}
+	return '';
+}
+
 /**
- * 将 RichBlock 降级为干净易读的文本（绝不添加 > 破坏 HTML）
+ * 将 RichBlock 降级为符合 Telegram 标准规范的 HTML（原生支持 <blockquote expandable> 折叠抽屉）
+ */
+export function richBlocksToHtml(blocks: RichBlock[]): string {
+	const parts: string[] = [];
+
+	for (const block of blocks) {
+		switch (block.type) {
+			case 'blockquote':
+				parts.push(`<blockquote>${richBlocksToHtml(block.blocks)}</blockquote>`);
+				break;
+			case 'heading':
+				parts.push(`\n<b>📌 ${richTextToHtml(block.text)}</b>\n`);
+				break;
+			case 'paragraph':
+				parts.push(richTextToHtml(block.text));
+				break;
+			case 'divider':
+				parts.push('\n━━━━━━━━━━━━━━━━━━━━\n');
+				break;
+			case 'details':
+				parts.push(
+					`\n<blockquote expandable><b>🔽 【${escapeHtml(block.summary)}】</b>\n${richBlocksToHtml(block.blocks)}</blockquote>\n`
+				);
+				break;
+			case 'table':
+				if (block.cells.length > 0) {
+					const tableLines = block.cells.map((row) =>
+						row
+							.map((cell) =>
+								cell.is_header ? `<b>${richTextToHtml(cell.text)}</b>` : richTextToHtml(cell.text)
+							)
+							.join(' | ')
+					);
+					parts.push(`<pre>${escapeHtml(tableLines.join('\n'))}</pre>`);
+				}
+				break;
+			case 'list':
+				for (const item of block.items) {
+					const mark = item.has_checkbox ? (item.is_checked ? '☑️ ' : '🔲 ') : '• ';
+					parts.push(`${mark}${richBlocksToHtml(item.blocks)}`);
+				}
+				break;
+		}
+	}
+
+	return parts.join('\n\n').trim();
+}
+
+/**
+ * 将 RichBlock 降级为干净易读的纯文本
  */
 export function richBlocksToPlainText(blocks: RichBlock[]): string {
 	const lines: string[] = [];
@@ -418,12 +868,45 @@ export async function sendTelegramRichMessage(
 			return { ok: true, status: res.status };
 		}
 
-		console.warn(`sendRichMessage failed (${res.status}): ${await res.text()}, attempting fallback to sendMessage`);
+		console.warn(
+			`sendRichMessage failed (${res.status}): ${await res.text()}, attempting HTML fallback`
+		);
 	} catch (e) {
-		console.warn('sendRichMessage network exception, falling back to sendMessage:', e);
+		console.warn('sendRichMessage network exception, falling back to HTML sendMessage:', e);
 	}
 
-	// 2. 降级方案：转换为普通干净文本通过 sendMessage 发送（严禁加 > 破坏格式）
+	// 2. 第一层降级：Telegram 原生 HTML 模式（原生支持 <blockquote expandable> 折叠抽屉与链接）
+	try {
+		const htmlText = richBlocksToHtml(blocks);
+		const chunks = splitTelegramMessage(htmlText);
+		let htmlOk = true;
+
+		for (const chunk of chunks) {
+			const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					chat_id: chatId.toString(),
+					text: chunk,
+					parse_mode: 'HTML',
+					reply_parameters: options.replyToMessageId ? { message_id: options.replyToMessageId } : undefined,
+				}),
+			});
+			if (!res.ok) {
+				htmlOk = false;
+				console.warn(`sendMessage HTML failed (${res.status}): ${await res.text()}`);
+				break;
+			}
+		}
+
+		if (htmlOk) {
+			return { ok: true };
+		}
+	} catch (err) {
+		console.warn('sendMessage HTML exception, falling back to plain text:', err);
+	}
+
+	// 3. 终极降级方案：纯文本发送
 	const text = options.fallbackText || richBlocksToPlainText(blocks);
 	const chunks = splitTelegramMessage(text);
 
