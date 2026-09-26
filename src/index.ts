@@ -614,7 +614,7 @@ export default {
 					}
 				);
 
-				await sendTelegramRichMessage(getTelegramToken(env), group.groupId, richData.blocks);
+				await sendTelegramRichMessage(getTelegramToken(env), group.groupId, richData.blocks, { rawMarkdown: raw });
 			} catch (err) {
 				console.error(`Error processing scheduled summary for group ${group.groupId}:`, err);
 			}
@@ -798,6 +798,24 @@ export default {
 				if (isGroup) {
 					const whitelisted = await isGroupWhitelisted(env, chat.id.toString());
 					statusText += whitelisted ? '📍 当前群组：已授权（白名单）\n' : '📍 当前群组：未授权\n';
+				}
+
+				if (admin) {
+					try {
+						const token = getTelegramToken(env);
+						const testRes = await fetch(`https://api.telegram.org/bot${token}/sendRichMessage`, {
+							method: 'POST',
+							headers: { 'Content-Type': 'application/json' },
+							body: JSON.stringify({ chat_id: 0, rich_message: { blocks: [] } }),
+						});
+						const testJson: any = await testRes.json().catch(() => null);
+						const richStatus = testRes.status === 404
+							? '❌ 接口未开放 (404 Not Found)'
+							: `✅ 接口响应 (${testRes.status}: ${testJson?.description || '正常'})`;
+						statusText += `\n🌐 原生富文本 (sendRichMessage)：${richStatus}\n`;
+					} catch (e: any) {
+						statusText += `\n🌐 原生富文本探测异常：${e.message}\n`;
+					}
 				}
 
 				if (!admin) {
@@ -1044,7 +1062,7 @@ export default {
 						}
 					);
 					const token = getTelegramToken(env);
-					await sendTelegramRichMessage(token, userId, richData.blocks);
+					await sendTelegramRichMessage(token, userId, richData.blocks, { rawMarkdown: raw });
 				} finally {
 					if (groupAckMessageId) {
 						await deleteTelegramMessage(getTelegramToken(env), groupId, groupAckMessageId);
@@ -1185,7 +1203,7 @@ export default {
 					);
 
 					const token = getTelegramToken(env);
-					await sendTelegramRichMessage(token, groupId, richData.blocks);
+					await sendTelegramRichMessage(token, groupId, richData.blocks, { rawMarkdown: raw });
 				} finally {
 					if (statusMessageId) {
 						await deleteTelegramMessage(getTelegramToken(env), groupId, statusMessageId);

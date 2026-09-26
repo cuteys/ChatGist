@@ -9,7 +9,8 @@ export type RichTextInline =
 	| { type: 'italic'; text: RichText }
 	| { type: 'code'; text: string }
 	| { type: 'marked'; text: string }
-	| { type: 'link'; text: string; url: string }
+	| { type: 'url'; text: string | RichText; url: string }
+	| { type: 'link'; text: string | RichText; url: string }
 	| { type: 'bot_command'; text: string; bot_command?: string };
 
 export type RichTextPart = string | RichTextInline;
@@ -278,16 +279,16 @@ export function parseRichInline(text: string): RichText {
 		const fullMatch = match[0];
 
 		if (match[2] && match[3]) {
-			// [text](url) 溯源链接
+			// [text](url) 溯源链接（Telegram RichTextUrl 规范使用 type: 'url'）
 			parts.push({
-				type: 'link',
+				type: 'url',
 				text: match[2],
 				url: fixLink(match[3]),
 			});
 		} else if (fullMatch.startsWith('http://') || fullMatch.startsWith('https://')) {
 			// 裸露的 Telegram 消息链接，直接转化为优雅的 💬 原文
 			parts.push({
-				type: 'link',
+				type: 'url',
 				text: '💬 原文',
 				url: fixLink(fullMatch),
 			});
@@ -709,8 +710,9 @@ export function richTextToHtml(text: RichText): string {
 				return `<code>${escapeHtml(text.text)}</code>`;
 			case 'marked':
 				return `<b>[${escapeHtml(text.text)}]</b>`;
+			case 'url':
 			case 'link':
-				return `<a href="${escapeHtml(text.url)}">${escapeHtml(text.text)}</a>`;
+				return `<a href="${escapeHtml(text.url)}">${typeof text.text === 'string' ? escapeHtml(text.text) : richTextToHtml(text.text)}</a>`;
 			case 'bot_command':
 				return `<code>${escapeHtml(text.text)}</code>`;
 		}
@@ -752,7 +754,7 @@ export function richBlocksToHtml(blocks: RichBlock[]): string {
 							)
 							.join(' | ')
 					);
-					parts.push(`<pre>${escapeHtml(tableLines.join('\n'))}</pre>`);
+					parts.push(tableLines.join('\n'));
 				}
 				break;
 			case 'list':
@@ -836,6 +838,7 @@ export async function sendTelegramRichMessage(
 	options: {
 		replyToMessageId?: number;
 		fallbackText?: string;
+		rawMarkdown?: string;
 	} = {}
 ): Promise<{ ok: boolean; status?: number; error?: string }> {
 	if (!token) {
@@ -856,7 +859,7 @@ export async function sendTelegramRichMessage(
 		};
 	}
 
-	// 1. 优先调用 Telegram 原生 sendRichMessage
+	// 1. 优先调用 Telegram Bot API 10.x 原生 sendRichMessage (blocks AST 模式)
 	try {
 		const res = await fetch(`https://api.telegram.org/bot${token}/sendRichMessage`, {
 			method: 'POST',
@@ -868,14 +871,39 @@ export async function sendTelegramRichMessage(
 			return { ok: true, status: res.status };
 		}
 
-		console.warn(
-			`sendRichMessage failed (${res.status}): ${await res.text()}, attempting HTML fallback`
-		);
+		const errBody = await res.text();
+		console.warn(`sendRichMessage (blocks) failed (${res.status}): ${errBody}`);
 	} catch (e) {
-		console.warn('sendRichMessage network exception, falling back to HTML sendMessage:', e);
+		console.warn('sendRichMessage (blocks) network exception:', e);
 	}
 
-	// 2. 第一层降级：Telegram 原生 HTML 模式（原生支持 <blockquote expandable> 折叠抽屉与链接）
+	// 2. 次选方案：调用 sendRichMessage 原生支持的 markdown 字段 (Telegram 官方解析引擎)
+	if (options.rawMarkdown) {
+		try {
+			const mdRes = await fetch(`https://api.telegram.org/bot${token}/sendRichMessage`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					chat_id: chatId.toString(),
+					rich_message: {
+						markdown: options.rawMarkdown,
+					},
+					reply_parameters: options.replyToMessageId ? { message_id: options.replyToMessageId } : undefined,
+				}),
+			});
+
+			if (mdRes.ok) {
+				return { ok: true, status: mdRes.status };
+			}
+
+			const mdErr = await mdRes.text();
+			console.warn(`sendRichMessage (markdown) failed (${mdRes.status}): ${mdErr}`);
+		} catch (e) {
+			console.warn('sendRichMessage (markdown) network exception:', e);
+		}
+	}
+
+	// 3. 第一层降级：Telegram 原生 HTML 模式（原生支持 <blockquote expandable> 折叠抽屉与链接）
 	try {
 		const htmlText = richBlocksToHtml(blocks);
 		const chunks = splitTelegramMessage(htmlText);
@@ -906,7 +934,7 @@ export async function sendTelegramRichMessage(
 		console.warn('sendMessage HTML exception, falling back to plain text:', err);
 	}
 
-	// 3. 终极降级方案：纯文本发送
+	// 4. 终极降级方案：纯文本发送
 	const text = options.fallbackText || richBlocksToPlainText(blocks);
 	const chunks = splitTelegramMessage(text);
 
@@ -1161,7 +1189,7 @@ export function buildQueryRichBlocks(
 			{ text: preview, align: 'left', valign: 'middle' },
 			{
 				text: link
-					? [{ type: 'link', text: '🔗 查看原文', url: link }]
+					? [{ type: 'url', text: '🔗 查看原文', url: link }]
 					: '-',
 				align: 'center',
 				valign: 'middle',

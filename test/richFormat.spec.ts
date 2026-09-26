@@ -139,7 +139,7 @@ describe('richFormat tests', () => {
 									[
 										{ text: '方案A', align: 'left' },
 										{
-											text: [{ type: 'link', text: '💬 原文', url: 'https://t.me/c/123456/789' }],
+											text: [{ type: 'url', text: '💬 原文', url: 'https://t.me/c/123456/789' }],
 											align: 'center',
 										},
 									],
@@ -162,7 +162,7 @@ describe('richFormat tests', () => {
 		const table = details.blocks[0];
 		expect(table.type).toBe('table');
 		expect(table.is_striped).toBe(true);
-		expect(table.cells[1][1].text[0].type).toBe('link');
+		expect(table.cells[1][1].text[0].type).toBe('url');
 		expect(table.cells[1][1].text[0].url).toBe('https://t.me/c/123456/789');
 	});
 
@@ -235,7 +235,7 @@ describe('richFormat tests', () => {
 
 		// Check the jump link in row 1, col 3
 		const linkCell = tableBlock.cells[1][3];
-		expect(linkCell.text[0].type).toBe('link');
+		expect(linkCell.text[0].type).toBe('url');
 		expect(linkCell.text[0].text).toBe('🔗 查看原文');
 		expect(linkCell.text[0].url).toBe('https://t.me/c/123456789/42');
 	});
@@ -336,7 +336,7 @@ describe('richFormat tests', () => {
 		expect(table.cells.length).toBe(3); // 1 header + 2 rows
 		const cellContent = table.cells[1][2].text;
 		const linkCell = Array.isArray(cellContent) ? cellContent[0] : cellContent;
-		expect(linkCell.type).toBe('link');
+		expect(linkCell.type).toBe('url');
 		expect(linkCell.url).toBe('https://t.me/c/123456/102');
 
 		// Second details block (checklist)
@@ -386,7 +386,7 @@ describe('richFormat tests', () => {
 						text: [
 							{ type: 'bold', text: '加粗文字' },
 							' 与 ',
-							{ type: 'link', text: '💬 原文', url: 'https://t.me/c/123/456' },
+							{ type: 'url', text: '💬 原文', url: 'https://t.me/c/123/456' },
 						],
 					},
 				],
