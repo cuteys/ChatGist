@@ -1,92 +1,35 @@
 import { describe, it, expect } from 'vitest';
 import {
-	getVisualWidth,
-	padEndVisual,
-	convertMarkdownTablesToAscii,
-	wrapInExpandableQuote,
-	parseDetailsAndFold,
-	formatRichTelegramMessage,
+	toSuperscript,
+	processMarkdownLinks,
+	fixLink,
+	foldText,
 	normalizeSpacing,
-	normalizeLatexForRichMarkdown,
-	formatForTelegramRichMessage,
+	formatSummaryWithHighlights,
+	formatAnswerMessage,
 } from '../src/richFormat';
 
 describe('richFormat tests', () => {
-	it('calculates visual width correctly', () => {
-		expect(getVisualWidth('hello')).toBe(5);
-		expect(getVisualWidth('你好')).toBe(4);
-		expect(getVisualWidth('AI模型')).toBe(6);
+	it('converts numbers to superscript correctly', () => {
+		expect(toSuperscript(1)).toBe('¹');
+		expect(toSuperscript(123)).toBe('¹²³');
 	});
 
-	it('pads string visually', () => {
-		expect(padEndVisual('你好', 6)).toBe('你好  ');
-		expect(padEndVisual('test', 6)).toBe('test  ');
+	it('processes duplicate markdown links correctly', () => {
+		const text = '[https://t.me/c/1/1](https://t.me/c/1/1) [https://t.me/c/1/1](https://t.me/c/1/1)';
+		const result = processMarkdownLinks(text);
+		expect(result).toBe('[引用¹](https://t.me/c/1/1) [引用¹](https://t.me/c/1/1)');
 	});
 
-	it('converts markdown table to beautiful ASCII box table', () => {
-		const md = `
-一些文字
-| 议题 | 结论 |
-| :--- | :--- |
-| 部署 | 完成 |
-| 模型 | GPT  |
-结尾文字
-`;
-		const result = convertMarkdownTablesToAscii(md);
-		expect(result).toContain('```');
-		expect(result).toContain('┌');
-		expect(result).toContain('│ 议题 │ 结论 │');
-		expect(result).toContain('├');
-		expect(result).toContain('│ 部署 │ 完成 │');
-		expect(result).toContain('│ 模型 │ GPT  │');
-		expect(result).toContain('└');
+	it('fixes erroneous links', () => {
+		expect(fixLink('https://tme.cat/123/456')).toBe('https://t.me/c/123/456');
+		expect(fixLink('https://t.me/c/c/123/456')).toBe('https://t.me/c/123/456');
 	});
 
 	it('wraps content in Telegram expandable quote', () => {
 		const content = '第一行\n第二行';
-		const quoted = wrapInExpandableQuote(content);
+		const quoted = foldText(content);
 		expect(quoted).toBe('**>第一行\n>第二行||');
-	});
-
-	it('parses details tag to expandable quote', () => {
-		const text = `
-今日概要速览：
-1. 项目更新完成
-
-<details>
-<summary>详细讨论记录</summary>
-Alice: 已经部署好啦
-Bob: 收到测试中
-</details>
-`;
-		const parsed = parseDetailsAndFold(text);
-		expect(parsed).toContain('今日概要速览：');
-		expect(parsed).toContain('**>详细讨论记录 🔽');
-		expect(parsed).toContain('>Alice: 已经部署好啦');
-		expect(parsed).toContain('||');
-	});
-
-	it('formats full message with table and details section', () => {
-		const raw = `
-### 💡 核心要点
-- 系统运行平稳
-
-| 议题 | 结论 |
-| :--- | :--- |
-| 性能 | 提升 |
-
-<details>
-<summary>详细讨论</summary>
-详细内容第1行
-详细内容第2行
-</details>
-`;
-		const result = formatRichTelegramMessage(raw);
-		expect(result).toContain('┌');
-		expect(result).toContain('│ 议题 │ 结论 │');
-		expect(result).toContain('**>详细讨论 🔽');
-		expect(result).toContain('>详细内容第1行');
-		expect(result).toContain('||');
 	});
 
 	it('normalizes spacing and collapses redundant newlines', () => {
@@ -94,40 +37,38 @@ Bob: 收到测试中
 		expect(normalizeSpacing(messy)).toBe(`第一行\n\n第二行\n\n第三行`);
 	});
 
-	it('normalizes LaTeX equations for Telegram Rich Markdown', () => {
-		const latex = `公式行：\\[ \\sum_{i=1}^n x_i \\] 与行内 \\( E=mc^2 \\)`;
-		const normalized = normalizeLatexForRichMarkdown(latex);
-		expect(normalized).toContain('$$\n\\sum_{i=1}^n x_i\n$$');
-		expect(normalized).toContain('$E=mc^2$');
-	});
-
-	it('formats text for Telegram Native Tables via formatForTelegramRichMessage', () => {
+	it('formats summary with highlights at top and details folded in expandable quote', () => {
 		const raw = `
 【💡 核心要点速览】
-- 进展顺利
+• 📌 确认本周发布上线
+• 💡 优化了折叠与速览体验
 
-
-
-【📊 议题简表】
-| 议题分类 | 核心结论 |
-|:---|:---|
-| 图像压缩 | 支持 |
-
-
-<details>
-<summary>💬 点击展开详细讨论与消息溯源</summary>
-1. 讨论过程消息
-</details>
+【💬 详细脉络与讨论溯源】
+1. **发布时间**：讨论了上线计划，见 [引用1](https://tme.cat/123/456)。
+2. **体验优化**：采用 MarkdownV2 格式发送 [引用2](https://tme.cat/123/789)。
 `;
-		const result = formatForTelegramRichMessage(raw);
-		// Native Table 保持标准 Markdown 管道符语法，未被转化为 ASCII 代码块
-		expect(result).toContain('| 议题分类 | 核心结论 |');
-		expect(result).toContain('|:---|:---|');
-		expect(result).not.toContain('┌');
-		// Details 标签被转化为可折叠引用块
-		expect(result).toContain('**>💬 点击展开详细讨论与消息溯源 🔽');
-		expect(result).toContain('>1. 讨论过程消息||');
-		// 连续空行被压缩
-		expect(result).not.toContain('\n\n\n');
+		const result = formatSummaryWithHighlights(raw);
+		expect(result).toContain('【💡 核心要点速览】');
+		expect(result).toContain('• 📌 确认本周发布上线');
+		expect(result).toContain('**>【💬 详细脉络与讨论溯源】');
+		expect(result).toContain('https://t.me/c/123/456');
+		expect(result).toContain('https://t.me/c/123/789');
+		expect(result.endsWith('||')).toBe(true);
+	});
+
+	it('formats summary without delimiter by folding the entire text', () => {
+		const raw = `本日群聊总结如下：\n1. 讨论了系统部署\n2. 解决了相关配置问题`;
+		const result = formatSummaryWithHighlights(raw);
+		expect(result.startsWith('**>')).toBe(true);
+		expect(result.endsWith('||')).toBe(true);
+		expect(result).toContain('讨论了系统部署');
+	});
+
+	it('formats answer message using formatAnswerMessage', () => {
+		const raw = `回答如下：大家在讨论部署方案 [https://tme.cat/123/1](https://tme.cat/123/1)`;
+		const result = formatAnswerMessage(raw);
+		expect(result.startsWith('**>')).toBe(true);
+		expect(result.endsWith('||')).toBe(true);
+		expect(result).toContain('https://t.me/c/123/1');
 	});
 });

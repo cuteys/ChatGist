@@ -6,11 +6,14 @@ import { isJPEG } from './isJpeg';
 import { extractAllOGInfo } from "./og";
 import { logModelError } from './logModelError';
 import {
-	formatRichTelegramMessage,
-	formatForTelegramRichMessage,
-	sendTelegramRichMessage,
+	foldText,
+	formatSummaryWithHighlights,
+	formatAnswerMessage,
 	deleteTelegramMessage,
 	normalizeSpacing,
+	toSuperscript,
+	processMarkdownLinks,
+	fixLink,
 } from './richFormat';
 import {
 	initWhitelistTables,
@@ -30,6 +33,8 @@ import {
 	getUserQuotaStatus,
 	cleanOldQuotaRecords,
 } from './quota';
+
+export { toSuperscript, processMarkdownLinks, fixLink, foldText, formatSummaryWithHighlights };
 
 function dispatchContent(content: string): { type: "text", text: string } | { type: "image_url", image_url: { url: string } } {
 	if (content.startsWith("data:image/jpeg;base64,")) {
@@ -55,55 +60,6 @@ function escapeMarkdownV2(text: string) {
 	const escapedChars = reservedChars.map(char => '\\' + char).join('');
 	const regex = new RegExp(`([${escapedChars}])`, 'g');
 	return text.replace(regex, '\\$1');
-}
-
-/**
- * 将数字转换为上标数字
- */
-export function toSuperscript(num: number) {
-	const superscripts = {
-		'0': '⁰',
-		'1': '¹',
-		'2': '²',
-		'3': '³',
-		'4': '⁴',
-		'5': '⁵',
-		'6': '⁶',
-		'7': '⁷',
-		'8': '⁸',
-		'9': '⁹'
-	};
-
-	return num
-		.toString()
-		.split('')
-		.map(digit => superscripts[digit as keyof typeof superscripts])
-		.join('');
-}
-
-/**
- * 处理 Markdown 文本中的重复链接，将其转换为顺序编号的格式
- */
-export function processMarkdownLinks(text: string, options: { prefix: string, useEnglish: boolean } = {
-	prefix: '引用',
-	useEnglish: false
-}) {
-	const { prefix, useEnglish } = options;
-	const linkMap = new Map();
-	let linkCounter = 1;
-	const linkPattern = /\[([^\]]+)\]\(([^)]+)\)/g;
-
-	return text.replace(linkPattern, (match, displayText, url) => {
-		if (displayText !== url) {
-			return match;
-		}
-		if (!linkMap.has(url)) {
-			linkMap.set(url, linkCounter++);
-		}
-		const linkNumber = linkMap.get(url);
-		const linkPrefix = useEnglish ? 'link' : prefix;
-		return `[${linkPrefix}${toSuperscript(linkNumber)}](${url})`;
-	});
 }
 
 export const BOT_COMMANDS = [
@@ -153,10 +109,6 @@ function getBaseUrl(env: Env): string | undefined {
 	return env.AI_BASE_URL || env.BASE_URL || undefined;
 }
 
-/**
- * 动态获取大模型调用配置
- * 避免向非推理模型传递 reasoning_effort 导致 400 Bad Request
- */
 function getCompletionOptions(model: string) {
 	const isReasoning = model.startsWith("o1") || model.startsWith("o3");
 	if (isReasoning) {
@@ -175,13 +127,12 @@ function getGenModel(env: Env) {
 	return new OpenAI({
 		apiKey: getApiKey(env),
 		...(baseURL ? { baseURL } : {}),
-		timeout: 60000, // 60秒合理超时保护
+		timeout: 60000,
 	});
 }
 
-// System prompts for different scenarios
 const SYSTEM_PROMPTS = {
-	summarizeChat: `你是一个专业的群聊总结助手。你的任务是用层次清晰、富于视觉表现力且符合群聊氛围的结构概括对话内容。
+	summarizeChat: `你是一个专业的群聊概括助手。你的任务是用符合群聊风格的语气概括对话内容。
 对话将按以下格式提供：
 ====================
 用户名:
@@ -190,29 +141,16 @@ const SYSTEM_PROMPTS = {
 ====================
 
 请严格遵循以下排版规范输出：
-1. **【💡 核心要点速览】**：
-   在开头用 2~4 个精炼要点概括今日群聊最核心的共识、进展或突发热点，使用 📌 或 💡 开头。
+1. 概括输出必须包含两部分：
+   【💡 核心要点速览】
+   在开头用 2~4 个精炼要点概括本次群聊最核心的共识、进展或突发热点，使用 • 📌 或 • 💡 开头。
 
-2. **【📊 议题简表】（必须输出标准 Markdown 表格）**：
-   梳理本次讨论的核心议题，输出紧凑精炼的 Markdown 原生表格：
-   | 议题分类 | 核心结论 / 共识 |
-   |:---|:---|
-   | ... | ... |
-   （精炼概括 2~5 个关键议题，表格内容单行简要概括，严禁在表格内换行或填充过多字数）
+   【💬 详细脉络与讨论溯源】
+   按议题或时间脉络分条详细概括讨论经过；若有图片内容，请在相应议题中进行描述。
+   在详细讨论中用 Markdown 格式引用原对话的链接，链接格式应为：[引用1](链接本体)、[关键字1](链接本体)等。
 
-3. **【💬 详细脉络与讨论溯源】（放入 <details> 标签中实现折叠）**：
-   在表格之后，使用 <details> 标签将详细讨论与引用包裹起来，示例：
-   <details>
-   <summary>💬 点击展开详细讨论与消息溯源</summary>
-   1. **议题一**：记录具体的讨论经过，必须用 Markdown 链接引用发言原消息，格式如：[引用1](链接)
-   2. **议题二**：记录具体的讨论经过，引用相关言论 [引用2](链接)
-   若有包含图片内容，请在相应议题中进行生动的描述。
-   </details>
-
-4. **【排版与间距严格规范】**：
-   - 紧凑布局：每个大标题之间、表格与标题之间仅保留单个换行空行，严禁输出连续多个空行或大面积空白！
-   - 标题命名规范：一律使用【💡 核心要点速览】、【📊 议题简表】、【💬 详细脉络与讨论溯源】，括号和内部字符之间不留多余空格。
-   - 整体风格专业干练，捕捉对话真实情绪，层次分明。`,
+2. 概括要简洁明了，捕捉对话的主要内容和情绪。
+3. 紧凑排版：各标题与段落之间仅保留单个空行，严禁输出多余的大面积连续空行。`,
 
 	answerQuestion: `你是一个群聊智能问答助手。你的任务是基于提供的群聊记录精准回答用户的问题。
 群聊记录将按以下格式提供：
@@ -223,15 +161,11 @@ const SYSTEM_PROMPTS = {
 ====================
 
 请遵循以下排版规范：
-1. **直接回答**：在最开头直接了当回答用户的问题，条理清晰。
-2. **证据与对话溯源（使用 <details> 折叠）**：
-   如果回答需要引用多条原始记录作为依据，将依据来源放在 <details> 标签中：
-   <details>
-   <summary>🔍 依据来源与原消息引用</summary>
-   - 发言人: "原发言简述" [引用1](链接)
-   </details>
-3. 链接格式：必须使用 [引用1](链接) 并在两侧留有适当空格。
-4. 如果群聊记录中找不到相关答案，请诚实说明，切勿编造。`
+1. 直接了当回答用户的问题，条理清晰。
+2. 在回答中引用相关的原始消息作为依据，格式为：[引用1](链接本体)、[关键字1](链接本体)。
+3. 在链接两侧添加空格。
+4. 如果找不到相关信息，请诚实说明，切勿编造。
+5. 回答应该简洁但内容完整。`
 };
 
 function getCommandVar(str: string, delim: string) {
@@ -241,18 +175,6 @@ function getCommandVar(str: string, delim: string) {
 function messageTemplate(s: string, modelName: string) {
 	const header = modelName ? `下面由 ${escapeMarkdownV2(modelName)} 概括群聊信息\n\n` : `群聊信息概括如下：\n\n`;
 	return normalizeSpacing(header + s + `\n\n本开源项目[地址](https://github\\.com/cuteys/ChatGist)`);
-}
-
-function richMessageTemplate(s: string, modelName: string) {
-	const header = modelName ? `下面由 ${modelName} 概括群聊信息\n\n` : `群聊信息概括如下：\n\n`;
-	return normalizeSpacing(header + s + `\n\n本开源项目 [地址](https://github.com/cuteys/ChatGist)`);
-}
-
-/**
- * 修正大模型偶尔输出的异常 Telegram 链接协议或拼写 (如 tme.cat -> t.me/c)
- */
-function fixLink(text: string) {
-	return text.replace(/tme\.cat/g, "t.me/c").replace(/\/c\/c/g, "/c");
 }
 
 function getUserName(msg: any): string {
@@ -266,9 +188,105 @@ function getUserName(msg: any): string {
 	return msg?.from?.username || "anonymous";
 }
 
-// -------------------------------------------------------------
-// 管理员与白名单公共操作函数（避免指令之间重复复制代码）
-// -------------------------------------------------------------
+function formatChatHistoryForAi(results: any[]) {
+	return results.flatMap((r: any) => [
+		dispatchContent(`====================`),
+		dispatchContent(`${r.userName}:`),
+		dispatchContent(r.content),
+		dispatchContent(getMessageLink(r)),
+	]);
+}
+
+async function saveMessage(env: Env, params: {
+	groupId: string;
+	messageId: number;
+	userName: string;
+	content: string;
+	groupName: string;
+}) {
+	try {
+		await env.DB.prepare(
+			`INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)`
+		)
+			.bind(
+				getMessageLink({ groupId: params.groupId, messageId: params.messageId }),
+				params.groupId,
+				Date.now(),
+				params.userName,
+				params.content,
+				params.messageId,
+				params.groupName
+			)
+			.run();
+	} catch (e) {
+		console.error("Failed to save message:", e);
+	}
+}
+
+async function withAdminAuth(
+	ctx: any,
+	env: Env,
+	action: (userId: string, parts: string[]) => Promise<void>
+): Promise<Response> {
+	const userId = ctx.update.message?.from?.id?.toString() || "";
+	if (!(await requireSuperAdmin(ctx, env, userId))) return new Response('ok');
+	const parts = (ctx.update.message?.text || "").trim().split(/\s+/).slice(1);
+	await action(userId, parts);
+	return new Response('ok');
+}
+
+function getRoleHelpText(env: Env, userId: string, superAdmin: boolean, admin: boolean): string {
+	if (superAdmin) {
+		return `👑【超级管理员使用指南】
+您拥有本机器人的最高控制权限，不受任何使用频次限制。
+
+🛠️ 白名单与权限管理：
+• /addgroup [群ID] [名称] - 授权群组（群内发送可一键授权当前群）
+• /delgroup [群ID] - 移出白名单
+• /whitelist - 查看白名单群组列表
+• /addadmin <用户ID> [备注] - 添加免流管理员
+• /deladmin <用户ID> - 移除管理员
+• /admins - 查看管理员列表
+• /setcommands - 向 Telegram 同步指令菜单
+
+💬 群聊常用指令：
+• /summary <数量/时间> - 概括群聊消息（如 /summary 20 或 /summary 12h）
+• /ask <问题> - 基于群聊记录提问（私聊推送答案）
+• /query <关键词> - 检索历史消息
+• /quota - 查看今日剩余配额
+• /status - 检查运行状态与群组授权`;
+	}
+
+	if (admin) {
+		return `🛡️【管理员使用指南】
+您已被系统授权为机器人管理员，享有【无限次免流特权】！
+
+💬 群聊可用指令（无使用频次限制）：
+• /summary <数量/时间> - 概括群聊消息（如 /summary 20 或 /summary 12h）
+• /ask <问题> - 基于群聊记录提问（私聊推送答案）
+• /query <关键词> - 检索群聊历史消息
+• /quota - 查看指令免流特权状态
+• /status - 检查运行状态与群组授权
+• /help - 查看本使用帮助`;
+	}
+
+	return `📖【ChatGist 群聊助手使用指南】
+欢迎使用群聊智能总结与检索助手！
+
+💬 可用群聊指令：
+• /summary <数量/时间> - 概括近期群聊重点（每日限 5 次）
+• /ask <问题> - 基于近期群聊记录回答（每日限 10 次，私聊推送）
+• /query <关键词> - 检索群聊历史消息（每日限 20 次）
+• /quota - 快速查看今日剩余配额
+• /status - 检查机器人运行状态及群组授权
+• /help - 查看本指令使用指南
+
+ℹ️ 使用须知：
+1. 您的 Telegram 用户 ID 为：\`${userId}\`
+2. 机器人仅在管理员授权的白名单群组中记录与响应；
+3. /ask 首次使用请先私聊机器人发起对话；
+4. 每日使用额度于北京时间 00:00 自动刷新。`;
+}
 
 async function requireSuperAdmin(ctx: any, env: Env, userId: string): Promise<boolean> {
 	if (isSuperAdmin(env, userId)) {
@@ -495,17 +513,13 @@ export default {
 					},
 					{
 						"role": "user",
-						content: results.flatMap(
-							(r: any) => [
-								dispatchContent(`====================`),
-								dispatchContent(`${r.userName}:`),
-								dispatchContent(r.content),
-								dispatchContent(getMessageLink(r)),
-							]
-						)
+						content: formatChatHistoryForAi(results)
 					}],
 				...getCompletionOptions(model),
 			});
+
+			const raw = result.choices[0].message.content || "";
+			const formatted = formatSummaryWithHighlights(raw);
 
 			console.debug("send message to", group.groupId);
 
@@ -516,15 +530,7 @@ export default {
 				},
 				body: JSON.stringify({
 					chat_id: group.groupId,
-					text: messageTemplate(
-						fixLink(
-							formatRichTelegramMessage(
-								processMarkdownLinks(result.choices[0].message.content || ""),
-								{ isSummary: true }
-							)
-						),
-						model
-					),
+					text: messageTemplate(formatted, model),
 					parse_mode: "MarkdownV2",
 				}),
 			});
@@ -556,7 +562,6 @@ export default {
 			return new Response("ChatGist Bot is running.");
 		}
 
-		// 适配 Telegram Webhook 请求
 		const reqUrl = new URL(request.url);
 		let botRequest = request;
 
@@ -568,23 +573,18 @@ export default {
 				return new Response("bad request", { status: 400 });
 			}
 
-			// 兼容编辑消息（将 edited_message 规整为 message，以便统一入库与处理）
 			if (!body?.message && body?.edited_message) {
 				body.message = body.edited_message;
 			}
 
-			// 过滤非消息类型的更新（如 my_chat_member、chat_member、message_reaction 等）
-			// 立即返回 200 OK 确认接收，防止 cf-workers-telegram-bot 将未知更新回退到 :message 并因缺少 message 对象报错
 			if (!body?.message) {
 				return new Response("ok");
 			}
 
-			// 兼容带 @botname 的指令（如 /status@chatgist_bot 归一化为 /status）
 			if (body.message?.text && body.message.text.startsWith("/")) {
 				body.message.text = body.message.text.replace(/^(\/[a-zA-Z0-9_]+)@[a-zA-Z0-9_]+/, "$1");
 			}
 
-			// 群组白名单拦截门禁
 			const msg = body.message;
 			const chat = msg?.chat;
 			const isGroup = chat && (chat.type === "group" || chat.type === "supergroup");
@@ -612,7 +612,6 @@ export default {
 
 					const senderIsSuperAdmin = isSuperAdmin(env, userId);
 					if (!senderIsSuperAdmin || !allowedAdminCommands.includes(cmd)) {
-						// 非白名单群组：静默忽略，不记录也不响应
 						return new Response("ok");
 					}
 				}
@@ -634,50 +633,7 @@ export default {
 				const userId = ctx.update.message?.from?.id?.toString() || "";
 				const superAdmin = isSuperAdmin(env, userId);
 				const admin = await isAdmin(env, userId);
-
-				let startText = "";
-				if (superAdmin) {
-					startText = `你好！系统超级管理员 👑\n\n` +
-						`您拥有本机器人的最高控制权限，不受任何使用频次限制。\n\n` +
-						`【超级管理员专属指令】\n` +
-						`• /addgroup - 授权当前群或指定群\n` +
-						`• /delgroup - 移出白名单\n` +
-						`• /whitelist - 查看白名单群组列表\n` +
-						`• /addadmin <用户ID> [备注] - 添加免流管理员\n` +
-						`• /deladmin <用户ID> - 移除管理员\n` +
-						`• /admins - 查看管理员列表\n` +
-						`• /setcommands - 向 Telegram 同步指令菜单\n\n` +
-						`【常规群聊指令】\n` +
-						`• /summary 20 - 概括最近 20 条消息\n` +
-						`• /ask <问题> - 智能问答（私聊推送答案）\n` +
-						`• /query <关键词> - 检索历史消息\n` +
-						`• /quota - 查看今日剩余配额\n` +
-						`• /status - 检查运行状态\n` +
-						`• /help - 查看详细使用帮助`;
-				} else if (admin) {
-					startText = `你好！管理员 🛡️\n\n` +
-						`您享有本机器人【无限次免流特权】，使用 /summary、/ask、/query 没有任何频次限制！\n\n` +
-						`【群聊可用指令】\n` +
-						`• /summary <数量/时间> - 概括群聊内容（无限制）\n` +
-						`• /ask <问题> - 基于群聊记录智能问答（无限制）\n` +
-						`• /query <关键词> - 检索群聊历史消息（无限制）\n` +
-						`• /quota - 查看指令特权状态\n` +
-						`• /status - 检查机器人运行状态\n` +
-						`• /help - 查看详细使用帮助`;
-				} else {
-					startText = `你好！我是 ChatGist 群聊智能助手 💬⚡\n\n` +
-						`💡 您的 Telegram 用户 ID 为：\`${userId}\`\n` +
-						`（若您是机器人部署者，请在 Cloudflare Workers 环境变量 ADMIN_USER_IDS 中添加此 ID 以获取超级管理权限）\n\n` +
-						`【可用指令与每日配额】\n` +
-						`• /summary <数量/时间> - 概括群聊消息（每日限 5 次）\n` +
-						`• /ask <问题> - 基于群聊记录智能回答（每日限 10 次）\n` +
-						`• /query <关键词> - 检索群聊历史消息（每日限 20 次）\n` +
-						`• /quota - 查看今日剩余使用配额\n` +
-						`• /status - 检查运行状态与群组授权\n` +
-						`• /help - 查看完整使用指南\n\n` +
-						`提示：机器人仅在已授权群组中工作，每日配额于北京时间 00:00 自动刷新。`;
-				}
-
+				const startText = getRoleHelpText(env, userId, superAdmin, admin);
 				await ctx.reply(escapeMarkdownV2(startText), "MarkdownV2");
 				return new Response('ok');
 			})
@@ -687,95 +643,9 @@ export default {
 				const userId = ctx.update.message?.from?.id?.toString() || "";
 				const superAdmin = isSuperAdmin(env, userId);
 				const admin = await isAdmin(env, userId);
-
-				let helpText = "";
-
-				if (superAdmin) {
-					helpText = `👑【超级管理员使用指南】
-您拥有本机器人的最高控制权限，不受任何使用频次限制。
-
-🛠️ 白名单与权限管理：
-• /addgroup [群ID] [名称] - 将群组加入白名单（群内直接发送即可一键授权当前群）
-• /delgroup [群ID] - 将群组移出白名单
-• /whitelist - 查看所有已授权的白名单群组
-• /addadmin <用户ID> [备注] - 添加数据库管理员（为其赋予免流特权）
-• /deladmin <用户ID> - 移除管理员
-• /admins - 查看所有超级管理员及数据库管理员列表
-• /setcommands - 向 Telegram 同步注册所有中文指令菜单
-
-💬 群聊常用指令：
-• /summary <数量/时间> - 概括群聊消息（如 /summary 20 或 /summary 12h）
-• /ask <问题> - 基于近期群聊记录提问（私聊推送答案）
-• /query <关键词> - 检索群聊历史消息
-• /quota - 检查今日剩余配额
-• /status - 检查机器人运行状态与群组授权状态
-
-💡 提示：在未授权群组内，机器人对普通成员完全静默，仅响应您的管理指令。`;
-				} else if (admin) {
-					helpText = `🛡️【管理员使用指南】
-您已被系统授权为机器人管理员，享有【无限次免流特权】！
-
-💬 群聊可用指令（无使用频次限制）：
-• /summary <数量/时间>
-  概括群聊消息（如 /summary 20 或 /summary 12h）
-  输出富文本表格与折叠消息溯源
-
-• /ask <问题>
-  基于近期群聊记录提问，答案私聊推送给您
-  示例：/ask 大家刚才在讨论什么？
-
-• /query <关键词>
-  检索群聊历史消息并提供原发言直达链接
-  示例：/query 部署
-
-• /quota
-  查看指令免流特权状态
-
-• /status
-  检查机器人运行状态及当前群组授权状态
-
-• /help
-  查看本帮助指南
-
-ℹ️ 权限说明：群组白名单与管理员权限由系统超级管理员负责统一维护。`;
-				} else {
-					helpText = `📖【ChatGist 群聊助手使用指南】
-欢迎使用群聊智能总结与检索助手！
-
-💬 可用群聊指令：
-• /summary <数量/时间>
-  概括近期群聊重点与核心议题
-  示例：/summary 20（最新20条）或 /summary 12h（最近12小时）
-  ⚠️ 每日限额：5 次
-
-• /ask <问题>
-  基于近期群聊记录回答您的问题（私聊推送答案，不打扰群友）
-  示例：/ask 大家刚才在讨论什么？
-  ⚠️ 每日限额：10 次
-
-• /query <关键词>
-  在群聊历史记录中检索关键词及原消息链接
-  示例：/query 部署
-  ⚠️ 每日限额：20 次
-
-• /quota
-  快速查看您今日的剩余配额
-
-• /status
-  检查机器人运行状态及群组授权
-
-• /help
-  查看本指令使用指南
-
-ℹ️ 使用须知：
-1. 您的 Telegram 用户 ID 为：${userId}
-2. 机器人仅在管理员授权的白名单群组中记录与响应；
-3. /ask 首次使用请先私聊机器人发起对话；
-4. 每日使用额度于北京时间 00:00 自动刷新。`;
-				}
+				const helpText = getRoleHelpText(env, userId, superAdmin, admin);
 
 				if (isGroup) {
-					// 群内触发：避免群内长文本刷屏，优先尝试私聊发送详细指南
 					let sentToPm = false;
 					try {
 						const pmRes = await ctx.api.sendMessage(ctx.bot.api.toString(), {
@@ -797,17 +667,13 @@ export default {
 					return new Response('ok');
 				}
 
-				// 私聊触发：直接发送完整使用指南
 				await ctx.reply(escapeMarkdownV2(helpText), "MarkdownV2");
 				return new Response('ok');
 			})
-			.on('setcommands', async (ctx) => {
-				const userId = ctx.update.message?.from?.id?.toString() || "";
-				if (!(await requireSuperAdmin(ctx, env, userId))) return new Response('ok');
+			.on('setcommands', (ctx) => withAdminAuth(ctx, env, async () => {
 				await registerBotCommands(botToken);
 				await ctx.reply('✅ 已向 Telegram 同步注册指令列表！');
-				return new Response('ok');
-			})
+			}))
 			.on('status', async (ctx) => {
 				const chat = ctx.update.message?.chat;
 				const isGroup = chat && (chat.type === "group" || chat.type === "supergroup");
@@ -858,74 +724,24 @@ export default {
 				await ctx.reply(text);
 				return new Response('ok');
 			})
-			.on('addgroup', async (ctx) => {
-				const userId = ctx.update.message?.from?.id?.toString() || "";
-				if (!(await requireSuperAdmin(ctx, env, userId))) return new Response('ok');
-				const parts = (ctx.update.message?.text || "").trim().split(/\s+/).slice(1);
-				await handleAddGroup(ctx, env, userId, parts[0], parts.slice(1).join(" "));
-				return new Response('ok');
-			})
-			.on('delgroup', async (ctx) => {
-				const userId = ctx.update.message?.from?.id?.toString() || "";
-				if (!(await requireSuperAdmin(ctx, env, userId))) return new Response('ok');
-				const parts = (ctx.update.message?.text || "").trim().split(/\s+/).slice(1);
-				await handleDelGroup(ctx, env, parts[0]);
-				return new Response('ok');
-			})
-			.on('whitelist', async (ctx) => {
-				const userId = ctx.update.message?.from?.id?.toString() || "";
-				if (!(await requireSuperAdmin(ctx, env, userId))) return new Response('ok');
-				const parts = (ctx.update.message?.text || "").trim().split(/\s+/).slice(1);
+			.on('addgroup', (ctx) => withAdminAuth(ctx, env, (uid, parts) => handleAddGroup(ctx, env, uid, parts[0], parts.slice(1).join(" "))))
+			.on('delgroup', (ctx) => withAdminAuth(ctx, env, (_uid, parts) => handleDelGroup(ctx, env, parts[0])))
+			.on('whitelist', (ctx) => withAdminAuth(ctx, env, async (uid, parts) => {
 				const subCmd = parts[0]?.toLowerCase();
-				if (subCmd === 'add') {
-					await handleAddGroup(ctx, env, userId, parts[1], parts.slice(2).join(" "));
-				} else if (subCmd === 'del' || subCmd === 'remove') {
-					await handleDelGroup(ctx, env, parts[1]);
-				} else {
-					await handleListGroups(ctx, env);
-				}
-				return new Response('ok');
-			})
-			.on('groups', async (ctx) => {
-				const userId = ctx.update.message?.from?.id?.toString() || "";
-				if (!(await requireSuperAdmin(ctx, env, userId))) return new Response('ok');
-				await handleListGroups(ctx, env);
-				return new Response('ok');
-			})
-			.on('addadmin', async (ctx) => {
-				const userId = ctx.update.message?.from?.id?.toString() || "";
-				if (!(await requireSuperAdmin(ctx, env, userId))) return new Response('ok');
-				const parts = (ctx.update.message?.text || "").trim().split(/\s+/).slice(1);
-				await handleAddAdmin(ctx, env, userId, parts[0], parts.slice(1).join(" "));
-				return new Response('ok');
-			})
-			.on('deladmin', async (ctx) => {
-				const userId = ctx.update.message?.from?.id?.toString() || "";
-				if (!(await requireSuperAdmin(ctx, env, userId))) return new Response('ok');
-				const parts = (ctx.update.message?.text || "").trim().split(/\s+/).slice(1);
-				await handleDelAdmin(ctx, env, parts[0]);
-				return new Response('ok');
-			})
-			.on('admins', async (ctx) => {
-				const userId = ctx.update.message?.from?.id?.toString() || "";
-				if (!(await requireSuperAdmin(ctx, env, userId))) return new Response('ok');
-				await handleListAdmins(ctx, env);
-				return new Response('ok');
-			})
-			.on('admin', async (ctx) => {
-				const userId = ctx.update.message?.from?.id?.toString() || "";
-				if (!(await requireSuperAdmin(ctx, env, userId))) return new Response('ok');
-				const parts = (ctx.update.message?.text || "").trim().split(/\s+/).slice(1);
+				if (subCmd === 'add') await handleAddGroup(ctx, env, uid, parts[1], parts.slice(2).join(" "));
+				else if (subCmd === 'del' || subCmd === 'remove') await handleDelGroup(ctx, env, parts[1]);
+				else await handleListGroups(ctx, env);
+			}))
+			.on('groups', (ctx) => withAdminAuth(ctx, env, () => handleListGroups(ctx, env)))
+			.on('addadmin', (ctx) => withAdminAuth(ctx, env, (uid, parts) => handleAddAdmin(ctx, env, uid, parts[0], parts.slice(1).join(" "))))
+			.on('deladmin', (ctx) => withAdminAuth(ctx, env, (_uid, parts) => handleDelAdmin(ctx, env, parts[0])))
+			.on('admins', (ctx) => withAdminAuth(ctx, env, () => handleListAdmins(ctx, env)))
+			.on('admin', (ctx) => withAdminAuth(ctx, env, async (uid, parts) => {
 				const subCmd = parts[0]?.toLowerCase();
-				if (subCmd === 'add') {
-					await handleAddAdmin(ctx, env, userId, parts[1], parts.slice(2).join(" "));
-				} else if (subCmd === 'del' || subCmd === 'remove') {
-					await handleDelAdmin(ctx, env, parts[1]);
-				} else {
-					await handleListAdmins(ctx, env);
-				}
-				return new Response('ok');
-			})
+				if (subCmd === 'add') await handleAddAdmin(ctx, env, uid, parts[1], parts.slice(2).join(" "));
+				else if (subCmd === 'del' || subCmd === 'remove') await handleDelAdmin(ctx, env, parts[1]);
+				else await handleListAdmins(ctx, env);
+			}))
 			.on("query", async (ctx) => {
 				const msg = ctx.update?.message;
 				if (!msg || !msg.chat) return new Response('ok');
@@ -943,7 +759,6 @@ export default {
 					return new Response('ok');
 				}
 
-				// 立即反馈状态提示
 				let statusMessageId: number | undefined;
 				try {
 					const initRes = await ctx.reply(`🔍 正在检索关键词【${keyword}】，请稍候...`);
@@ -1013,7 +828,6 @@ export default {
 					return new Response('ok');
 				}
 
-				// 群内发指令时，在群内回复即时反馈
 				const isGroup = msg.chat.type?.includes('group');
 				let groupAckMessageId: number | undefined;
 				if (isGroup) {
@@ -1065,14 +879,7 @@ export default {
 								},
 								{
 									"role": "user",
-									content: results.flatMap(
-										(r: any) => [
-											dispatchContent(`====================`),
-											dispatchContent(`${r.userName}:`),
-											dispatchContent(r.content),
-											dispatchContent(getMessageLink(r)),
-										]
-									)
+									content: formatChatHistoryForAi(results)
 								},
 								{
 									"role": "user",
@@ -1090,12 +897,7 @@ export default {
 					return new Response('ok');
 				}
 				const raw = result.choices[0].message.content || "";
-				const response_text = fixLink(
-					formatRichTelegramMessage(
-						processMarkdownLinks(raw),
-						{ isSummary: false }
-					)
-				);
+				const response_text = formatAnswerMessage(raw);
 
 				res = await ctx.api.sendMessage(ctx.bot.api.toString(), {
 					"chat_id": userId,
@@ -1112,7 +914,13 @@ export default {
 						}
 						return new Response('ok');
 					}
-					await ctx.reply(`发送失败`);
+					const plainText = response_text.replace(/\\([_*[\]()~`>#+\-=|{}.!])/g, '$1');
+					await ctx.api.sendMessage(ctx.bot.api.toString(), {
+						"chat_id": userId,
+						"parse_mode": "",
+						"text": plainText,
+						reply_to_message_id: -1,
+					});
 				}
 				if (groupAckMessageId) {
 					await deleteTelegramMessage(getTelegramToken(env), groupId, groupAckMessageId);
@@ -1134,7 +942,7 @@ export default {
 				let summary = parts[1];
 				let isDefault = false;
 				if (!summary) {
-					summary = "50"; // 默认总结最近 50 条消息
+					summary = "50";
 					isDefault = true;
 				}
 
@@ -1156,7 +964,6 @@ export default {
 					return new Response('ok');
 				}
 
-				// 立即反馈执行状态，避免用户等待时产生无响应的错觉
 				let statusMessageId: number | undefined;
 				try {
 					const initRes = await bot.reply("⏳ 正在读取群聊记录并生成总结，请稍候...");
@@ -1220,65 +1027,31 @@ export default {
 								},
 								{
 									"role": "user",
-									content: results.flatMap(
-										(r: any) => [
-											dispatchContent(`====================`),
-											dispatchContent(`${r.userName}:`),
-											dispatchContent(r.content),
-											dispatchContent(getMessageLink(r)),
-										]
-									)
+									content: formatChatHistoryForAi(results)
 								}
 							],
 							...getCompletionOptions(model),
 						});
 
 					const raw = result.choices[0].message.content || "";
-					const processedMarkdown = processMarkdownLinks(raw);
+					const formatted = formatSummaryWithHighlights(raw);
 
-					// 1. 优先尝试 Telegram Bot API 原生富文本发送 (支持 Native Tables 原生富文本表格)
-					const richContent = richMessageTemplate(
-						fixLink(formatForTelegramRichMessage(processedMarkdown)),
-						model
+					let replyContent = messageTemplate(formatted, model);
+					if (isDefault) {
+						replyContent = `💡【未指定参数，默认总结近期 50 条消息】\n\n` + replyContent;
+					}
+
+					let res = await bot.reply(
+						replyContent,
+						'MarkdownV2'
 					);
-					const finalRichContent = isDefault
-						? `💡（未指定参数，默认总结近期 50 条消息）\n\n` + richContent
-						: richContent;
-
-					const richRes = await sendTelegramRichMessage(
-						getTelegramToken(env),
-						groupId,
-						finalRichContent,
-						msg.message_id
-					);
-
-					if (richRes.ok) {
-						if (statusMessageId) {
-							await deleteTelegramMessage(getTelegramToken(env), groupId, statusMessageId);
-						}
-					} else {
-						console.error("sendRichMessage failed, fallback to standard reply:", richRes.description);
-						// 2. 降级回退：使用 standard sendMessage
-						const formatted = formatRichTelegramMessage(
-							processedMarkdown,
-							{ isSummary: true }
-						);
-						let replyContent = messageTemplate(fixLink(formatted), model);
-						if (isDefault) {
-							replyContent = `💡（未指定参数，默认总结近期 50 条消息）\n\n` + replyContent;
-						}
-						let res = await bot.reply(
-							replyContent,
-							'MarkdownV2'
-						);
-						if (!res?.ok) {
-							console.error("Failed to send reply with MarkdownV2, falling back to plain text:", res?.statusText, await res?.text());
-							const plainText = replyContent.replace(/\\([_*[\]()~`>#+\-=|{}.!])/g, '$1');
-							await bot.reply(plainText);
-						}
-						if (statusMessageId) {
-							await deleteTelegramMessage(getTelegramToken(env), groupId, statusMessageId);
-						}
+					if (!res?.ok) {
+						console.error("Failed to send reply with MarkdownV2, falling back to plain text:", res?.statusText, await res?.text());
+						const plainText = replyContent.replace(/\\([_*[\]()~`>#+\-=|{}.!])/g, '$1');
+						await bot.reply(plainText);
+					}
+					if (statusMessageId) {
+						await deleteTelegramMessage(getTelegramToken(env), groupId, statusMessageId);
 					}
 				}
 				catch (e) {
@@ -1321,25 +1094,8 @@ export default {
 						}
 						const messageId = msg.message_id;
 						const groupName = msg.chat.title || "anonymous";
-						const timeStamp = Date.now();
 						const userName = getUserName(msg);
-						try {
-							await env.DB.prepare(`
-								INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-								.bind(
-									getMessageLink({ groupId, messageId }),
-									groupId,
-									timeStamp,
-									userName,
-									content,
-									messageId,
-									groupName
-								)
-								.run();
-						}
-						catch (e) {
-							console.error(e);
-						}
+						await saveMessage(env, { groupId, messageId, userName, content, groupName });
 						return new Response('ok');
 
 					}
@@ -1353,14 +1109,10 @@ export default {
 						const timeStamp = Date.now();
 						const userName = getUserName(msg);
 
-						// 智能降级与压缩机制：
-						// Telegram 会自动生成多档清晰度规格 (从缩略图到高分原图)
-						// 倒序优先选择体积 <= 950KB 的最清晰尺寸，若全部超出则逐级回退，彻底解决大于 1MB 图片无法识别的问题
 						const candidatePhotos = [...(msg.photo || [])].reverse();
 						let file: ArrayBuffer | null = null;
 
 						for (const p of candidatePhotos) {
-							// 若 Telegram 明确标注了文件大小且超过 950KB，跳过该超大档位
 							if (p.file_size && p.file_size > 950 * 1024) {
 								continue;
 							}
@@ -1375,7 +1127,6 @@ export default {
 							}
 						}
 
-						// 极端保底：若候选全超出，则下载 Telegram 最小缩略图 (通常 < 50KB)
 						if (!file && msg.photo && msg.photo.length > 0) {
 							try {
 								file = await bot.getFile(msg.photo[0].file_id).then((response) => response.arrayBuffer());
@@ -1390,23 +1141,7 @@ export default {
 						}
 
 						const content = "data:image/jpeg;base64," + Buffer.from(file).toString("base64");
-						try {
-							await env.DB.prepare(`
-							INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-								.bind(
-									getMessageLink({ groupId, messageId }),
-									groupId,
-									timeStamp,
-									userName,
-									content,
-									messageId,
-									groupName
-								)
-								.run();
-						}
-						catch (e) {
-							console.error(e);
-						}
+						await saveMessage(env, { groupId, messageId, userName, content, groupName });
 						return new Response('ok');
 					}
 					default:
@@ -1425,25 +1160,8 @@ export default {
 				const content = msg.text || "";
 				const messageId = msg.message_id;
 				const groupName = msg.chat.title || "anonymous";
-				const timeStamp = Date.now();
 				const userName = getUserName(msg);
-				try {
-					await env.DB.prepare(`
-					INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-						.bind(
-							getMessageLink({ groupId, messageId }),
-							groupId,
-							timeStamp,
-							userName,
-							content,
-							messageId,
-							groupName
-						)
-						.run();
-				}
-				catch (e) {
-					console.error(e);
-				}
+				await saveMessage(env, { groupId, messageId, userName, content, groupName });
 				return new Response('ok');
 			})
 			.handle(botRequest);
