@@ -45,10 +45,10 @@ mode = "smart"
 
 # Bind a D1 database. D1 is Cloudflare’s native serverless SQL database.
 # Docs: https://developers.cloudflare.com/workers/wrangler/configuration/#d1-databases
-# [[d1_databases]]
-#binding = "DB"
-# database_name = "chat-msg-d1"
-# database_id = "f76898f1-671d-4844-89e8-b460d73855b0"
+[[d1_databases]]
+binding = "DB"
+database_name = "chatgist"
+database_id = "5ab01338-e174-41b7-b96f-87b8c35782d6"
 
 [triggers]
 crons = ["*/6 16 * * *"] # utc+8 0 0,1 * * *
