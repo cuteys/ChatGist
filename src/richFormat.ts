@@ -561,6 +561,7 @@ export function aggregateMarkdownToRichBlocks(content: string): RichBlock[] {
 
 	raw = fixLink(processMarkdownLinks(removeThematicBreaks(raw)));
 	raw = raw.replace(/^#\s+(?:📊\s*)?群聊动态深度总结[^\r\n]*\r?\n+/i, '').trim();
+	raw = raw.replace(/^(?:#+\s*)?(?:✨\s*)?【?本期看点速览】?[^\r\n]*\r?\n+/i, '').trim();
 
 	// 1. 若包含显式 <details><summary> 标签
 	const detailsRegex = /<details>[\s\S]*?<summary>([\s\S]*?)<\/summary>([\s\S]*?)<\/details>/gi;

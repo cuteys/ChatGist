@@ -169,13 +169,12 @@ const SYSTEM_PROMPTS = {
 ====================
 
 【排版与视觉规范】
-1. 丰富生动的 Emoji：在各级标题、看点速览、要点、表格和清单中，恰当点缀符合语境的高表现力 Emoji（如 📊 🎯 💡 ⚡ 🛠️ 🔍 📝 📌 💬 🎬 🚀 等），使总结直观、有趣且美观；
-2. 链接自然内嵌（含看点速览）：在开头的【本期看点速览】及后续各议题中，都必须将原消息的“相应链接”直接嵌入到核心关键词、事件或方案名中（例如：群聊聚焦于 [401 认证报错修复](相应链接) 与 [片单计费体系](相应链接)；期间探讨了 [视频 AI 超分修复测试](相应链接)...），点击关键词即可直达原消息，严禁在句末或单独列中追加独立的“[💬 原文]”；
-3. 原生富文本组件结构：不要输出最顶层的大标题（如“# 群聊动态深度总结”），直接从【本期看点速览】开始，合理使用 <details><summary> 抽屉、原生 Markdown 表格、待办复选框。
+1. 丰富生动的 Emoji：在各级标题、概述、要点、表格和清单中，恰当点缀符合语境的高表现力 Emoji（如 📊 🎯 💡 ⚡ 🛠️ 🔍 📝 📌 💬 🎬 🚀 等），使总结直观、有趣且美观；
+2. 链接自然内嵌：在开头的概述及后续各议题中，都必须将原消息的“相应链接”直接嵌入到核心关键词、事件或方案名中（例如：群聊聚焦于 [401 认证报错修复](相应链接) 与 [片单计费体系](相应链接)；期间探讨了 [视频 AI 超分修复测试](相应链接)...），点击关键词即可直达原消息，严禁在句末或单独列中追加独立的“[💬 原文]”；
+3. 原生富文本组件结构：不要输出任何顶部标题（严禁输出“# 群聊动态深度总结”、“✨ 【本期看点速览】”等），直接以 1-2 段生动的核心概述开头，合理使用 <details><summary> 抽屉、原生 Markdown 表格、待办复选框。
 
 请直接输出符合以下结构的 Markdown：
 
-✨ 【本期看点速览】
 用 1-2 段生动精炼的语言概括本次群聊的核心热点、主要争议与讨论走向，并将讨论核心词直接嵌入对应原消息链接（如：本期群友重点探讨了 [401 报错排查](对应相应链接) 与 [片单计费逻辑](对应相应链接)，此外分享了 [AI 视频超分实测数据](对应相应链接)...）。
 
 <details>
@@ -210,8 +209,8 @@ const SYSTEM_PROMPTS = {
 </details>
 
 【核心约束】
-1. 严禁输出顶部一级大标题（如 # ...总结），直接从 ✨ 【本期看点速览】 开始；
-2. 看点速览与正文要点中的链接必须直接嵌入词句中，不要产生多余的“💬 原文”；
+1. 严禁输出顶部一级大标题及“✨ 【本期看点速览】”等标题字样，直接输出精炼概述与各议题抽屉；
+2. 概述与正文要点中的链接必须直接嵌入词句中，不要产生多余的“💬 原文”；
 3. 链接必须 100% 来源于输入中的真实“相应链接”，严禁杜撰或捏造；
 4. 输出纯 Markdown 文本，无需其他废话。`,
 
@@ -822,12 +821,19 @@ export default {
 							body: JSON.stringify({ chat_id: 0, rich_message: { blocks: [] } }),
 						});
 						const testJson: any = await testRes.json().catch(() => null);
-						const richStatus = testRes.status === 404
-							? '❌ 接口未开放 (404 Not Found)'
-							: `✅ 接口响应 (${testRes.status}: ${testJson?.description || '正常'})`;
+						let richStatus: string;
+						if (testRes.ok) {
+							richStatus = '✅ 正常可用';
+						} else if (testRes.status === 400 && (testJson?.description?.includes('chat not found') || testJson?.description?.includes('chat_id'))) {
+							richStatus = '✅ 接口已就绪 (原生富文本模式)';
+						} else if (testRes.status === 404) {
+							richStatus = 'ℹ️ 接口未开放 (已启用 HTML 折叠降级)';
+						} else {
+							richStatus = `⚠️ 状态异常 (${testJson?.description || testRes.status})`;
+						}
 						statusText += `\n🌐 原生富文本 (sendRichMessage)：${richStatus}\n`;
 					} catch (e: any) {
-						statusText += `\n🌐 原生富文本探测异常：${e.message}\n`;
+						statusText += `\n🌐 原生富文本：⚠️ 探测异常 (${e.message})\n`;
 					}
 				}
 
@@ -1273,12 +1279,12 @@ export default {
 						let file: ArrayBuffer | null = null;
 
 						for (const p of candidatePhotos) {
-							if (p.file_size && p.file_size > 512 * 1024) {
+							if (p.file_size && p.file_size > 950 * 1024) {
 								continue;
 							}
 							try {
 								const buf = await bot.getFile(p.file_id).then((response) => response.arrayBuffer());
-								if (buf.byteLength <= 512 * 1024) {
+								if (buf.byteLength <= 950 * 1024) {
 									file = buf;
 									break;
 								}
