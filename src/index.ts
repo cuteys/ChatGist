@@ -7,6 +7,7 @@ import { Buffer } from 'node:buffer';
 import { isJPEGBase64 } from './isJpeg';
 import { extractAllOGInfo } from "./og"
 import { logModelError } from './logModelError';
+import { formatRichTelegramMessage } from './richFormat';
 function dispatchContent(content: string): { type: "text", text: string } | { type: "image_url", image_url: { url: string } } {
 	if (content.startsWith("data:image/jpeg;base64,")) {
 		return ({
@@ -140,11 +141,19 @@ export async function registerBotCommands(token: string) {
 }
 
 function getModelName(env: Env): string {
-	return env.AI_MODEL || env.MODEL || "gpt-5.6-luna";
+	return env.AI_MODEL || env.MODEL || "";
 }
 
-function getBaseUrl(env: Env): string {
-	return env.AI_BASE_URL || env.BASE_URL || "https://api.tokener.ai/v1";
+function getTelegramToken(env: Env): string {
+	return env.TELEGRAM_BOT_TOKEN || env.SECRET_TELEGRAM_API_TOKEN || "";
+}
+
+function getApiKey(env: Env): string {
+	return env.AI_API_KEY || env.OPENAI_API_KEY || env.GEMINI_API_KEY || "";
+}
+
+function getBaseUrl(env: Env): string | undefined {
+	return env.AI_BASE_URL || env.BASE_URL || undefined;
 }
 
 // Share GPT request settings across commands and scheduled summaries.
@@ -154,21 +163,18 @@ const completionOptions = {
 } as const;
 
 function getGenModel(env: Env) {
+	const baseURL = getBaseUrl(env);
 	const openai = new OpenAI({
-		apiKey: env.GEMINI_API_KEY,
-		baseURL: getBaseUrl(env),
+		apiKey: getApiKey(env),
+		...(baseURL ? { baseURL } : {}),
 		timeout: 999999999999,
 	});
 	return openai;
 }
 
-function foldText(text: string) {
-	return '**>' + text.split("\n").map((line) => '>' + line).join("\n") + '||';
-}
-
 // System prompts for different scenarios
 const SYSTEM_PROMPTS = {
-	summarizeChat: `你是一个专业的群聊概括助手。你的任务是用符合群聊风格的语气概括对话内容。
+	summarizeChat: `你是一个专业的群聊总结助手。你的任务是用层次清晰、富于视觉表现力且符合群聊氛围的结构概括对话内容。
 对话将按以下格式提供：
 ====================
 用户名:
@@ -176,15 +182,29 @@ const SYSTEM_PROMPTS = {
 相应链接
 ====================
 
-请遵循以下指南：
-1. 如果对话包含多个主题，请分条概括
-2. 如果对话中提到图片，请在概括中包含相关内容描述
-3. 在回答中用markdown格式引用原对话的链接
-4. 链接格式应为：[引用1](链接本体)、[关键字1](链接本体)等
-5. 概括要简洁明了，捕捉对话的主要内容和情绪
-6. 概括的开头使用"本日群聊总结如下："`,
+请严格遵循以下排版规范输出：
+1. **【💡 核心要点速览】**：
+   在开头用 2~4 个精炼要点概括今日群聊最核心的共识、进展或突发热点，使用 📌 或 💡 开头。
 
-	answerQuestion: `你是一个群聊智能助手。你的任务是基于提供的群聊记录回答用户的问题。
+2. **【📊 议题简表】（必须输出标准 Markdown 表格）**：
+   梳理本次讨论的核心议题，输出简洁的 Markdown 表格：
+   | 议题分类 | 核心结论 / 共识 |
+   | :--- | :--- |
+   | ... | ... |
+   （精炼概括，通常包含 2~5 个关键议题）
+
+3. **【💬 详细脉络与讨论溯源】（放入 <details> 标签中实现折叠）**：
+   在表格之后，使用 <details> 标签将详细讨论与引用包裹起来，示例：
+   <details>
+   <summary>💬 点击展开详细讨论与消息溯源</summary>
+   1. **议题一**：记录具体的讨论经过，必须用 Markdown 链接引用发言原消息，格式如：[引用1](链接)
+   2. **议题二**：记录具体的讨论经过，引用相关言论 [引用2](链接)
+   若有包含图片内容，请在相应议题中进行生动的描述。
+   </details>
+
+4. 整体风格专业干练，捕捉对话真实情绪，层次分明。`,
+
+	answerQuestion: `你是一个群聊智能问答助手。你的任务是基于提供的群聊记录精准回答用户的问题。
 群聊记录将按以下格式提供：
 ====================
 用户名:
@@ -192,13 +212,16 @@ const SYSTEM_PROMPTS = {
 相应链接
 ====================
 
-请遵循以下指南：
-1. 用符合群聊风格的语气回答问题
-2. 在回答中引用相关的原始消息作为依据
-3. 使用markdown格式引用原对话，格式为：[引用1](链接本体)、[关键字1](链接本体)
-4. 在链接两侧添加空格
-5. 如果找不到相关信息，请诚实说明
-6. 回答应该简洁但内容完整`
+请遵循以下排版规范：
+1. **直接回答**：在最开头直接了当回答用户的问题，条理清晰。
+2. **证据与对话溯源（使用 <details> 折叠）**：
+   如果回答需要引用多条原始记录作为依据，将依据来源放在 <details> 标签中：
+   <details>
+   <summary>🔍 依据来源与原消息引用</summary>
+   - 发言人: "原发言简述" [引用1](链接)
+   </details>
+3. 链接格式：必须使用 [引用1](链接) 并在两侧留有适当空格。
+4. 如果群聊记录中找不到相关答案，请诚实说明，切勿编造。`
 };
 
 function getCommandVar(str: string, delim: string) {
@@ -206,7 +229,8 @@ function getCommandVar(str: string, delim: string) {
 }
 
 function messageTemplate(s: string, modelName: string) {
-	return `下面由 ${escapeMarkdownV2(modelName)} 概括群聊信息\n` + s + `\n本开源项目[地址](https://github\\.com/asukaminato0721/telegram-summary-bot)`;
+	const header = modelName ? `下面由 ${escapeMarkdownV2(modelName)} 概括群聊信息\n` : `群聊信息概括如下：\n`;
+	return header + s + `\n本开源项目[地址](https://github\\.com/cuteys/ChatGist)`;
 }
 /**
  * 
@@ -251,7 +275,7 @@ export default {
 				.run();
 		}
 		const cache = caches.default;
-		const cacheKey = new Request(`https://dummy-url/${env.SECRET_TELEGRAM_API_TOKEN}`);
+		const cacheKey = new Request(`https://dummy-url/${getTelegramToken(env)}`);
 		const cachedResponse = await cache.match(cacheKey);
 		let groups: any[] = [];
 		if (cachedResponse) {
@@ -288,6 +312,10 @@ export default {
 		console.debug("Batch:", batch);
 		console.debug("Found groups:", groups.length, JSON.stringify(groups));
 		const model = getModelName(env);
+		if (!model) {
+			console.error("AI_MODEL is not configured, skipping scheduled summary.");
+			return;
+		}
 		for (const [id, group] of groups.entries()) {
 			if (id % 10 !== batch) {
 				continue;
@@ -324,16 +352,22 @@ export default {
 			console.debug("send message to", group.groupId);
 
 			// Use fetch to send message directly to Telegram API
-			const res = await fetch(`https://api.telegram.org/bot${env.SECRET_TELEGRAM_API_TOKEN}/sendMessage`, {
+			const res = await fetch(`https://api.telegram.org/bot${getTelegramToken(env)}/sendMessage`, {
 				method: 'POST',
 				headers: {
 					'Content-Type': 'application/json',
 				},
 				body: JSON.stringify({
 					chat_id: group.groupId,
-					text: messageTemplate(foldText(
+					text: messageTemplate(
 						fixLink(
-							processMarkdownLinks(telegramifyMarkdown(result.choices[0].message.content || "", 'keep')))), model),
+							formatRichTelegramMessage(
+								processMarkdownLinks(result.choices[0].message.content || ""),
+								{ isSummary: true }
+							)
+						),
+						model
+					),
 					parse_mode: "MarkdownV2",
 				}),
 			});
@@ -353,10 +387,11 @@ export default {
 		console.debug("cron processed");
 	},
 	fetch: async (request: Request, env: Env, ctx: ExecutionContext) => {
+		const botToken = getTelegramToken(env);
 		if (request.method === "GET") {
 			const url = new URL(request.url);
 			if (url.pathname === "/setcommands") {
-				await registerBotCommands(env.SECRET_TELEGRAM_API_TOKEN);
+				await registerBotCommands(botToken);
 				return new Response(JSON.stringify({ ok: true, message: "Commands registered to Telegram", commands: BOT_COMMANDS }), {
 					headers: { "Content-Type": "application/json; charset=utf-8" },
 				});
@@ -364,9 +399,9 @@ export default {
 			return new Response("Telegram Summary Bot is running.");
 		}
 
-		await new TelegramBot(env.SECRET_TELEGRAM_API_TOKEN)
+		await new TelegramBot(botToken)
 			.on('start', async (ctx) => {
-				await registerBotCommands(env.SECRET_TELEGRAM_API_TOKEN);
+				await registerBotCommands(botToken);
 				const startText = escapeMarkdownV2(`你好！我是群聊总结与问答助手。
 请将我添加到群组中使用。
 
@@ -405,7 +440,7 @@ export default {
 				return new Response('ok');
 			})
 			.on('setcommands', async (ctx) => {
-				await registerBotCommands(env.SECRET_TELEGRAM_API_TOKEN);
+				await registerBotCommands(botToken);
 				await ctx.reply('已向 Telegram 同步注册中文指令列表！');
 				return new Response('ok');
 			})
@@ -443,6 +478,10 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 			})
 			.on("ask", async (ctx) => {
 				const model = getModelName(env);
+				if (!model) {
+					await ctx.reply('未配置 AI_MODEL 环境变量，无法处理请求。');
+					return new Response('ok');
+				}
 				const groupId = ctx.update.message!.chat.id;
 				const userId = ctx.update.message!.from!.id;
 				const messageText = ctx.update.message!.text || "";
@@ -504,17 +543,22 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 							...completionOptions,
 						});
 				} catch (e) {
-					logModelError(e, { command: 'ask', model }, [env.GEMINI_API_KEY, env.SECRET_TELEGRAM_API_TOKEN]);
+					logModelError(e, { command: 'ask', model }, [getApiKey(env), getTelegramToken(env)]);
 					await ctx.reply('回答失败，AI 服务暂时无法完成请求，请稍后重试。');
 					return new Response('ok');
 				}
-				let response_text: string;
-				response_text = processMarkdownLinks(telegramifyMarkdown(result.choices[0].message.content || "", 'keep'));
+				const raw = result.choices[0].message.content || "";
+				const response_text = fixLink(
+					formatRichTelegramMessage(
+						processMarkdownLinks(raw),
+						{ isSummary: false }
+					)
+				);
 
 				res = await ctx.api.sendMessage(ctx.bot.api.toString(), {
 					"chat_id": userId,
 					"parse_mode": "MarkdownV2",
-					"text": foldText(response_text),
+					"text": response_text,
 					reply_to_message_id: -1,
 				});
 				if (!res.ok) {
@@ -577,6 +621,10 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 				}
 				if (results.length > 0) {
 					const model = getModelName(env);
+					if (!model) {
+						await bot.reply('未配置 AI_MODEL 环境变量，无法处理请求。');
+						return new Response('ok');
+					}
 					try {
 						const result = await getGenModel(env).chat.completions.create(
 							{
@@ -602,16 +650,21 @@ ${results.map((r: any) => `${r.userName}: ${r.content} ${r.messageId == null ? "
 							})
 
 
+						const raw = result.choices[0].message.content || "";
+						const formatted = formatRichTelegramMessage(
+							processMarkdownLinks(raw),
+							{ isSummary: true }
+						);
 						let res = await bot.reply(
-							messageTemplate(foldText(
-								fixLink(
-									processMarkdownLinks(telegramifyMarkdown(result.choices[0].message.content || "", 'keep')))), model), 'MarkdownV2');
+							messageTemplate(fixLink(formatted), model),
+							'MarkdownV2'
+						);
 						if (!res?.ok) {
 							console.error("Failed to send reply", res?.statusText, await res?.text());
 						}
 					}
 					catch (e) {
-						logModelError(e, { command: 'summary', model }, [env.GEMINI_API_KEY, env.SECRET_TELEGRAM_API_TOKEN]);
+						logModelError(e, { command: 'summary', model }, [getApiKey(env), getTelegramToken(env)]);
 						await bot.reply('概括失败，暂时无法完成请求，请稍后重试。');
 					}
 				}
