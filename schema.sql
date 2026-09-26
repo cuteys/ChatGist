@@ -1,7 +1,5 @@
-DROP TABLE IF EXISTS UserUsage;
-DROP TABLE IF EXISTS WhitelistGroups;
-DROP TABLE IF EXISTS Admins;
-DROP TABLE IF EXISTS Messages;
+-- D1 Database Schema for ChatGist
+-- Tables are created safely with IF NOT EXISTS
 
 CREATE TABLE IF NOT EXISTS Messages (
 	id TEXT PRIMARY KEY,

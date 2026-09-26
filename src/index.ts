@@ -1,8 +1,7 @@
 import TelegramBot from '@codebam/cf-workers-telegram-bot';
 import OpenAI from "openai";
-//@ts-ignore
 import { Buffer } from 'node:buffer';
-import { isJPEG } from './isJpeg';
+import { isJPEG, detectImageMimeType } from './isJpeg';
 import { extractAllOGInfo } from "./og";
 import { logModelError } from './logModelError';
 import {
@@ -14,6 +13,8 @@ import {
 	toSuperscript,
 	processMarkdownLinks,
 	fixLink,
+	stripMarkdownV2Escapes,
+	splitTelegramMessage,
 } from './richFormat';
 import {
 	initWhitelistTables,
@@ -26,6 +27,7 @@ import {
 	addAdmin,
 	removeAdmin,
 	getAdmins,
+	clearGroupMessages,
 } from './whitelist';
 import {
 	initQuotaTables,
@@ -34,25 +36,34 @@ import {
 	cleanOldQuotaRecords,
 } from './quota';
 
-export { toSuperscript, processMarkdownLinks, fixLink, foldText, formatSummaryWithHighlights };
+export {
+	toSuperscript,
+	processMarkdownLinks,
+	fixLink,
+	foldText,
+	formatSummaryWithHighlights,
+	stripMarkdownV2Escapes,
+	splitTelegramMessage,
+};
 
 function dispatchContent(content: string): { type: "text", text: string } | { type: "image_url", image_url: { url: string } } {
-	if (content.startsWith("data:image/jpeg;base64,")) {
-		return ({
-			"type": "image_url",
-			"image_url": {
-				"url": content
+	if (content.startsWith("data:image/")) {
+		return {
+			type: "image_url",
+			image_url: {
+				url: content,
 			},
-		});
+		};
 	}
-	return ({
-		"type": "text",
-		"text": content,
-	});
+	return {
+		type: "text",
+		text: content,
+	};
 }
 
-function getMessageLink(r: { groupId: string, messageId: number }) {
-	return `https://t.me/c/${parseInt(r.groupId.slice(2))}/${r.messageId}`;
+function getMessageLink(r: { groupId: string; messageId: number }) {
+	const cleanGroupId = r.groupId.replace(/^-100/, '').replace(/^-/, '');
+	return `https://t.me/c/${cleanGroupId}/${r.messageId}`;
 }
 
 function escapeMarkdownV2(text: string) {
@@ -75,6 +86,7 @@ export const BOT_COMMANDS = [
 	{ command: "addadmin", description: "【超管】添加管理员（免流特权）" },
 	{ command: "deladmin", description: "【超管】移除管理员" },
 	{ command: "admins", description: "【超管】查看所有管理员列表" },
+	{ command: "clearmessages", description: "【超管】清空指定群组的历史消息记录" },
 	{ command: "setcommands", description: "【超管】同步更新指令菜单" },
 ];
 
@@ -98,7 +110,7 @@ function getModelName(env: Env): string {
 }
 
 function getTelegramToken(env: Env): string {
-	return env.TELEGRAM_BOT_TOKEN || env.SECRET_TELEGRAM_API_TOKEN || "";
+	return env.TELEGRAM_BOT_TOKEN || "";
 }
 
 function getApiKey(env: Env): string {
@@ -114,7 +126,6 @@ function getCompletionOptions(model: string) {
 	if (isReasoning) {
 		return {
 			max_completion_tokens: 4096,
-			reasoning_effort: "none" as const,
 		};
 	}
 	return {
@@ -167,6 +178,13 @@ const SYSTEM_PROMPTS = {
 4. 如果找不到相关信息，请诚实说明，切勿编造。
 5. 回答应该简洁但内容完整。`
 };
+
+function getSystemPrompt(env: Env, type: 'summary' | 'ask'): string {
+	if (type === 'summary') {
+		return env.SYSTEM_PROMPT_SUMMARY?.trim() || SYSTEM_PROMPTS.summarizeChat;
+	}
+	return env.SYSTEM_PROMPT_ASK?.trim() || SYSTEM_PROMPTS.answerQuestion;
+}
 
 function getCommandVar(str: string, delim: string) {
 	return str.slice(str.indexOf(delim) + delim.length);
@@ -247,6 +265,7 @@ function getRoleHelpText(env: Env, userId: string, superAdmin: boolean, admin: b
 • /addadmin <用户ID> [备注] - 添加免流管理员
 • /deladmin <用户ID> - 移除管理员
 • /admins - 查看管理员列表
+• /clearmessages [群ID] - 清空指定群组的历史消息记录
 • /setcommands - 向 Telegram 同步指令菜单
 
 💬 群聊常用指令：
@@ -431,123 +450,126 @@ export default {
 		console.debug("Scheduled task starting:", new Date().toISOString());
 		await initWhitelistTables(env);
 		await initQuotaTables(env);
-		const date = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Shanghai" }));
-		// Clean up oldest 3000 messages and old quota records
-		if (date.getHours() === 0 && date.getMinutes() < 5) {
+
+		// 1. 定期清理：清理 3 天前的配额记录，保留各群最新 3000 条消息，以及清理 24 小时前的旧图片
+		try {
 			await cleanOldQuotaRecords(env);
 			await env.DB.prepare(`
-					DELETE FROM Messages
-					WHERE id IN (
-						SELECT id
-						FROM (
-							SELECT
-								id,
-								ROW_NUMBER() OVER (
-									PARTITION BY groupId
-									ORDER BY timeStamp DESC
-								) as row_num
-							FROM Messages
-						) ranked
-						WHERE row_num > 3000
-					);`)
-				.run();
-		}
-		const cache = caches.default;
-		const cacheKey = new Request(`https://dummy-url/${getTelegramToken(env)}`);
-		const cachedResponse = await cache.match(cacheKey);
-		let groups: any[] = [];
-		if (cachedResponse) {
-			console.debug("Using cached response");
-			groups = await cachedResponse.json();
-		}
-		else {
-			console.debug("Fetching groups");
-			groups = (await env.DB.prepare(`
-		WITH MessageCounts AS (
-			SELECT
-				m.groupId,
-				COUNT(*) as message_count
-			FROM Messages m
-			INNER JOIN WhitelistGroups w ON m.groupId = w.groupId
-			WHERE m.timeStamp >= ?1 - (24 * 3600 * 1000)
-			GROUP BY m.groupId
-		)
-		SELECT groupId, message_count
-		FROM MessageCounts
-		WHERE message_count > 10
-		ORDER BY message_count DESC
-		LIMIT 20;
-		`).bind(Date.now()).all()).results;
-			ctx.waitUntil(
-				cache.put(cacheKey, new Response(JSON.stringify(groups), {
-					headers: {
-						'content-type': 'application/json',
-						"Cache-Control": "s-maxage=10000",
-					},
-				})));
-		}
-		const batch = Math.floor(date.getMinutes() / 6);  // 0 <= batch < 10
+				DELETE FROM Messages
+				WHERE id IN (
+					SELECT id
+					FROM (
+						SELECT
+							id,
+							ROW_NUMBER() OVER (
+								PARTITION BY groupId
+								ORDER BY timeStamp DESC
+							) as row_num
+						FROM Messages
+					) ranked
+					WHERE row_num > 3000
+				);
+			`).run();
 
-		console.debug("Batch:", batch);
-		console.debug("Found groups:", groups.length, JSON.stringify(groups));
+			await env.DB.prepare(`
+				DELETE FROM Messages
+				WHERE timeStamp < ? AND content LIKE 'data:image/%'
+			`).bind(Date.now() - 24 * 60 * 60 * 1000).run();
+		} catch (e) {
+			console.error("Scheduled cleanup failed:", e);
+		}
+
 		const model = getModelName(env);
 		if (!model) {
 			console.error("AI_MODEL is not configured, skipping scheduled summary.");
 			return;
 		}
-		for (const [id, group] of groups.entries()) {
-			if (id % 10 !== batch) {
-				continue;
-			}
-			console.debug(`Processing group ${id + 1}/${groups.length}: ${group.groupId}`);
-			const { results } = await env.DB.prepare('SELECT * FROM Messages WHERE groupId=? AND timeStamp >= ? ORDER BY timeStamp ASC')
-				.bind(group.groupId, Date.now() - 24 * 60 * 60 * 1000)
-				.all();
 
-			const result = await getGenModel(env).chat.completions.create({
-				model,
-				messages: [
-					{
-						"role": "system",
-						content: SYSTEM_PROMPTS.summarizeChat,
-					},
-					{
-						"role": "user",
-						content: formatChatHistoryForAi(results)
-					}],
-				...getCompletionOptions(model),
-			});
+		// 2. 查找过去 24 小时活跃的白名单群组（发言超过 10 条）
+		let groups: Array<{ groupId: string; message_count: number }> = [];
+		try {
+			const res = await env.DB.prepare(`
+				WITH MessageCounts AS (
+					SELECT
+						m.groupId,
+						COUNT(*) as message_count
+					FROM Messages m
+					INNER JOIN WhitelistGroups w ON m.groupId = w.groupId
+					WHERE m.timeStamp >= ?1 - (24 * 3600 * 1000)
+					GROUP BY m.groupId
+				)
+				SELECT groupId, message_count
+				FROM MessageCounts
+				WHERE message_count > 10
+				ORDER BY message_count DESC
+				LIMIT 20;
+			`).bind(Date.now()).all<{ groupId: string; message_count: number }>();
+			groups = res?.results || [];
+		} catch (e) {
+			console.error("Failed to query active groups:", e);
+			return;
+		}
 
-			const raw = result.choices[0].message.content || "";
-			const formatted = formatSummaryWithHighlights(raw);
+		console.debug(`Scheduled summary: found ${groups.length} active groups.`);
 
-			console.debug("send message to", group.groupId);
+		// 3. 逐个群组生成并推送总结，单群异常不影响其它群
+		for (const group of groups) {
+			try {
+				const { results } = await env.DB.prepare(
+					'SELECT * FROM Messages WHERE groupId=? AND timeStamp >= ? ORDER BY timeStamp ASC'
+				)
+					.bind(group.groupId, Date.now() - 24 * 60 * 60 * 1000)
+					.all();
 
-			const res = await fetch(`https://api.telegram.org/bot${getTelegramToken(env)}/sendMessage`, {
-				method: 'POST',
-				headers: {
-					'Content-Type': 'application/json',
-				},
-				body: JSON.stringify({
-					chat_id: group.groupId,
-					text: messageTemplate(formatted, model),
-					parse_mode: "MarkdownV2",
-				}),
-			});
-			if (!res?.ok) {
-				console.error("Failed to send reply", res?.statusText, await res?.text());
+				if (!results || results.length === 0) continue;
+
+				const result = await getGenModel(env).chat.completions.create({
+					model,
+					messages: [
+						{
+							role: "system",
+							content: getSystemPrompt(env, 'summary'),
+						},
+						{
+							role: "user",
+							content: formatChatHistoryForAi(results),
+						},
+					],
+					...getCompletionOptions(model),
+				});
+
+				const raw = result.choices[0].message.content || "";
+				const formatted = formatSummaryWithHighlights(raw);
+				const fullText = messageTemplate(formatted, model);
+
+				const chunks = splitTelegramMessage(fullText);
+				for (const chunk of chunks) {
+					const res = await fetch(`https://api.telegram.org/bot${getTelegramToken(env)}/sendMessage`, {
+						method: 'POST',
+						headers: { 'Content-Type': 'application/json' },
+						body: JSON.stringify({
+							chat_id: group.groupId,
+							text: chunk,
+							parse_mode: "MarkdownV2",
+						}),
+					});
+					if (!res?.ok) {
+						const plainText = stripMarkdownV2Escapes(chunk);
+						await fetch(`https://api.telegram.org/bot${getTelegramToken(env)}/sendMessage`, {
+							method: 'POST',
+							headers: { 'Content-Type': 'application/json' },
+							body: JSON.stringify({
+								chat_id: group.groupId,
+								text: plainText,
+							}),
+						});
+					}
+				}
+			} catch (err) {
+				console.error(`Error processing scheduled summary for group ${group.groupId}:`, err);
 			}
 		}
-		// clean up old images
-		if (date.getHours() === 0 && date.getMinutes() < 5) {
-			ctx.waitUntil(env.DB.prepare(`
-					DELETE
-					FROM Messages
-					WHERE timeStamp < ? AND content LIKE 'data:image/jpeg;base64,%'`)
-				.bind(Date.now() - 24 * 60 * 60 * 1000)
-				.run());
-		}
-		console.debug("cron processed");
+		console.debug("Scheduled cron completed.");
 	},
 	fetch: async (request: Request, env: Env, ctx: ExecutionContext) => {
 		const botToken = getTelegramToken(env);
@@ -560,6 +582,15 @@ export default {
 				});
 			}
 			return new Response("ChatGist Bot is running.");
+		}
+
+		// 安全校验：若配置了 SECRET_TELEGRAM_API_TOKEN，校验 Telegram Webhook 请求头
+		const secretToken = env.SECRET_TELEGRAM_API_TOKEN;
+		if (secretToken) {
+			const headerToken = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
+			if (headerToken !== secretToken) {
+				return new Response("Unauthorized", { status: 403 });
+			}
 		}
 
 		const reqUrl = new URL(request.url);
@@ -607,6 +638,7 @@ export default {
 						"admins",
 						"addadmin",
 						"deladmin",
+						"clearmessages",
 						"setcommands",
 					];
 
@@ -742,20 +774,33 @@ export default {
 				else if (subCmd === 'del' || subCmd === 'remove') await handleDelAdmin(ctx, env, parts[1]);
 				else await handleListAdmins(ctx, env);
 			}))
+			.on('clearmessages', (ctx) => withAdminAuth(ctx, env, async (uid, parts) => {
+				const chat = ctx.update.message?.chat;
+				const isGroup = chat && (chat.type === 'group' || chat.type === 'supergroup');
+				let targetGid = parts[0] || (isGroup ? chat.id.toString() : "");
+				if (!targetGid) {
+					await ctx.reply("⚠️ 请在群内发送 /clearmessages，或指定群组 ID，例如：\n/clearmessages -1001234567890");
+					return;
+				}
+				const count = await clearGroupMessages(env, targetGid);
+				await ctx.reply(`🧹 已成功清除群组 (${targetGid}) 的历史消息记录（共清理 ${count} 条）。`);
+			}))
 			.on("query", async (ctx) => {
 				const msg = ctx.update?.message;
 				if (!msg || !msg.chat) return new Response('ok');
 				const groupId = msg.chat.id.toString();
 				const userId = msg.from?.id?.toString() || "";
-				const quota = await checkAndIncrementQuota(env, userId, 'query');
-				if (!quota.allowed) {
-					await ctx.reply(`⚠️ 您今日的 /query 检索次数已达上限（${quota.current}/${quota.limit} 次）。配额将在次日 00:00 自动刷新。`);
-					return new Response('ok');
-				}
+
 				const messageText = msg.text || "";
 				const keyword = messageText.split(/\s+/).slice(1).join(" ").trim();
 				if (!keyword) {
 					await ctx.reply('⚠️ 请输入要查询的关键词，例如：/query 部署');
+					return new Response('ok');
+				}
+
+				const quota = await checkAndIncrementQuota(env, userId, 'query');
+				if (!quota.allowed) {
+					await ctx.reply(`⚠️ 您今日的 /query 检索次数已达上限（${quota.current}/${quota.limit} 次）。配额将在次日 00:00 自动刷新。`);
 					return new Response('ok');
 				}
 
@@ -770,40 +815,46 @@ export default {
 					console.error("Failed to send query status", e);
 				}
 
-				const { results } = await env.DB.prepare(`
-					SELECT * FROM Messages
-					WHERE groupId = ? AND content NOT LIKE 'data:image%' AND content GLOB ?
-					ORDER BY timeStamp DESC
-					LIMIT 50`)
-					.bind(groupId, `*${keyword}*`)
-					.all();
+				try {
+					const { results } = await env.DB.prepare(`
+						SELECT * FROM Messages
+						WHERE groupId = ? AND content NOT LIKE 'data:image%' AND content GLOB ?
+						ORDER BY timeStamp DESC
+						LIMIT 50`)
+						.bind(groupId, `*${keyword}*`)
+						.all();
 
-				if (statusMessageId) {
-					await deleteTelegramMessage(getTelegramToken(env), groupId, statusMessageId);
+					if (!results || results.length === 0) {
+						await ctx.reply(`🔍 未找到包含关键词【${keyword}】的相关历史消息。`);
+						return new Response('ok');
+					}
+
+					const MAX_DISPLAY = 15;
+					const displayList = results.slice(0, MAX_DISPLAY);
+					let outputLines = [`🔍 关键词【${keyword}】检索结果（共找到 ${results.length} 条）：\n`];
+					for (const r of displayList as any[]) {
+						const contentPreview = r.content.length > 80 ? r.content.slice(0, 80) + '...' : r.content;
+						const link = r.messageId ? ` [链接](${getMessageLink(r)})` : '';
+						outputLines.push(`• ${r.userName}：${contentPreview}${link}`);
+					}
+					if (results.length > MAX_DISPLAY) {
+						outputLines.push(`\nℹ️ 结果较多，仅展示最近 ${MAX_DISPLAY} 条记录。`);
+					}
+
+					const responseText = normalizeSpacing(outputLines.join('\n'));
+					const chunks = splitTelegramMessage(escapeMarkdownV2(responseText));
+					for (const chunk of chunks) {
+						const res = await ctx.reply(chunk, "MarkdownV2");
+						if (!res?.ok) {
+							await ctx.reply(stripMarkdownV2Escapes(chunk));
+						}
+					}
+				} finally {
+					if (statusMessageId) {
+						await deleteTelegramMessage(getTelegramToken(env), groupId, statusMessageId);
+					}
 				}
 
-				if (!results || results.length === 0) {
-					await ctx.reply(`🔍 未找到包含关键词【${keyword}】的相关历史消息。`);
-					return new Response('ok');
-				}
-
-				const MAX_DISPLAY = 15;
-				const displayList = results.slice(0, MAX_DISPLAY);
-				let outputLines = [`🔍 关键词【${keyword}】检索结果（共找到 ${results.length} 条）：\n`];
-				for (const r of displayList as any[]) {
-					const contentPreview = r.content.length > 80 ? r.content.slice(0, 80) + '...' : r.content;
-					const link = r.messageId ? ` [链接](https://t.me/c/${parseInt(r.groupId.slice(2))}/${r.messageId})` : '';
-					outputLines.push(`• ${r.userName}：${contentPreview}${link}`);
-				}
-				if (results.length > MAX_DISPLAY) {
-					outputLines.push(`\nℹ️ 结果较多，仅展示最近 ${MAX_DISPLAY} 条记录。`);
-				}
-
-				const responseText = normalizeSpacing(outputLines.join('\n'));
-				const res = await ctx.reply(escapeMarkdownV2(responseText), "MarkdownV2");
-				if (!res?.ok) {
-					console.error(`Error sending message:`, res?.status, res?.statusText, await res?.text());
-				}
 				return new Response('ok');
 			})
 			.on("ask", async (ctx) => {
@@ -816,11 +867,7 @@ export default {
 				if (!msg || !msg.chat) return new Response('ok');
 				const groupId = msg.chat.id.toString();
 				const userId = msg.from?.id?.toString() || "";
-				const quota = await checkAndIncrementQuota(env, userId, 'ask');
-				if (!quota.allowed) {
-					await ctx.reply(`⚠️ 您今日的 /ask 提问次数已达上限（${quota.current}/${quota.limit} 次）。配额将在次日 00:00 自动刷新。`);
-					return new Response('ok');
-				}
+
 				const messageText = ctx.update.message!.text || "";
 				const question = getCommandVar(messageText, " ").trim();
 				if (!question) {
@@ -842,89 +889,92 @@ export default {
 					}
 				}
 
-				let res = await ctx.api.sendMessage(ctx.bot.api.toString(), {
-					"chat_id": userId,
-					"parse_mode": "MarkdownV2",
-					"text": "bot 已经收到你的问题, 请稍等",
-					reply_to_message_id: -1,
-				});
-				if (!res.ok) {
-					if (groupAckMessageId) {
-						await deleteTelegramMessage(getTelegramToken(env), groupId, groupAckMessageId);
-					}
-					await ctx.reply(`请先在私聊中向机器人发送 /start 发起对话，否则无法私信推送答案。`);
-					return new Response('ok');
-				}
-				const { results } = await env.DB.prepare(`
-					WITH latest_1000 AS (
-						SELECT * FROM Messages
-						WHERE groupId=?
-						ORDER BY timeStamp DESC
-						LIMIT 1000
-					)
-					SELECT * FROM latest_1000
-					ORDER BY timeStamp ASC
-					`)
-					.bind(groupId)
-					.all();
-				let result;
 				try {
-					result = await getGenModel(env)
-						.chat.completions.create({
-							model,
-							messages: [
-								{
-									"role": "system",
-									content: SYSTEM_PROMPTS.answerQuestion,
-								},
-								{
-									"role": "user",
-									content: formatChatHistoryForAi(results)
-								},
-								{
-									"role": "user",
-									content: `问题：${question}`
-								}
-							],
-							...getCompletionOptions(model),
-						});
-				} catch (e) {
-					if (groupAckMessageId) {
-						await deleteTelegramMessage(getTelegramToken(env), groupId, groupAckMessageId);
-					}
-					logModelError(e, { command: 'ask', model }, [getApiKey(env), getTelegramToken(env)]);
-					await ctx.reply('回答失败，AI 服务暂时无法完成请求，请稍后重试。');
-					return new Response('ok');
-				}
-				const raw = result.choices[0].message.content || "";
-				const response_text = formatAnswerMessage(raw);
-
-				res = await ctx.api.sendMessage(ctx.bot.api.toString(), {
-					"chat_id": userId,
-					"parse_mode": "MarkdownV2",
-					"text": response_text,
-					reply_to_message_id: -1,
-				});
-				if (!res.ok) {
-					let reason = (await res.json() as any)?.promptFeedback?.blockReason;
-					if (reason) {
-						await ctx.reply(`无法回答, 理由 ${reason}`);
-						if (groupAckMessageId) {
-							await deleteTelegramMessage(getTelegramToken(env), groupId, groupAckMessageId);
-						}
-						return new Response('ok');
-					}
-					const plainText = response_text.replace(/\\([_*[\]()~`>#+\-=|{}.!])/g, '$1');
-					await ctx.api.sendMessage(ctx.bot.api.toString(), {
-						"chat_id": userId,
-						"parse_mode": "",
-						"text": plainText,
+					// 先测试私聊是否可达，防止扣减额度后无法送达
+					const testPmRes = await ctx.api.sendMessage(ctx.bot.api.toString(), {
+						chat_id: userId,
+						parse_mode: "MarkdownV2",
+						text: "⏳ 正在分析群聊记录并为您解答，请稍候...",
 						reply_to_message_id: -1,
 					});
+					if (!testPmRes.ok) {
+						await ctx.reply(`请先在私聊中向机器人发送 /start 发起对话，否则无法私信推送答案。`);
+						return new Response('ok');
+					}
+
+					const quota = await checkAndIncrementQuota(env, userId, 'ask');
+					if (!quota.allowed) {
+						await ctx.reply(`⚠️ 您今日的 /ask 提问次数已达上限（${quota.current}/${quota.limit} 次）。配额将在次日 00:00 自动刷新。`);
+						return new Response('ok');
+					}
+
+					const { results } = await env.DB.prepare(`
+						WITH latest_1000 AS (
+							SELECT * FROM Messages
+							WHERE groupId=?
+							ORDER BY timeStamp DESC
+							LIMIT 1000
+						)
+						SELECT * FROM latest_1000
+						ORDER BY timeStamp ASC
+						`)
+						.bind(groupId)
+						.all();
+
+					let result;
+					try {
+						result = await getGenModel(env)
+							.chat.completions.create({
+								model,
+								messages: [
+									{
+										role: "system",
+										content: getSystemPrompt(env, 'ask'),
+									},
+									{
+										role: "user",
+										content: formatChatHistoryForAi(results)
+									},
+									{
+										role: "user",
+										content: `问题：${question}`
+									}
+								],
+								...getCompletionOptions(model),
+							});
+					} catch (e) {
+						logModelError(e, { command: 'ask', model }, [getApiKey(env), getTelegramToken(env)]);
+						await ctx.reply('回答失败，AI 服务暂时无法完成请求，请稍后重试。');
+						return new Response('ok');
+					}
+
+					const raw = result.choices[0].message.content || "";
+					const response_text = formatAnswerMessage(raw);
+
+					const chunks = splitTelegramMessage(response_text);
+					for (const chunk of chunks) {
+						const sendRes = await ctx.api.sendMessage(ctx.bot.api.toString(), {
+							chat_id: userId,
+							parse_mode: "MarkdownV2",
+							text: chunk,
+							reply_to_message_id: -1,
+						});
+						if (!sendRes.ok) {
+							const plainText = stripMarkdownV2Escapes(chunk);
+							await ctx.api.sendMessage(ctx.bot.api.toString(), {
+								chat_id: userId,
+								parse_mode: "",
+								text: plainText,
+								reply_to_message_id: -1,
+							});
+						}
+					}
+				} finally {
+					if (groupAckMessageId) {
+						await deleteTelegramMessage(getTelegramToken(env), groupId, groupAckMessageId);
+					}
 				}
-				if (groupAckMessageId) {
-					await deleteTelegramMessage(getTelegramToken(env), groupId, groupAckMessageId);
-				}
+
 				return new Response('ok');
 			})
 			.on("summary", async (bot) => {
@@ -932,35 +982,37 @@ export default {
 				if (!msg || !msg.chat) return new Response('ok');
 				const groupId = msg.chat.id.toString();
 				const userId = msg.from?.id?.toString() || "";
+
+				const parts = (msg.text || "").trim().split(/\s+/);
+				const summaryArg = parts[1];
+				let isDefault = false;
+				let limitCount = 50;
+				let hours: number | undefined;
+
+				if (!summaryArg) {
+					isDefault = true;
+					limitCount = 50;
+				} else {
+					const match = summaryArg.match(/^(\d+)(h)?$/i);
+					if (!match) {
+						await bot.reply('⚠️ 请输入有效的时间范围或消息数量，例如：\n• /summary 20（最近 20 条）\n• /summary 12h（最近 12 小时）');
+						return new Response('ok');
+					}
+					const num = parseInt(match[1], 10);
+					if (num <= 0) {
+						await bot.reply('⚠️ 请输入大于 0 的有效数值。');
+						return new Response('ok');
+					}
+					if (match[2]) {
+						hours = num;
+					} else {
+						limitCount = Math.min(num, 4000);
+					}
+				}
+
 				const quota = await checkAndIncrementQuota(env, userId, 'summary');
 				if (!quota.allowed) {
 					await bot.reply(`⚠️ 您今日的 /summary 总结次数已达上限（${quota.current}/${quota.limit} 次）。配额将在次日 00:00 自动刷新。`);
-					return new Response('ok');
-				}
-
-				const parts = (msg.text || "").trim().split(/\s+/);
-				let summary = parts[1];
-				let isDefault = false;
-				if (!summary) {
-					summary = "50";
-					isDefault = true;
-				}
-
-				let results: Record<string, unknown>[];
-				try {
-					const test = parseInt(summary);
-					if (Number.isNaN(test)) {
-						throw new Error("not a number");
-					}
-					if (test < 0) {
-						throw new Error("negative number");
-					}
-					if (!Number.isFinite(test)) {
-						throw new Error("infinite number");
-					}
-				}
-				catch (e: any) {
-					await bot.reply('⚠️ 请输入有效的时间范围或消息数量，例如：\n• /summary 20（最近 20 条）\n• /summary 12h（最近 12 小时）');
 					return new Response('ok');
 				}
 
@@ -975,91 +1027,84 @@ export default {
 					console.error("Failed to send initial status message:", e);
 				}
 
-				if (summary.endsWith("h")) {
-					results = (await env.DB.prepare(`
-						SELECT *
-						FROM Messages
-						WHERE groupId=? AND timeStamp >= ?
-						ORDER BY timeStamp ASC
-						`)
-						.bind(groupId, Date.now() - parseInt(summary) * 60 * 60 * 1000)
-						.all()).results;
-				}
-				else {
-					results = (await env.DB.prepare(`
-						WITH latest_n AS (
-							SELECT * FROM Messages
-							WHERE groupId=?
-							ORDER BY timeStamp DESC
-							LIMIT ?
-						)
-						SELECT * FROM latest_n
-						ORDER BY timeStamp ASC
-						`)
-						.bind(groupId, Math.min(parseInt(summary), 4000))
-						.all()).results;
-				}
-
-				if (!results || results.length === 0) {
-					if (statusMessageId) {
-						await deleteTelegramMessage(getTelegramToken(env), groupId, statusMessageId);
-					}
-					await bot.reply('📋 在指定范围暂无群聊消息记录，无需总结。');
-					return new Response('ok');
-				}
-
-				const model = getModelName(env);
-				if (!model) {
-					if (statusMessageId) {
-						await deleteTelegramMessage(getTelegramToken(env), groupId, statusMessageId);
-					}
-					await bot.reply('未配置 AI_MODEL 环境变量，无法处理请求。');
-					return new Response('ok');
-				}
 				try {
-					const result = await getGenModel(env).chat.completions.create(
-						{
+					let results: Record<string, unknown>[];
+					if (hours !== undefined) {
+						results = (await env.DB.prepare(`
+							SELECT *
+							FROM Messages
+							WHERE groupId=? AND timeStamp >= ?
+							ORDER BY timeStamp ASC
+							`)
+							.bind(groupId, Date.now() - hours * 60 * 60 * 1000)
+							.all()).results;
+					} else {
+						results = (await env.DB.prepare(`
+							WITH latest_n AS (
+								SELECT * FROM Messages
+								WHERE groupId=?
+								ORDER BY timeStamp DESC
+								LIMIT ?
+							)
+							SELECT * FROM latest_n
+							ORDER BY timeStamp ASC
+							`)
+							.bind(groupId, limitCount)
+							.all()).results;
+					}
+
+					if (!results || results.length === 0) {
+						await bot.reply('📋 在指定范围暂无群聊消息记录，无需总结。');
+						return new Response('ok');
+					}
+
+					const model = getModelName(env);
+					if (!model) {
+						await bot.reply('未配置 AI_MODEL 环境变量，无法处理请求。');
+						return new Response('ok');
+					}
+
+					let raw = "";
+					try {
+						const result = await getGenModel(env).chat.completions.create({
 							model,
 							messages: [
 								{
-									"role": "system",
-									content: SYSTEM_PROMPTS.summarizeChat,
+									role: "system",
+									content: getSystemPrompt(env, 'summary'),
 								},
 								{
-									"role": "user",
+									role: "user",
 									content: formatChatHistoryForAi(results)
 								}
 							],
 							...getCompletionOptions(model),
 						});
+						raw = result.choices[0].message.content || "";
+					} catch (e) {
+						logModelError(e, { command: 'summary', model }, [getApiKey(env), getTelegramToken(env)]);
+						await bot.reply('概括失败，暂时无法完成请求，请稍后重试。');
+						return new Response('ok');
+					}
 
-					const raw = result.choices[0].message.content || "";
 					const formatted = formatSummaryWithHighlights(raw);
-
 					let replyContent = messageTemplate(formatted, model);
 					if (isDefault) {
 						replyContent = `💡【未指定参数，默认总结近期 50 条消息】\n\n` + replyContent;
 					}
 
-					let res = await bot.reply(
-						replyContent,
-						'MarkdownV2'
-					);
-					if (!res?.ok) {
-						console.error("Failed to send reply with MarkdownV2, falling back to plain text:", res?.statusText, await res?.text());
-						const plainText = replyContent.replace(/\\([_*[\]()~`>#+\-=|{}.!])/g, '$1');
-						await bot.reply(plainText);
+					const chunks = splitTelegramMessage(replyContent);
+					for (const chunk of chunks) {
+						const res = await bot.reply(chunk, 'MarkdownV2');
+						if (!res?.ok) {
+							const plainText = stripMarkdownV2Escapes(chunk);
+							await bot.reply(plainText);
+						}
 					}
+				} finally {
 					if (statusMessageId) {
 						await deleteTelegramMessage(getTelegramToken(env), groupId, statusMessageId);
 					}
-				}
-				catch (e) {
-					if (statusMessageId) {
-						await deleteTelegramMessage(getTelegramToken(env), groupId, statusMessageId);
-					}
-					logModelError(e, { command: 'summary', model }, [getApiKey(env), getTelegramToken(env)]);
-					await bot.reply('概括失败，暂时无法完成请求，请稍后重试。');
 				}
 
 				return new Response('ok');
@@ -1106,7 +1151,6 @@ export default {
 						}
 						const messageId = msg.message_id;
 						const groupName = msg.chat.title || "anonymous";
-						const timeStamp = Date.now();
 						const userName = getUserName(msg);
 
 						const candidatePhotos = [...(msg.photo || [])].reverse();
@@ -1135,12 +1179,18 @@ export default {
 							}
 						}
 
-						if (!file || !isJPEG(file)) {
-							console.error("not a valid jpeg or failed to download photo");
+						if (!file) {
+							console.error("Failed to download photo");
 							return new Response('ok');
 						}
 
-						const content = "data:image/jpeg;base64," + Buffer.from(file).toString("base64");
+						const mimeType = detectImageMimeType(file);
+						if (!mimeType) {
+							console.warn("Unsupported image format");
+							return new Response('ok');
+						}
+
+						const content = `data:${mimeType};base64,` + Buffer.from(file).toString("base64");
 						await saveMessage(env, { groupId, messageId, userName, content, groupName });
 						return new Response('ok');
 					}

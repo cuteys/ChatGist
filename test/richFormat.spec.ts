@@ -7,6 +7,8 @@ import {
 	normalizeSpacing,
 	formatSummaryWithHighlights,
 	formatAnswerMessage,
+	stripMarkdownV2Escapes,
+	splitTelegramMessage,
 } from '../src/richFormat';
 
 describe('richFormat tests', () => {
@@ -70,5 +72,24 @@ describe('richFormat tests', () => {
 		expect(result.startsWith('**>')).toBe(true);
 		expect(result.endsWith('||')).toBe(true);
 		expect(result).toContain('https://t.me/c/123/1');
+	});
+
+	it('strips MarkdownV2 escapes correctly', () => {
+		const escaped = 'Hello\\! This is a test\\_with\\*symbols\\[and\\]parens\\(ok\\)\\.';
+		expect(stripMarkdownV2Escapes(escaped)).toBe('Hello! This is a test_with*symbols[and]parens(ok).');
+	});
+
+	it('splits long messages cleanly without exceeding maximum length', () => {
+		const shortText = '短消息无需切分';
+		expect(splitTelegramMessage(shortText)).toEqual([shortText]);
+
+		// Create a long text with paragraphs
+		const p1 = 'A'.repeat(2500);
+		const p2 = 'B'.repeat(2500);
+		const longText = `${p1}\n\n${p2}`;
+		const chunks = splitTelegramMessage(longText, 4000);
+		expect(chunks.length).toBe(2);
+		expect(chunks[0]).toBe(p1);
+		expect(chunks[1]).toBe(p2);
 	});
 });

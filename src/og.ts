@@ -12,6 +12,12 @@ export async function extractAllOGInfo(url: string): Promise<string> {
 			return url;
 		}
 
+		// 检查 Content-Type，仅处理 HTML 网页，防止下载超大二进制文件或音视频
+		const contentType = response.headers.get('content-type') || '';
+		if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) {
+			return url;
+		}
+
 		class MetaHandler {
 			element(element: Element) {
 				const propertyValue = element.getAttribute("property");

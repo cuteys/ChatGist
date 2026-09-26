@@ -457,6 +457,67 @@ describe('Worker fetch whitelist gatekeeping', () => {
 		expect(row).toBeDefined();
 		expect((row as any).content).toBe('Updated edited message text');
 	});
+
+	it('should verify secret token authentication when configured', async () => {
+		const testEnvWithSecret: Env = {
+			...env,
+			TELEGRAM_BOT_TOKEN: 'test_token',
+			SECRET_TELEGRAM_API_TOKEN: 'super_secret_123',
+		};
+
+		// 1. Without matching header -> 403
+		const reqUnauthorized = new Request('https://chatgist.example.com/', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ update_id: 1002 }),
+		});
+		const resUnauthorized = await worker.fetch(reqUnauthorized, testEnvWithSecret, mockCtx);
+		expect(resUnauthorized.status).toBe(403);
+
+		// 2. With matching header -> 200
+		const reqAuthorized = new Request('https://chatgist.example.com/', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-Telegram-Bot-Api-Secret-Token': 'super_secret_123',
+			},
+			body: JSON.stringify({ update_id: 1003 }),
+		});
+		const resAuthorized = await worker.fetch(reqAuthorized, testEnvWithSecret, mockCtx);
+		expect(resAuthorized.status).toBe(200);
+	});
+
+	it('should clear group messages using clearGroupMessages', async () => {
+		const groupId = '-100999888';
+		await addGroupToWhitelist(testEnv, groupId, 'Temp Group', '10001');
+
+		// Insert dummy messages
+		await testEnv.DB.prepare(
+			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)'
+		)
+			.bind('msg-1', groupId, Date.now(), 'User1', 'Test message 1', 1, 'Temp Group')
+			.run();
+
+		await testEnv.DB.prepare(
+			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)'
+		)
+			.bind('msg-2', groupId, Date.now(), 'User2', 'Test message 2', 2, 'Temp Group')
+			.run();
+
+		const countBefore = await testEnv.DB.prepare('SELECT COUNT(*) as cnt FROM Messages WHERE groupId = ?')
+			.bind(groupId)
+			.first<number>('cnt');
+		expect(countBefore).toBe(2);
+
+		const { clearGroupMessages } = await import('../src/whitelist');
+		const cleared = await clearGroupMessages(testEnv, groupId);
+		expect(cleared).toBe(2);
+
+		const countAfter = await testEnv.DB.prepare('SELECT COUNT(*) as cnt FROM Messages WHERE groupId = ?')
+			.bind(groupId)
+			.first<number>('cnt');
+		expect(countAfter).toBe(0);
+	});
 });
 
 

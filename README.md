@@ -30,8 +30,8 @@
 - 🔍 **关键词全文搜索**：支持在群聊历史记录中检索关键词（完美支持中文与 CJK 字符）。
 - 🛡️ **群组白名单与鉴权**：严格采用白名单授权机制，非白名单群组完全**不记录消息、不响应任何常规指令**，保障隐私与防滥用。
 - 👑 **多级管理员系统**：支持环境变量设置超级管理员，支持通过指令动态添加/查看/删除数据库管理员与白名单群组。
-- 🖼️ **支持图文多模态**：支持存储群内 JPEG 图片，并在总结和问答中结合图片内容综合分析。
-- ⚙️ **灵活的 AI 接口配置**：支持自定义 `AI_BASE_URL` 和 `AI_MODEL`，无缝对接 OpenAI、Gemini、DeepSeek、Claude 等兼容接口。
+- 🖼️ **支持图文多模态**：支持接收群内 JPEG、PNG、WebP 图片，并在总结和问答中结合图片内容综合分析。
+- ⚙️ **灵活的 AI 接口配置**：支持自定义 `AI_BASE_URL` 和 `AI_MODEL`，支持自定义 Prompt，无缝对接 OpenAI、Gemini、DeepSeek、Claude 等兼容接口。
 
 ---
 
@@ -58,6 +58,7 @@
 | **`/addadmin`** | `/addadmin <用户ID> [备注]` | 添加新的数据库管理员（享有免流无限制特权） |
 | **`/deladmin`** | `/deladmin <用户ID>` | 移除数据库管理员 |
 | **`/admins`** | `/admins` | 查看所有超级管理员及数据库管理员列表 |
+| **`/clearmessages`**| `/clearmessages` 或 `/clearmessages <群ID>` | 清空指定群组的历史消息记录（用于维护/测试/隐私重置） |
 | **`/setcommands`** | `/setcommands` | 向 Telegram 官方同步注册中文快捷指令菜单 |
 
 > **提示**：直接在浏览器访问 `https://<你的Worker域名>/setcommands` 亦可自动向 Telegram 注册上述指令菜单。
@@ -84,9 +85,12 @@
 | 变量名 | 类型 | 必需 | 说明 |
 | :--- | :--- | :---: | :--- |
 | **`TELEGRAM_BOT_TOKEN`** | Secret | 是 | Telegram Bot Token（由 [@BotFather](https://t.me/BotFather) 获取） |
+| **`SECRET_TELEGRAM_API_TOKEN`** | Secret | 否 | Webhook Secret Token，用于严格防伪造安全校验 |
 | **`AI_API_KEY`** | Secret | 是 | AI 接口的 API Key（兼容 OpenAI 规范） |
 | **`AI_MODEL`** | 变量 (var) | 是 | 模型名称（如 `gpt-4o-mini`、`deepseek-chat` 等） |
 | **`ADMIN_USER_IDS`** | 变量 (var) | 推荐 | 超级管理员 Telegram 用户 ID 列表，英文逗号分隔（如 `12345678`） |
+| **`SYSTEM_PROMPT_SUMMARY`** | 变量 (var) | 否 | 自定义群聊总结 System Prompt，留空使用内置专业总结提示词 |
+| **`SYSTEM_PROMPT_ASK`** | 变量 (var) | 否 | 自定义群聊智能问答 System Prompt，留空使用内置问答提示词 |
 | **`LIMIT_SUMMARY`** | 变量 (var) | 否 | 普通用户单日 `/summary` 上限（默认 `5`） |
 | **`LIMIT_ASK`** | 变量 (var) | 否 | 普通用户单日 `/ask` 上限（默认 `10`） |
 | **`LIMIT_QUERY`** | 变量 (var) | 否 | 普通用户单日 `/query` 上限（默认 `20`） |

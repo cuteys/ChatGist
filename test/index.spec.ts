@@ -29,7 +29,7 @@ describe("upper number", () => {
 	});
 });
 
-import { isJPEG, isJPEGBase64 } from "../src/isJpeg";
+import { isJPEG, isJPEGBase64, isPNG, isWEBP, detectImageMimeType } from "../src/isJpeg";
 
 describe("JPEG validation", () => {
 	it("should validate JPEG ArrayBuffer correctly", () => {
@@ -55,6 +55,26 @@ describe("JPEG validation", () => {
 		const base64Str = "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD//gATQ2hhdEdpc3T/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAAAAX/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9k=";
 		expect(isJPEGBase64(base64Str).isValid).toBe(true);
 		expect(isJPEGBase64("not-base64").isValid).toBe(false);
+	});
+
+	it("should validate PNG and WEBP formats correctly", () => {
+		const pngBytes = new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00]);
+		expect(isPNG(pngBytes)).toBe(true);
+		expect(detectImageMimeType(pngBytes)).toBe("image/png");
+
+		const webpBytes = new Uint8Array([
+			0x52, 0x49, 0x46, 0x46, // RIFF
+			0x00, 0x00, 0x00, 0x00,
+			0x57, 0x45, 0x42, 0x50, // WEBP
+		]);
+		expect(isWEBP(webpBytes)).toBe(true);
+		expect(detectImageMimeType(webpBytes)).toBe("image/webp");
+
+		const jpegBytes = new Uint8Array([0xFF, 0xD8, 0x00, 0x01, 0xFF, 0xD9]);
+		expect(detectImageMimeType(jpegBytes)).toBe("image/jpeg");
+
+		const unknownBytes = new Uint8Array([0x00, 0x01, 0x02, 0x03]);
+		expect(detectImageMimeType(unknownBytes)).toBeNull();
 	});
 });
 

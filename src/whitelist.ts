@@ -41,7 +41,7 @@ export function isSuperAdmin(env: Env, userId?: string | number): boolean {
 	if (!uid) return false;
 
 	const envAdminStr = env.ADMIN_USER_IDS || env.ADMIN_USER_ID || "";
-	const envAdmins = envAdminStr.split(",").map((s) => s.trim()).filter(Boolean);
+	const envAdmins = envAdminStr.split(",").map((s: string) => s.trim()).filter(Boolean);
 	return envAdmins.includes(uid);
 }
 
@@ -118,12 +118,12 @@ export async function getWhitelistedGroups(env: Env): Promise<
 	Array<{ groupId: string; groupName: string; addedBy: string; createdAt: number }>
 > {
 	try {
-		const { results } = await withAutoInit(env, () =>
+		const res = await withAutoInit(env, () =>
 			env.DB.prepare(
 				"SELECT groupId, groupName, addedBy, createdAt FROM WhitelistGroups ORDER BY createdAt DESC"
-			).all()
+			).all<{ groupId: string; groupName: string; addedBy: string; createdAt: number }>()
 		);
-		return (results || []) as Array<{ groupId: string; groupName: string; addedBy: string; createdAt: number }>;
+		return (res?.results || []) as Array<{ groupId: string; groupName: string; addedBy: string; createdAt: number }>;
 	} catch (e) {
 		console.error("Failed to list whitelisted groups:", e);
 		return [];
@@ -163,19 +163,35 @@ export async function getAdmins(env: Env): Promise<{
 	dbAdmins: Array<{ userId: string; userName: string; addedBy: string; createdAt: number }>;
 }> {
 	const envAdminStr = env.ADMIN_USER_IDS || env.ADMIN_USER_ID || "";
-	const envAdmins = envAdminStr.split(",").map((s) => s.trim()).filter(Boolean);
+	const envAdmins = envAdminStr.split(",").map((s: string) => s.trim()).filter(Boolean);
 	try {
-		const { results } = await withAutoInit(env, () =>
+		const res = await withAutoInit(env, () =>
 			env.DB.prepare(
 				"SELECT userId, userName, addedBy, createdAt FROM Admins ORDER BY createdAt DESC"
-			).all()
+			).all<{ userId: string; userName: string; addedBy: string; createdAt: number }>()
 		);
 		return {
 			envAdmins,
-			dbAdmins: (results || []) as Array<{ userId: string; userName: string; addedBy: string; createdAt: number }>,
+			dbAdmins: (res?.results || []) as Array<{ userId: string; userName: string; addedBy: string; createdAt: number }>,
 		};
 	} catch (e) {
 		console.error("Failed to list admins:", e);
 		return { envAdmins, dbAdmins: [] };
 	}
 }
+
+/**
+ * 清除指定群组的所有历史消息记录（超级管理员维护使用）
+ */
+export async function clearGroupMessages(env: Env, groupId: string): Promise<number> {
+	try {
+		const res = await env.DB.prepare("DELETE FROM Messages WHERE groupId = ?")
+			.bind(groupId)
+			.run();
+		return res?.meta?.changes || 0;
+	} catch (e) {
+		console.error("Failed to clear group messages:", e);
+		return 0;
+	}
+}
+

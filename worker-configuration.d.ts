@@ -13,6 +13,8 @@ interface Env {
 	AI_MODEL?: string;
 	BASE_URL?: string;
 	MODEL?: string;
+	SYSTEM_PROMPT_SUMMARY?: string;
+	SYSTEM_PROMPT_ASK?: string;
 	LIMIT_SUMMARY?: string;
 	LIMIT_ASK?: string;
 	LIMIT_QUERY?: string;

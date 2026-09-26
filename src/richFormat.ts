@@ -98,6 +98,52 @@ export function normalizeSpacing(text: string): string {
 		.trim();
 }
 
+/**
+ * 将转义过的 MarkdownV2 文本恢复为无转义的纯文本，作为发送失败时的降级方案
+ */
+export function stripMarkdownV2Escapes(text: string): string {
+	return text.replace(/\\([_*[\]()~`>#+\-=|{}.!])/g, '$1');
+}
+
+/**
+ * 针对 Telegram 4096 字符单条消息限制，在段落或换行符处安全切分长消息
+ */
+export function splitTelegramMessage(text: string, maxLength = 4000): string[] {
+	if (text.length <= maxLength) {
+		return [text];
+	}
+
+	const chunks: string[] = [];
+	let remaining = text;
+
+	while (remaining.length > 0) {
+		if (remaining.length <= maxLength) {
+			chunks.push(remaining);
+			break;
+		}
+
+		// 优先在段落边界 \n\n 处切分
+		let splitIndex = remaining.lastIndexOf('\n\n', maxLength);
+		if (splitIndex === -1 || splitIndex < maxLength * 0.4) {
+			// 次选在单换行符 \n 处切分
+			splitIndex = remaining.lastIndexOf('\n', maxLength);
+		}
+		if (splitIndex === -1 || splitIndex < maxLength * 0.4) {
+			// 再次选在空格处切分
+			splitIndex = remaining.lastIndexOf(' ', maxLength);
+		}
+		if (splitIndex === -1 || splitIndex < maxLength * 0.2) {
+			// 若实在无合适边界，硬截断
+			splitIndex = maxLength;
+		}
+
+		chunks.push(remaining.slice(0, splitIndex).trim());
+		remaining = remaining.slice(splitIndex).trim();
+	}
+
+	return chunks.filter(Boolean);
+}
+
 export async function deleteTelegramMessage(
 	token: string,
 	chatId: string | number,
