@@ -16,6 +16,11 @@ import {
 	stripMarkdownV2Escapes,
 	splitTelegramMessage,
 	removeThematicBreaks,
+	sendTelegramRichMessage,
+	markdownToRichBlocks,
+	buildWhitelistRichBlocks,
+	buildAdminsRichBlocks,
+	buildQueryRichBlocks,
 } from './richFormat';
 import {
 	initWhitelistTables,
@@ -46,6 +51,11 @@ export {
 	stripMarkdownV2Escapes,
 	splitTelegramMessage,
 	removeThematicBreaks,
+	sendTelegramRichMessage,
+	markdownToRichBlocks,
+	buildWhitelistRichBlocks,
+	buildAdminsRichBlocks,
+	buildQueryRichBlocks,
 };
 
 function dispatchContent(content: string): { type: "text", text: string } | { type: "image_url", image_url: { url: string } } {
@@ -145,7 +155,7 @@ function getGenModel(env: Env) {
 }
 
 const SYSTEM_PROMPTS = {
-	summarizeChat: `你是一个专业的群聊概括助手。你的任务是用符合群聊风格的语气概括对话内容。
+	summarizeChat: `你是一个专业的群聊概括与深度总结助手。你的任务是用符合群聊风格的生动语气，对对话内容进行结构化深度概括。
 对话将按以下格式提供：
 ====================
 用户名:
@@ -153,17 +163,21 @@ const SYSTEM_PROMPTS = {
 相应链接
 ====================
 
-请严格遵循以下排版规范输出：
-1. 概括输出必须包含两部分：
-   【💡 核心要点速览】
-   在开头用 2~4 个精炼要点概括本次群聊最核心的共识、进展或突发热点，使用 • 📌 或 • 💡 开头。
+请严格遵循以下现代原生富文本排版标准输出：
+1. 整体结构规范：
+   - 【顶部背景引用】：在开头使用引用块（>）说明本次总结的范围或主题（如：> 总结群聊近期共 X 条发言记录）。
+   - 【总标题与全局概览】：使用 1 级标题（#）给出精炼有深度的总标题，并在其后附上一段 100~200 字的核心梗概，概括本期群聊最关键的讨论方向。
+   - 【原生手风琴抽屉（<details>）】：遇到各分门别类的详细议题、事件、技术探讨或八卦杂谈时，必须使用 HTML 原生折叠标签：
+     <details>
+     <summary>分类议题标题（简明扼要）</summary>
+     这里写具体的讨论经过与深入说明...
+     </details>
+   - 【原消息链接溯源（极其重要）】：在概括每个具体观点、事实、发言、故障或结论时，必须在对应位置附上原消息溯源链接，格式为 [引用¹](原对话链接) 或 [💬 原文](原对话链接)。点击该链接能够直接跳转定位到群聊发言。链接必须完全来源于输入中提供的真实“相应链接”，严禁杜撰。
+   - 【原生斑马纹表格】：凡是遇到多方观点对比、服务计费规则、参数方案对比、优劣势分析时，必须输出规范的 GFM Markdown 管道表格（如 | 机制类型 | 扣费规则 | 注意事项与特性 | 原文 |）。
+   - 【待办事项与操作清单】：凡是总结中提到故障排查建议、待办操作、优化事项时，必须在专门的 <details><summary>待办事项与操作清单</summary> 抽屉内使用任务列表语法输出（- [ ] 待办项 1）。
+   - 【结尾统计】：最后用 --- 水平分割线收尾，并用 6 级标题输出精简的模型与统计说明（如 ###### gemini-3.8-flash）。
 
-   【💬 详细脉络与讨论溯源】
-   按议题或时间脉络分条详细概括讨论经过；若有图片内容，请在相应议题中进行描述。
-   在详细讨论中用 Markdown 格式引用原对话的链接，链接格式应为：[引用1](链接本体)、[关键字1](链接本体)等。
-
-2. 概括要简洁明了，捕捉对话的主要内容和情绪。
-3. 紧凑排版：各标题与段落之间仅保留单个空行，严禁输出多余的大面积连续空行。`,
+2. 紧凑排版，文字生动清晰，重点明确。`,
 
 	answerQuestion: `你是一个群聊智能问答助手。你的任务是基于提供的群聊记录精准回答用户的问题。
 群聊记录将按以下格式提供：
@@ -173,12 +187,12 @@ const SYSTEM_PROMPTS = {
 相应链接
 ====================
 
-请遵循以下排版规范：
-1. 直接了当回答用户的问题，条理清晰。
-2. 在回答中引用相关的原始消息作为依据，格式为：[引用1](链接本体)、[关键字1](链接本体)。
-3. 在链接两侧添加空格。
-4. 如果找不到相关信息，请诚实说明，切勿编造。
-5. 回答应该简洁但内容完整。`
+请遵循以下现代排版规范：
+1. 【顶部提问提示】：开头使用引用块（>）明确列出用户的问题；
+2. 【结论先行】：直截了当回答核心结论与答案；
+3. 【原消息溯源（极其重要）】：在回答中引用相关的原始发言作为依据，格式为 [引用¹](原对话链接) 或 [发言人](原对话链接)，方便用户点击直接在群聊中定位原始消息；
+4. 【结构化展示】：遇到多方案/多选项对比时，使用表格（| 列1 | 列2 |）；遇到排查步骤或操作项时，使用任务列表（- [ ] 操作项）；遇到长篇细节时，可使用 <details><summary>详细排查步骤</summary>...</details> 折叠呈现；
+5. 如果找不到相关信息，请诚实说明，切勿编造。`
 };
 
 function getSystemPrompt(env: Env, type: 'summary' | 'ask'): string {
@@ -371,6 +385,14 @@ async function handleDelGroup(ctx: any, env: Env, targetGroupId?: string) {
 
 async function handleListGroups(ctx: any, env: Env) {
 	const groups = await getWhitelistedGroups(env);
+	const token = getTelegramToken(env);
+	const chatId = ctx.update?.message?.chat?.id?.toString() || "";
+	if (token && chatId) {
+		const blocks = buildWhitelistRichBlocks(groups);
+		const sendRes = await sendTelegramRichMessage(token, chatId, blocks);
+		if (sendRes.ok) return;
+	}
+
 	if (groups.length === 0) {
 		await ctx.reply("📋 当前暂无白名单群组。\n超级管理员可在目标群内直接发送 /addgroup 将其加入白名单。");
 		return;
@@ -419,6 +441,14 @@ async function handleDelAdmin(ctx: any, env: Env, targetUserId?: string) {
 
 async function handleListAdmins(ctx: any, env: Env) {
 	const { envAdmins, dbAdmins } = await getAdmins(env);
+	const token = getTelegramToken(env);
+	const chatId = ctx.update?.message?.chat?.id?.toString() || "";
+	if (token && chatId) {
+		const blocks = buildAdminsRichBlocks(envAdmins, dbAdmins);
+		const sendRes = await sendTelegramRichMessage(token, chatId, blocks);
+		if (sendRes.ok) return;
+	}
+
 	let msg = `👑 管理员列表：\n\n`;
 
 	msg += `【环境变量超级管理员】\n`;
@@ -541,33 +571,26 @@ export default {
 				});
 
 				const raw = result.choices[0].message.content || "";
+				const processed = fixLink(processMarkdownLinks(raw));
+				const blocks = markdownToRichBlocks(processed);
+				blocks.push(
+					{ type: "divider" },
+					{
+						type: "heading",
+						size: 6,
+						text: [
+							{ type: "code", text: model },
+							" · ChatGist 定时群聊深度概括"
+						]
+					}
+				);
+
 				const formatted = formatSummaryWithHighlights(raw);
 				const fullText = messageTemplate(formatted, model);
 
-				const chunks = splitTelegramMessage(fullText);
-				for (const chunk of chunks) {
-					const res = await fetch(`https://api.telegram.org/bot${getTelegramToken(env)}/sendMessage`, {
-						method: 'POST',
-						headers: { 'Content-Type': 'application/json' },
-						body: JSON.stringify({
-							chat_id: group.groupId,
-							text: chunk,
-							parse_mode: "MarkdownV2",
-						}),
-					});
-					if (!res?.ok) {
-						console.error("Scheduled summary MarkdownV2 send failed:", res?.statusText, await res?.text());
-						const plainText = stripMarkdownV2Escapes(chunk);
-						await fetch(`https://api.telegram.org/bot${getTelegramToken(env)}/sendMessage`, {
-							method: 'POST',
-							headers: { 'Content-Type': 'application/json' },
-							body: JSON.stringify({
-								chat_id: group.groupId,
-								text: plainText,
-							}),
-						});
-					}
-				}
+				await sendTelegramRichMessage(getTelegramToken(env), group.groupId, blocks, {
+					fallbackMarkdownV2: fullText,
+				});
 			} catch (err) {
 				console.error(`Error processing scheduled summary for group ${group.groupId}:`, err);
 			}
@@ -855,24 +878,30 @@ export default {
 						return new Response('ok');
 					}
 
-					const MAX_DISPLAY = 15;
-					const displayList = results.slice(0, MAX_DISPLAY);
-					let outputLines = [`🔍 关键词【${keyword}】检索结果（共找到 ${results.length} 条）：\n`];
-					for (const r of displayList as any[]) {
-						const contentPreview = r.content.length > 80 ? r.content.slice(0, 80) + '...' : r.content;
-						const link = r.messageId ? ` [链接](${getMessageLink(r)})` : '';
-						outputLines.push(`• ${r.userName}：${contentPreview}${link}`);
-					}
-					if (results.length > MAX_DISPLAY) {
-						outputLines.push(`\nℹ️ 结果较多，仅展示最近 ${MAX_DISPLAY} 条记录。`);
-					}
+					const token = getTelegramToken(env);
+					const blocks = buildQueryRichBlocks(keyword, results.length, results);
+					const richRes = await sendTelegramRichMessage(token, groupId, blocks);
 
-					const responseText = normalizeSpacing(outputLines.join('\n'));
-					const chunks = splitTelegramMessage(escapeMarkdownV2(responseText));
-					for (const chunk of chunks) {
-						const res = await ctx.reply(chunk, "MarkdownV2");
-						if (!res?.ok) {
-							await ctx.reply(stripMarkdownV2Escapes(chunk));
+					if (!richRes.ok) {
+						const MAX_DISPLAY = 15;
+						const displayList = results.slice(0, MAX_DISPLAY);
+						let outputLines = [`🔍 关键词【${keyword}】检索结果（共找到 ${results.length} 条）：\n`];
+						for (const r of displayList as any[]) {
+							const contentPreview = r.content.length > 80 ? r.content.slice(0, 80) + '...' : r.content;
+							const link = r.messageId ? ` [链接](${getMessageLink(r)})` : '';
+							outputLines.push(`• ${r.userName}：${contentPreview}${link}`);
+						}
+						if (results.length > MAX_DISPLAY) {
+							outputLines.push(`\nℹ️ 结果较多，仅展示最近 ${MAX_DISPLAY} 条记录。`);
+						}
+
+						const responseText = normalizeSpacing(outputLines.join('\n'));
+						const chunks = splitTelegramMessage(escapeMarkdownV2(responseText));
+						for (const chunk of chunks) {
+							const res = await ctx.reply(chunk, "MarkdownV2");
+							if (!res?.ok) {
+								await ctx.reply(stripMarkdownV2Escapes(chunk));
+							}
 						}
 					}
 				} finally {
@@ -975,25 +1004,28 @@ export default {
 					}
 
 					const raw = result.choices[0].message.content || "";
-					const response_text = formatAnswerMessage(raw);
+					const processed = fixLink(processMarkdownLinks(raw));
+					const promptHeader = `> 💬 提问：${question}\n\n`;
+					const fullContent = promptHeader + processed;
 
-					const chunks = splitTelegramMessage(response_text);
-					for (const chunk of chunks) {
-						const sendRes = await ctx.api.sendMessage(ctx.bot.api.toString(), {
-							chat_id: userId,
-							parse_mode: "MarkdownV2",
-							text: chunk,
-						} as any);
-						if (!sendRes.ok) {
-							console.error("Ask MarkdownV2 send failed:", sendRes?.statusText, await sendRes?.text());
-							const plainText = stripMarkdownV2Escapes(chunk);
-							await ctx.api.sendMessage(ctx.bot.api.toString(), {
-								chat_id: userId,
-								parse_mode: "",
-								text: plainText,
-							} as any);
+					const blocks = markdownToRichBlocks(fullContent);
+					blocks.push(
+						{ type: "divider" },
+						{
+							type: "heading",
+							size: 6,
+							text: [
+								{ type: "code", text: model },
+								" · ChatGist 智能问答"
+							]
 						}
-					}
+					);
+
+					const response_text = formatAnswerMessage(raw);
+					const token = getTelegramToken(env);
+					await sendTelegramRichMessage(token, userId, blocks, {
+						fallbackMarkdownV2: response_text,
+					});
 				} finally {
 					if (groupAckMessageId) {
 						await deleteTelegramMessage(getTelegramToken(env), groupId, groupAckMessageId);
@@ -1112,21 +1144,35 @@ export default {
 						return new Response('ok');
 					}
 
+					const processed = fixLink(processMarkdownLinks(raw));
+					let contentToParse = processed;
+					if (isDefault) {
+						contentToParse = `> 💡 【未指定参数，默认总结近期 50 条消息】\n\n` + contentToParse;
+					}
+
+					const blocks = markdownToRichBlocks(contentToParse);
+					blocks.push(
+						{ type: "divider" },
+						{
+							type: "heading",
+							size: 6,
+							text: [
+								{ type: "code", text: model },
+								" · ChatGist 群聊动态深度概括"
+							]
+						}
+					);
+
 					const formatted = formatSummaryWithHighlights(raw);
 					let replyContent = messageTemplate(formatted, model);
 					if (isDefault) {
 						replyContent = `💡【未指定参数，默认总结近期 50 条消息】\n\n` + replyContent;
 					}
 
-					const chunks = splitTelegramMessage(replyContent);
-					for (const chunk of chunks) {
-						const res = await bot.reply(chunk, 'MarkdownV2');
-						if (!res?.ok) {
-							console.error("Summary MarkdownV2 reply failed:", res?.statusText, await res?.text());
-							const plainText = stripMarkdownV2Escapes(chunk);
-							await bot.reply(plainText);
-						}
-					}
+					const token = getTelegramToken(env);
+					await sendTelegramRichMessage(token, groupId, blocks, {
+						fallbackMarkdownV2: replyContent,
+					});
 				} finally {
 					if (statusMessageId) {
 						await deleteTelegramMessage(getTelegramToken(env), groupId, statusMessageId);
