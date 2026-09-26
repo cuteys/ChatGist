@@ -346,6 +346,90 @@ describe('Worker fetch whitelist gatekeeping', () => {
 		}
 	});
 
+	it('should send concise welcome greeting when /start is used in group chat', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		const sentMessages: any[] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			sentMessages.push(url);
+			return new Response(JSON.stringify({ ok: true, result: {} }), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		}) as any;
+
+		try {
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 13,
+					message: {
+						message_id: 203,
+						from: { id: 55555, first_name: 'Bob' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/start',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnv, mockCtx);
+			expect(res.status).toBe(200);
+
+			expect(sentMessages.length).toBe(1);
+			const decoded = decodeURIComponent(sentMessages[0]).replace(/\+/g, ' ');
+			expect(decoded).toContain('我是 ChatGist 群聊智能总结助手');
+			expect(decoded).not.toContain('【超级管理员使用指南】');
+			expect(decoded).not.toContain('【ChatGist 群聊助手使用指南】');
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should send welcome and onboarding message when /start is used in private chat', async () => {
+		const sentMessages: any[] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			sentMessages.push(url);
+			return new Response(JSON.stringify({ ok: true, result: {} }), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		}) as any;
+
+		try {
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 14,
+					message: {
+						message_id: 204,
+						from: { id: 55555, first_name: 'Bob' },
+						chat: { id: 55555, type: 'private' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/start',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnv, mockCtx);
+			expect(res.status).toBe(200);
+
+			expect(sentMessages.length).toBe(1);
+			const decoded = decodeURIComponent(sentMessages[0]).replace(/\+/g, ' ');
+			expect(decoded).toContain('欢迎使用 ChatGist 群聊智能助手');
+			expect(decoded).toContain('快速上手');
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
 	it('should respond to /quota command with usage information', async () => {
 		const sentMessages: any[] = [];
 		const originalFetch = globalThis.fetch;

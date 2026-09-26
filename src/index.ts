@@ -665,11 +665,35 @@ export default {
 
 		const res = await new TelegramBot(botToken)
 			.on('start', async (ctx) => {
-				const userId = ctx.update.message?.from?.id?.toString() || "";
-				const superAdmin = isSuperAdmin(env, userId);
-				const admin = await isAdmin(env, userId);
-				const startText = getRoleHelpText(env, userId, superAdmin, admin);
-				await ctx.reply(escapeMarkdownV2(startText), "MarkdownV2");
+				const chat = ctx.update.message?.chat;
+				const isGroup = Boolean(chat && (chat.type === 'group' || chat.type === 'supergroup' || chat.type?.includes('group')));
+				if (isGroup) {
+					const groupStartText = escapeMarkdownV2(
+						`👋 你好！我是 ChatGist 群聊智能总结助手。\n\n` +
+						`我会在后台静默记录本群对话并为您提供服务：\n` +
+						`• /summary - 智能提取群聊重点与讨论脉络\n` +
+						`• /ask - 针对近期群聊提问（私聊推送答案）\n` +
+						`• /query - 检索群聊历史记录\n` +
+						`• /help - 查看完整指令指南`
+					);
+					await ctx.reply(groupStartText, "MarkdownV2");
+					return new Response('ok');
+				}
+
+				const privateStartText = escapeMarkdownV2(
+					`👋 你好！欢迎使用 ChatGist 群聊智能助手！\n\n` +
+					`我是专为 Telegram 群组设计的 AI 总结与智能问答助手：\n` +
+					`• 💡 智能概括：提炼群聊核心要点，长篇脉络一键折叠展开\n` +
+					`• 💬 智能问答：基于群聊记录精准回答，支持原消息直达溯源\n` +
+					`• 🛡️ 白名单机制：仅在授权群组中记录与服务，保护群隐私\n\n` +
+					`🚀 快速上手：\n` +
+					`1. 将机器人添加到您的 Telegram 群组中\n` +
+					`2. 授予机器人读取群消息权限（设为管理员）\n` +
+					`3. 超级管理员在群内发送 /addgroup 授权当前群组\n` +
+					`4. 在群内发送 /summary 或 /ask 即可开始体验！\n\n` +
+					`📖 随时发送 /help 可查看完整指令指南与管理说明。`
+				);
+				await ctx.reply(privateStartText, "MarkdownV2");
 				return new Response('ok');
 			})
 			.on('help', async (ctx) => {
@@ -687,8 +711,7 @@ export default {
 							chat_id: userId,
 							parse_mode: "MarkdownV2",
 							text: escapeMarkdownV2(helpText),
-							reply_to_message_id: -1,
-						});
+						} as any);
 						sentToPm = Boolean(pmRes?.ok);
 					} catch (e) {
 						sentToPm = false;
@@ -697,7 +720,7 @@ export default {
 					if (sentToPm) {
 						await ctx.reply("📖 完整使用指南已私聊发送给您，请查看私聊消息（避免群内刷屏）。");
 					} else {
-						await ctx.reply("📖 为避免群内长消息刷屏，使用指南需在私聊中查看。\n👉 请先私聊机器人并发送 /help 获取完整说明。");
+						await ctx.reply("📖 为避免群内长消息刷屏，使用指南需在私聊中查看。\n👉 请先私聊机器人发送 /start，然后发送 /help 获取完整说明。");
 					}
 					return new Response('ok');
 				}
@@ -896,11 +919,11 @@ export default {
 					// 先测试私聊是否可达，防止扣减额度后无法送达
 					const testPmRes = await ctx.api.sendMessage(ctx.bot.api.toString(), {
 						chat_id: userId,
-						parse_mode: "MarkdownV2",
+						parse_mode: "",
 						text: "⏳ 正在分析群聊记录并为您解答，请稍候...",
-						reply_to_message_id: -1,
-					});
+					} as any);
 					if (!testPmRes.ok) {
+						console.error("Test PM reachability failed:", testPmRes.status, await testPmRes.text());
 						await ctx.reply(`请先在私聊中向机器人发送 /start 发起对话，否则无法私信推送答案。`);
 						return new Response('ok');
 					}
@@ -960,8 +983,7 @@ export default {
 							chat_id: userId,
 							parse_mode: "MarkdownV2",
 							text: chunk,
-							reply_to_message_id: -1,
-						});
+						} as any);
 						if (!sendRes.ok) {
 							console.error("Ask MarkdownV2 send failed:", sendRes?.statusText, await sendRes?.text());
 							const plainText = stripMarkdownV2Escapes(chunk);
@@ -969,8 +991,7 @@ export default {
 								chat_id: userId,
 								parse_mode: "",
 								text: plainText,
-								reply_to_message_id: -1,
-							});
+							} as any);
 						}
 					}
 				} finally {
