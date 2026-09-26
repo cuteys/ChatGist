@@ -109,111 +109,74 @@ describe('richFormat tests', () => {
 		expect(chunks[1]).toBe(p2);
 	});
 
-	it('parses inline rich text with jump links, bold, code, marked, and bot commands', async () => {
-		const { parseInlineRichText } = await import('../src/richFormat');
-		const input = '出现错误 `401 Unauthorized`，请前往 **控制台** 修复，详见 [引用¹](https://t.me/c/123456/789) 或发送 /admin_check 检查 ==安全==。';
-		const parsed = parseInlineRichText(input);
+	it('parses direct Rich Message JSON AST output from AI correctly', async () => {
+		const { parseRichMessageResponse } = await import('../src/richFormat');
+		const jsonFromAi = JSON.stringify({
+			rich_message: {
+				blocks: [
+					{
+						type: 'blockquote',
+						blocks: [{ type: 'paragraph', text: '总结群聊近期记录' }],
+					},
+					{
+						type: 'heading',
+						size: 1,
+						text: '群聊动态深度总结',
+					},
+					{
+						type: 'details',
+						summary: '议题一：架构方案与溯源',
+						blocks: [
+							{
+								type: 'table',
+								is_bordered: true,
+								is_striped: true,
+								cells: [
+									[
+										{ text: '方案', is_header: true, align: 'center' },
+										{ text: '发言溯源', is_header: true, align: 'center' },
+									],
+									[
+										{ text: '方案A', align: 'left' },
+										{
+											text: [{ type: 'link', text: '💬 原文', url: 'https://t.me/c/123456/789' }],
+											align: 'center',
+										},
+									],
+								],
+							},
+						],
+					},
+				],
+			},
+		});
 
-		expect(Array.isArray(parsed)).toBe(true);
-		const parts = parsed as any[];
+		const result = parseRichMessageResponse(jsonFromAi);
+		expect(result.blocks.length).toBe(3);
+		expect(result.blocks[0].type).toBe('blockquote');
+		expect(result.blocks[1].type).toBe('heading');
+		expect(result.blocks[2].type).toBe('details');
 
-		// Check code
-		const codePart = parts.find((p) => typeof p === 'object' && p.type === 'code');
-		expect(codePart).toBeDefined();
-		expect(codePart.text).toBe('401 Unauthorized');
-
-		// Check bold
-		const boldPart = parts.find((p) => typeof p === 'object' && p.type === 'bold');
-		expect(boldPart).toBeDefined();
-		expect(boldPart.text).toBe('控制台');
-
-		// Check link (crucial for chat history jump anchor)
-		const linkPart = parts.find((p) => typeof p === 'object' && p.type === 'link');
-		expect(linkPart).toBeDefined();
-		expect(linkPart.text).toBe('引用¹');
-		expect(linkPart.url).toBe('https://t.me/c/123456/789');
-
-		// Check bot command
-		const cmdPart = parts.find((p) => typeof p === 'object' && p.type === 'bot_command');
-		expect(cmdPart).toBeDefined();
-		expect(cmdPart.text).toBe('/admin_check');
-		expect(cmdPart.bot_command).toBe('admin_check');
-
-		// Check marked
-		const markPart = parts.find((p) => typeof p === 'object' && p.type === 'marked');
-		expect(markPart).toBeDefined();
-		expect(markPart.text).toBe('安全');
+		const details = result.blocks[2] as any;
+		expect(details.summary).toBe('议题一：架构方案与溯源');
+		const table = details.blocks[0];
+		expect(table.type).toBe('table');
+		expect(table.is_striped).toBe(true);
+		expect(table.cells[1][1].text[0].type).toBe('link');
+		expect(table.cells[1][1].text[0].url).toBe('https://t.me/c/123456/789');
 	});
 
-	it('converts markdown with details, tables, checklists and dividers into RichBlock AST', async () => {
-		const { markdownToRichBlocks } = await import('../src/richFormat');
-		const markdown = `
-> 总结群聊「技术交流群」近期 500 条消息
+	it('strips markdown code blocks and handles plain text fallback in parseRichMessageResponse', async () => {
+		const { parseRichMessageResponse } = await import('../src/richFormat');
+		const wrappedJson = '```json\n{"blocks": [{"type": "paragraph", "text": "测试内容"}]}\n```';
+		const resWrapped = parseRichMessageResponse(wrappedJson);
+		expect(resWrapped.blocks.length).toBe(1);
+		expect(resWrapped.blocks[0].type).toBe('paragraph');
 
-# 本期群聊动态深度总结
-本期重点探讨了系统架构升级与部署规范。
-
----
-
-<details>
-<summary>服务架构升级与配置说明</summary>
-
-### 1. 架构方案对比
-| 方案类型 | 资源开销 | 注意事项 | 原文溯源 |
-| :--- | :---: | ---: | :--- |
-| **基础版架构** | 低开销 | 适合测试环境 | [引用¹](https://t.me/c/123/1) |
-| **高可用集群** | 动态扩容 | 生产首选方案 | [引用²](https://t.me/c/123/2) |
-
-### 2. 待办清单
-- [ ] 线上配置参数校准与排查
-- [x] 更新系统监控与报警规则
-</details>
-
----
-
-###### gemini-3.8-flash
-`;
-
-		const blocks = markdownToRichBlocks(markdown);
-		expect(blocks.length).toBeGreaterThanOrEqual(4);
-
-		// 1. Blockquote
-		const quoteBlock = blocks.find((b) => b.type === 'blockquote') as any;
-		expect(quoteBlock).toBeDefined();
-		expect(quoteBlock.blocks[0].text).toContain('总结群聊');
-
-		// 2. Heading 1
-		const h1Block = blocks.find((b) => b.type === 'heading' && b.size === 1) as any;
-		expect(h1Block).toBeDefined();
-		expect(h1Block.text).toBe('本期群聊动态深度总结');
-
-		// 3. Details drawer
-		const detailsBlock = blocks.find((b) => b.type === 'details') as any;
-		expect(detailsBlock).toBeDefined();
-		expect(detailsBlock.summary).toBe('服务架构升级与配置说明');
-
-		// Inner table inside details drawer
-		const tableBlock = detailsBlock.blocks.find((b: any) => b.type === 'table');
-		expect(tableBlock).toBeDefined();
-		expect(tableBlock.is_bordered).toBe(true);
-		expect(tableBlock.is_striped).toBe(true);
-		expect(tableBlock.cells.length).toBe(3); // 1 header row + 2 data rows
-		expect(tableBlock.cells[0][0].is_header).toBe(true);
-		expect(tableBlock.cells[0][0].text).toBe('方案类型');
-
-		// Inner list with checkbox inside details drawer
-		const listBlock = detailsBlock.blocks.find((b: any) => b.type === 'list');
-		expect(listBlock).toBeDefined();
-		expect(listBlock.items.length).toBe(2);
-		expect(listBlock.items[0].has_checkbox).toBe(true);
-		expect(listBlock.items[0].is_checked).toBe(false);
-		expect(listBlock.items[1].has_checkbox).toBe(true);
-		expect(listBlock.items[1].is_checked).toBe(true);
-
-		// 4. Heading 6 footer
-		const h6Block = blocks.find((b) => b.type === 'heading' && b.size === 6) as any;
-		expect(h6Block).toBeDefined();
-		expect(h6Block.text).toBe('gemini-3.8-flash');
+		const nonJson = '这是一段普通的非 JSON 文本';
+		const resFallback = parseRichMessageResponse(nonJson);
+		expect(resFallback.blocks.length).toBe(1);
+		expect(resFallback.blocks[0].type).toBe('paragraph');
 	});
 
 	it('builds rich table for whitelist groups correctly', async () => {

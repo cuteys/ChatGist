@@ -254,358 +254,51 @@ export async function deleteTelegramMessage(
 }
 
 // ==========================================
-// 3. 富文本内联解析与 AST 转换核心
+// 3. AI 直接生成 JSON 的解析器
 // ==========================================
 
 /**
- * 将内联 Markdown 文本转换为 Telegram 原生 RichText 结构
+ * 直接解析大模型输出的 Rich Message JSON
  */
-export function parseInlineRichText(text: string): RichText {
-	if (!text) return '';
+export function parseRichMessageResponse(raw: string): { blocks: RichBlock[] } {
+	let clean = (raw || '').trim();
 
-	// 预先规范化 HTML 常见行内标签
-	const preprocessed = text
-		.replace(/<b>(.*?)<\/b>/gi, '**$1**')
-		.replace(/<strong>(.*?)<\/strong>/gi, '**$1**')
-		.replace(/<code>(.*?)<\/code>/gi, '`$1`')
-		.replace(/<mark>(.*?)<\/mark>/gi, '==$1==');
-
-	const tokenPattern =
-		/(\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|\*\*([^*]+)\*\*|__([^_]+)__|`([^`]+)`|==([^=]+)==|(\B\/[a-zA-Z0-9_]+)|\*([^*]+)\*|_([^_]+)_)/g;
-
-	const parts: RichTextPart[] = [];
-	let lastIndex = 0;
-	let match: RegExpExecArray | null;
-
-	while ((match = tokenPattern.exec(preprocessed)) !== null) {
-		const matchStart = match.index;
-		const matchEnd = tokenPattern.lastIndex;
-
-		if (matchStart > lastIndex) {
-			parts.push(preprocessed.slice(lastIndex, matchStart));
-		}
-
-		if (match[2] && match[3]) {
-			// 超链接（关键：群聊原消息跳转链接）
-			parts.push({
-				type: 'link',
-				text: match[2],
-				url: match[3],
-			});
-		} else if (match[4] || match[5]) {
-			// 加粗
-			const boldContent = match[4] || match[5];
-			parts.push({
-				type: 'bold',
-				text: boldContent,
-			});
-		} else if (match[6]) {
-			// 行内代码
-			parts.push({
-				type: 'code',
-				text: match[6],
-			});
-		} else if (match[7]) {
-			// 高亮标记
-			parts.push({
-				type: 'marked',
-				text: match[7],
-			});
-		} else if (match[8]) {
-			// Bot 指令
-			parts.push({
-				type: 'bot_command',
-				text: match[8],
-				bot_command: match[8].slice(1),
-			});
-		} else if (match[9] || match[10]) {
-			// 斜体
-			parts.push({
-				type: 'italic',
-				text: match[9] || match[10],
-			});
-		}
-
-		lastIndex = matchEnd;
+	// 剥离可能存在的 markdown json 代码块包裹 (```json ... ```)
+	if (clean.startsWith('```')) {
+		clean = clean.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
 	}
 
-	if (lastIndex < preprocessed.length) {
-		parts.push(preprocessed.slice(lastIndex));
+	try {
+		const parsed = JSON.parse(clean);
+		if (parsed.rich_message && Array.isArray(parsed.rich_message.blocks)) {
+			return parsed.rich_message;
+		}
+		if (Array.isArray(parsed.blocks)) {
+			return { blocks: parsed.blocks };
+		}
+		if (Array.isArray(parsed)) {
+			return { blocks: parsed };
+		}
+	} catch (e) {
+		console.warn('parseRichMessageResponse: AI output is not valid JSON, using fallback block', e);
 	}
 
-	if (parts.length === 0) return preprocessed;
-	if (parts.length === 1) return parts[0];
-	return parts;
+	// 容错降级：若模型未按 JSON 输出，则转为单个段落（绝不胡乱添加 > 引用破坏）
+	return {
+		blocks: [
+			{
+				type: 'paragraph',
+				text: clean || '（无概括内容）',
+			},
+		],
+	};
 }
 
 /**
- * 递归解析 Markdown 与 HTML Details 为 Telegram RichBlock 数组
+ * 兼容旧版的 markdownToRichBlocks
  */
 export function markdownToRichBlocks(content: string): RichBlock[] {
-	const trimmed = content.trim();
-	if (!trimmed) return [];
-
-	// 1. 若大模型直接输出了 JSON AST 结构，尝试直接解析
-	if (trimmed.startsWith('{') && trimmed.includes('"blocks"')) {
-		try {
-			const parsed = JSON.parse(trimmed);
-			if (parsed.rich_message?.blocks && Array.isArray(parsed.rich_message.blocks)) {
-				return parsed.rich_message.blocks;
-			}
-			if (Array.isArray(parsed.blocks)) {
-				return parsed.blocks;
-			}
-		} catch {
-			// 忽略并按普通 Markdown 解析
-		}
-	}
-
-	const blocks: RichBlock[] = [];
-
-	// 2. 检查并提取 <details><summary>...</summary>...</details>
-	const detailsRegex = /<details(?:\s+[^>]*)?>([\s\S]*?)<\/details>/gi;
-	let lastIndex = 0;
-	let match: RegExpExecArray | null;
-
-	while ((match = detailsRegex.exec(content)) !== null) {
-		const matchStart = match.index;
-		const matchEnd = detailsRegex.lastIndex;
-
-		if (matchStart > lastIndex) {
-			const textBefore = content.slice(lastIndex, matchStart).trim();
-			if (textBefore) {
-				blocks.push(...parseStandardMarkdownBlocks(textBefore));
-			}
-		}
-
-		const insideDetails = match[1];
-		let summaryTitle = '详细内容';
-		let bodyContent = insideDetails;
-
-		const summaryMatch = insideDetails.match(/<summary>([\s\S]*?)<\/summary>/i);
-		if (summaryMatch && summaryMatch.index !== undefined) {
-			summaryTitle = summaryMatch[1].replace(/<[^>]+>/g, '').trim();
-			bodyContent = insideDetails.slice(summaryMatch.index + summaryMatch[0].length).trim();
-		}
-
-		// 递归解析抽屉内部的 blocks（支持嵌套表格、列表等）
-		const innerBlocks = markdownToRichBlocks(bodyContent);
-
-		blocks.push({
-			type: 'details',
-			summary: summaryTitle,
-			blocks: innerBlocks.length > 0 ? innerBlocks : [{ type: 'paragraph', text: '无详细内容' }],
-		});
-
-		lastIndex = matchEnd;
-	}
-
-	if (lastIndex < content.length) {
-		const remaining = content.slice(lastIndex).trim();
-		if (remaining) {
-			blocks.push(...parseStandardMarkdownBlocks(remaining));
-		}
-	}
-
-	return blocks;
-}
-
-/**
- * 解析不含 <details> 的标准 Markdown 块（标题、表格、任务列表、引用、分割线、段落）
- */
-function parseStandardMarkdownBlocks(markdown: string): RichBlock[] {
-	const blocks: RichBlock[] = [];
-	const lines = markdown.split(/\r?\n/);
-	let i = 0;
-
-	while (i < lines.length) {
-		const line = lines[i];
-		const trimmed = line.trim();
-
-		// 空行跳过
-		if (!trimmed) {
-			i++;
-			continue;
-		}
-
-		// 1. 分割线
-		if (/^(?:---|[*]{3,}|_{3,})$/.test(trimmed)) {
-			blocks.push({ type: 'divider' });
-			i++;
-			continue;
-		}
-
-		// 2. 标题 (# 到 ######)
-		const headingMatch = trimmed.match(/^(#{1,6})\s+(.*)$/);
-		if (headingMatch) {
-			const level = headingMatch[1].length as 1 | 2 | 3 | 4 | 5 | 6;
-			const text = headingMatch[2].trim();
-			blocks.push({
-				type: 'heading',
-				size: level,
-				text: parseInlineRichText(text),
-			});
-			i++;
-			continue;
-		}
-
-		// 3. 引用块 (> 开头)
-		if (trimmed.startsWith('>')) {
-			const quoteLines: string[] = [];
-			while (i < lines.length && lines[i].trim().startsWith('>')) {
-				quoteLines.push(lines[i].trim().replace(/^>\s?/, ''));
-				i++;
-			}
-			const quoteText = quoteLines.join('\n').trim();
-			blocks.push({
-				type: 'blockquote',
-				blocks: [
-					{
-						type: 'paragraph',
-						text: parseInlineRichText(quoteText),
-					},
-				],
-			});
-			continue;
-		}
-
-		// 4. Markdown 原生表格 (| ... |)
-		if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
-			const tableLines: string[] = [];
-			while (i < lines.length && lines[i].trim().startsWith('|') && lines[i].trim().endsWith('|')) {
-				tableLines.push(lines[i].trim());
-				i++;
-			}
-
-			if (tableLines.length >= 2) {
-				const headerLine = tableLines[0];
-				const separatorLine = tableLines[1];
-				const dataLines = tableLines.slice(2);
-
-				const headers = headerLine
-					.split('|')
-					.slice(1, -1)
-					.map((c) => c.trim());
-
-				const alignments: Array<'left' | 'center' | 'right'> = separatorLine
-					.split('|')
-					.slice(1, -1)
-					.map((sep) => {
-						const s = sep.trim();
-						if (s.startsWith(':') && s.endsWith(':')) return 'center';
-						if (s.endsWith(':')) return 'right';
-						return 'left';
-					});
-
-				const cells: RichTableCell[][] = [];
-
-				// 表头行
-				cells.push(
-					headers.map((h, colIdx) => ({
-						text: parseInlineRichText(h),
-						is_header: true,
-						align: alignments[colIdx] || 'center',
-						valign: 'middle',
-					}))
-				);
-
-				// 数据行
-				for (const dLine of dataLines) {
-					const rowCols = dLine
-						.split('|')
-						.slice(1, -1)
-						.map((c) => c.trim());
-					cells.push(
-						rowCols.map((col, colIdx) => ({
-							text: parseInlineRichText(col),
-							align: alignments[colIdx] || 'left',
-							valign: 'middle',
-						}))
-					);
-				}
-
-				blocks.push({
-					type: 'table',
-					is_bordered: true,
-					is_striped: true,
-					cells,
-				});
-				continue;
-			}
-		}
-
-		// 5. 任务列表与无序列表 (- [ ] / • / - / 1.)
-		const listMatch = trimmed.match(/^([-*•]|\d+\.)\s+(.*)$/);
-		if (listMatch) {
-			const items: RichListItem[] = [];
-			while (i < lines.length) {
-				const currTrimmed = lines[i].trim();
-				const itemMatch = currTrimmed.match(/^([-*•]|\d+\.)\s+(.*)$/);
-				if (!itemMatch) break;
-
-				const rest = itemMatch[2].trim();
-				const checkboxMatch = rest.match(/^\[([ xX])\]\s*(.*)$/);
-
-				if (checkboxMatch) {
-					const isChecked = checkboxMatch[1].toLowerCase() === 'x';
-					const itemText = checkboxMatch[2].trim();
-					items.push({
-						label: '•',
-						has_checkbox: true,
-						is_checked: isChecked,
-						blocks: [
-							{
-								type: 'paragraph',
-								text: parseInlineRichText(itemText),
-							},
-						],
-					});
-				} else {
-					items.push({
-						label: '•',
-						blocks: [
-							{
-								type: 'paragraph',
-								text: parseInlineRichText(rest),
-							},
-						],
-					});
-				}
-				i++;
-			}
-
-			blocks.push({
-				type: 'list',
-				items,
-			});
-			continue;
-		}
-
-		// 6. 普通段落文本
-		const paraLines: string[] = [];
-		while (
-			i < lines.length &&
-			lines[i].trim() &&
-			!lines[i].trim().startsWith('#') &&
-			!lines[i].trim().startsWith('>') &&
-			!lines[i].trim().startsWith('|') &&
-			!lines[i].trim().match(/^([-*•]|\d+\.)\s+/) &&
-			!/^(?:---|[*]{3,}|_{3,})$/.test(lines[i].trim())
-		) {
-			paraLines.push(lines[i]);
-			i++;
-		}
-
-		if (paraLines.length > 0) {
-			const paraText = paraLines.join('\n').trim();
-			blocks.push({
-				type: 'paragraph',
-				text: parseInlineRichText(paraText),
-			});
-		}
-	}
-
-	return blocks;
+	return parseRichMessageResponse(content).blocks;
 }
 
 /**
@@ -625,68 +318,61 @@ export function richTextToString(text: RichText): string {
 }
 
 /**
- * 将 RichBlock 降级转换回 Markdown 字符串（用于不支持 Rich Message 或 API 报错时的回退）
+ * 将 RichBlock 降级为干净易读的文本（绝不添加 > 破坏 HTML）
  */
-export function richBlocksToMarkdown(blocks: RichBlock[]): string {
-	const out: string[] = [];
+export function richBlocksToPlainText(blocks: RichBlock[]): string {
+	const lines: string[] = [];
 
 	for (const block of blocks) {
 		switch (block.type) {
+			case 'blockquote': {
+				lines.push(`【概览】${richBlocksToPlainText(block.blocks)}`);
+				break;
+			}
 			case 'heading': {
-				const prefix = '#'.repeat(block.size || 2);
-				out.push(`${prefix} ${richTextToString(block.text)}`);
+				lines.push(`\n📌 ${richTextToString(block.text)}\n`);
 				break;
 			}
 			case 'paragraph': {
-				out.push(richTextToString(block.text));
-				break;
-			}
-			case 'blockquote': {
-				const inner = richBlocksToMarkdown(block.blocks);
-				const quoted = inner
-					.split('\n')
-					.map((l) => `> ${l}`)
-					.join('\n');
-				out.push(quoted);
+				lines.push(richTextToString(block.text));
 				break;
 			}
 			case 'divider': {
-				out.push('---');
+				lines.push('------------------------');
 				break;
 			}
 			case 'details': {
-				out.push(`**【${block.summary}】**`);
-				out.push(richBlocksToMarkdown(block.blocks));
+				lines.push(`\n🔽 【${block.summary}】`);
+				lines.push(richBlocksToPlainText(block.blocks));
 				break;
 			}
 			case 'table': {
 				if (block.cells.length > 0) {
-					const headerRow = block.cells[0];
-					out.push(`| ${headerRow.map((c) => richTextToString(c.text)).join(' | ')} |`);
-					out.push(`| ${headerRow.map(() => '---').join(' | ')} |`);
-					for (const row of block.cells.slice(1)) {
-						out.push(`| ${row.map((c) => richTextToString(c.text)).join(' | ')} |`);
+					for (const row of block.cells) {
+						lines.push(row.map((c) => richTextToString(c.text)).join(' | '));
 					}
 				}
 				break;
 			}
 			case 'list': {
 				for (const item of block.items) {
-					const check = item.has_checkbox ? (item.is_checked ? '[x] ' : '[ ] ') : '';
-					const inner = richBlocksToMarkdown(item.blocks);
-					out.push(`• ${check}${inner}`);
+					const mark = item.has_checkbox ? (item.is_checked ? '[✓] ' : '[ ] ') : '• ';
+					lines.push(`${mark}${richBlocksToPlainText(item.blocks)}`);
 				}
 				break;
 			}
 		}
 	}
 
-	return out.join('\n\n');
+	return lines.join('\n\n').trim();
+}
+
+export function richBlocksToMarkdown(blocks: RichBlock[]): string {
+	return richBlocksToPlainText(blocks);
 }
 
 export function richBlocksToMarkdownV2(blocks: RichBlock[]): string {
-	const md = richBlocksToMarkdown(blocks);
-	return telegramifyMarkdown(md, 'keep');
+	return richBlocksToPlainText(blocks);
 }
 
 // ==========================================
@@ -699,7 +385,7 @@ export async function sendTelegramRichMessage(
 	blocks: RichBlock[],
 	options: {
 		replyToMessageId?: number;
-		fallbackMarkdownV2?: string;
+		fallbackText?: string;
 	} = {}
 ): Promise<{ ok: boolean; status?: number; error?: string }> {
 	if (!token) {
@@ -720,7 +406,7 @@ export async function sendTelegramRichMessage(
 		};
 	}
 
-	// 1. 优先尝试调用 Telegram 原生 sendRichMessage
+	// 1. 优先调用 Telegram 原生 sendRichMessage
 	try {
 		const res = await fetch(`https://api.telegram.org/bot${token}/sendRichMessage`, {
 			method: 'POST',
@@ -737,36 +423,23 @@ export async function sendTelegramRichMessage(
 		console.warn('sendRichMessage network exception, falling back to sendMessage:', e);
 	}
 
-	// 2. 降级方案：转换为 MarkdownV2 / 纯文本使用 sendMessage 发送
-	const markdownText = options.fallbackMarkdownV2 || richBlocksToMarkdownV2(blocks);
-	const chunks = splitTelegramMessage(markdownText);
+	// 2. 降级方案：转换为普通干净文本通过 sendMessage 发送（严禁加 > 破坏格式）
+	const text = options.fallbackText || richBlocksToPlainText(blocks);
+	const chunks = splitTelegramMessage(text);
 
 	let allOk = true;
 	for (const chunk of chunks) {
 		try {
-			const mdRes = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+			const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
 					chat_id: chatId.toString(),
 					text: chunk,
-					parse_mode: 'MarkdownV2',
 					reply_parameters: options.replyToMessageId ? { message_id: options.replyToMessageId } : undefined,
 				}),
 			});
-
-			if (!mdRes.ok) {
-				const plainText = stripMarkdownV2Escapes(chunk);
-				await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({
-						chat_id: chatId.toString(),
-						text: plainText,
-						reply_parameters: options.replyToMessageId ? { message_id: options.replyToMessageId } : undefined,
-					}),
-				});
-			}
+			if (!res.ok) allOk = false;
 		} catch (err) {
 			allOk = false;
 			console.error('Fallback sendMessage failed:', err);

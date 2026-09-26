@@ -17,6 +17,7 @@ import {
 	splitTelegramMessage,
 	removeThematicBreaks,
 	sendTelegramRichMessage,
+	parseRichMessageResponse,
 	markdownToRichBlocks,
 	buildWhitelistRichBlocks,
 	buildAdminsRichBlocks,
@@ -52,6 +53,7 @@ export {
 	splitTelegramMessage,
 	removeThematicBreaks,
 	sendTelegramRichMessage,
+	parseRichMessageResponse,
 	markdownToRichBlocks,
 	buildWhitelistRichBlocks,
 	buildAdminsRichBlocks,
@@ -133,15 +135,11 @@ function getBaseUrl(env: Env): string | undefined {
 	return env.AI_BASE_URL || env.BASE_URL || undefined;
 }
 
-function getCompletionOptions(model: string) {
+function getCompletionOptions(model: string, jsonMode = false) {
 	const isReasoning = model.startsWith("o1") || model.startsWith("o3");
-	if (isReasoning) {
-		return {
-			max_completion_tokens: 4096,
-		};
-	}
 	return {
-		max_tokens: 4096,
+		...(isReasoning ? { max_completion_tokens: 4096 } : { max_tokens: 4096 }),
+		...(jsonMode ? { response_format: { type: "json_object" as const } } : {}),
 	};
 }
 
@@ -155,44 +153,155 @@ function getGenModel(env: Env) {
 }
 
 const SYSTEM_PROMPTS = {
-	summarizeChat: `你是一个专业的群聊概括与深度总结助手。你的任务是用符合群聊风格的生动语气，对对话内容进行结构化深度概括。
-对话将按以下格式提供：
+	summarizeChat: `你是一个专业的群聊总结助手。你的任务是分析群聊记录，并【直接输出符合 Telegram 原生 Rich Message 规范的纯 JSON 对象】。
+
+对话记录提供格式如下：
 ====================
 用户名:
 发言内容
 相应链接
 ====================
 
-请严格遵循以下现代原生富文本排版标准输出：
-1. 整体结构规范：
-   - 【顶部背景引用】：在开头使用引用块（>）说明本次总结的范围或主题（如：> 总结群聊近期共 X 条发言记录）。
-   - 【总标题与全局概览】：使用 1 级标题（#）给出精炼有深度的总标题，并在其后附上一段 100~200 字的核心梗概，概括本期群聊最关键的讨论方向。
-   - 【原生手风琴抽屉（<details>）】：遇到各分门别类的详细议题、事件、技术探讨或八卦杂谈时，必须使用 HTML 原生折叠标签：
-     <details>
-     <summary>分类议题标题（简明扼要）</summary>
-     这里写具体的讨论经过与深入说明...
-     </details>
-   - 【原消息链接溯源（极其重要）】：在概括每个具体观点、事实、发言、故障或结论时，必须在对应位置附上原消息溯源链接，格式为 [引用¹](原对话链接) 或 [💬 原文](原对话链接)。点击该链接能够直接跳转定位到群聊发言。链接必须完全来源于输入中提供的真实“相应链接”，严禁杜撰。
-   - 【原生斑马纹表格】：凡是遇到多方观点对比、服务计费规则、参数方案对比、优劣势分析时，必须输出规范的 GFM Markdown 管道表格（如 | 机制类型 | 扣费规则 | 注意事项与特性 | 原文 |）。
-   - 【待办事项与操作清单】：凡是总结中提到故障排查建议、待办操作、优化事项时，必须在专门的 <details><summary>待办事项与操作清单</summary> 抽屉内使用任务列表语法输出（- [ ] 待办项 1）。
-   - 【结尾统计】：最后用 --- 水平分割线收尾，并用 6 级标题输出精简的模型与统计说明（如 ###### gemini-3.8-flash）。
+【必须严格遵守的 JSON 输出结构】
+你必须直接返回一个合法的 JSON，不要输出任何额外的解释文本或包裹，其结构必须严格符合 Telegram Rich Message：
+{
+  "rich_message": {
+    "blocks": [
+      {
+        "type": "blockquote",
+        "blocks": [
+          { "type": "paragraph", "text": "总结群聊近期对话记录（共 X 条消息）" }
+        ]
+      },
+      {
+        "type": "heading",
+        "size": 1,
+        "text": "群聊动态深度总结：核心议题与讨论梳理"
+      },
+      {
+        "type": "paragraph",
+        "text": [
+          "本期群聊聚焦于 ",
+          { "type": "bold", "text": "核心议题" },
+          "；期间穿插了多项技术探讨与经验交流..."
+        ]
+      },
+      { "type": "divider" },
+      {
+        "type": "details",
+        "summary": "议题一分类标题（简明扼要）",
+        "blocks": [
+          {
+            "type": "paragraph",
+            "text": [
+              "群友讨论了具体细节，见 ",
+              { "type": "link", "text": "💬 原文", "url": "原消息相应链接" },
+              "。"
+            ]
+          },
+          {
+            "type": "table",
+            "is_bordered": true,
+            "is_striped": true,
+            "cells": [
+              [
+                { "text": "机制类型", "is_header": true, "align": "center", "valign": "middle" },
+                { "text": "规则说明", "is_header": true, "align": "center", "valign": "middle" },
+                { "text": "原文依据", "is_header": true, "align": "center", "valign": "middle" }
+              ],
+              [
+                { "text": { "type": "bold", "text": "选项A" }, "align": "left", "valign": "middle" },
+                { "text": "说明文本", "align": "left", "valign": "middle" },
+                { "text": [{ "type": "link", "text": "💬 原文", "url": "原消息相应链接" }], "align": "center", "valign": "middle" }
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "type": "details",
+        "summary": "待办事项与操作清单",
+        "blocks": [
+          {
+            "type": "list",
+            "items": [
+              {
+                "label": "•",
+                "has_checkbox": true,
+                "is_checked": false,
+                "blocks": [
+                  {
+                    "type": "paragraph",
+                    "text": [
+                      { "type": "bold", "text": "操作任务" },
+                      "：具体说明... ",
+                      { "type": "link", "text": "💬 原文", "url": "原消息相应链接" }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      { "type": "divider" },
+      {
+        "type": "heading",
+        "size": 6,
+        "text": "ChatGist 原生富文本总结"
+      }
+    ]
+  }
+}
 
-2. 紧凑排版，文字生动清晰，重点明确。`,
+【核心约束】
+1. 只输出符合以上 Schema 的纯 JSON 对象，不要用 markdown 包裹；
+2. 凡是涉及观点、事实、发言、故障或结论，必须在文本中包含对应发言的超链接：{"type": "link", "text": "💬 原文", "url": "原消息相应链接"}；
+3. 链接必须 100% 来源于输入中的真实“相应链接”，严禁杜撰。`,
 
-	answerQuestion: `你是一个群聊智能问答助手。你的任务是基于提供的群聊记录精准回答用户的问题。
-群聊记录将按以下格式提供：
+	answerQuestion: `你是一个群聊智能问答助手。你的任务是基于提供的群聊记录精准回答用户的问题，并【直接输出符合 Telegram 原生 Rich Message 规范的纯 JSON 对象】。
+
+群聊记录提供格式如下：
 ====================
 用户名:
 发言内容
 相应链接
 ====================
 
-请遵循以下现代排版规范：
-1. 【顶部提问提示】：开头使用引用块（>）明确列出用户的问题；
-2. 【结论先行】：直截了当回答核心结论与答案；
-3. 【原消息溯源（极其重要）】：在回答中引用相关的原始发言作为依据，格式为 [引用¹](原对话链接) 或 [发言人](原对话链接)，方便用户点击直接在群聊中定位原始消息；
-4. 【结构化展示】：遇到多方案/多选项对比时，使用表格（| 列1 | 列2 |）；遇到排查步骤或操作项时，使用任务列表（- [ ] 操作项）；遇到长篇细节时，可使用 <details><summary>详细排查步骤</summary>...</details> 折叠呈现；
-5. 如果找不到相关信息，请诚实说明，切勿编造。`
+【必须严格遵守的 JSON 输出结构】
+你必须直接返回一个合法的 JSON 对象：
+{
+  "rich_message": {
+    "blocks": [
+      {
+        "type": "blockquote",
+        "blocks": [
+          { "type": "paragraph", "text": "提问：用户的问题" }
+        ]
+      },
+      {
+        "type": "paragraph",
+        "text": [
+          "核心解答内容...",
+          "依据群友发言，详见 ",
+          { "type": "link", "text": "💬 原文", "url": "原消息相应链接" },
+          "。"
+        ]
+      },
+      { "type": "divider" },
+      {
+        "type": "heading",
+        "size": 6,
+        "text": "ChatGist 智能问答"
+      }
+    ]
+  }
+}
+
+【约束】
+1. 只输出合法纯 JSON，严禁输出任何额外废话；
+2. 引用原发言依据必须使用 {"type": "link", "text": "💬 原文", "url": "原消息相应链接"}；
+3. 若群聊中未提及相关信息，请在 paragraph 中说明未找到相关记录。`
 };
 
 function getSystemPrompt(env: Env, type: 'summary' | 'ask'): string {
@@ -567,30 +676,13 @@ export default {
 							content: formatChatHistoryForAi(results),
 						},
 					],
-					...getCompletionOptions(model),
+					...getCompletionOptions(model, true),
 				});
 
 				const raw = result.choices[0].message.content || "";
-				const processed = fixLink(processMarkdownLinks(raw));
-				const blocks = markdownToRichBlocks(processed);
-				blocks.push(
-					{ type: "divider" },
-					{
-						type: "heading",
-						size: 6,
-						text: [
-							{ type: "code", text: model },
-							" · ChatGist 定时群聊深度概括"
-						]
-					}
-				);
+				const richData = parseRichMessageResponse(raw);
 
-				const formatted = formatSummaryWithHighlights(raw);
-				const fullText = messageTemplate(formatted, model);
-
-				await sendTelegramRichMessage(getTelegramToken(env), group.groupId, blocks, {
-					fallbackMarkdownV2: fullText,
-				});
+				await sendTelegramRichMessage(getTelegramToken(env), group.groupId, richData.blocks);
 			} catch (err) {
 				console.error(`Error processing scheduled summary for group ${group.groupId}:`, err);
 			}
@@ -995,7 +1087,7 @@ export default {
 										content: `问题：${question}`
 									}
 								],
-								...getCompletionOptions(model),
+								...getCompletionOptions(model, true),
 							});
 					} catch (e) {
 						logModelError(e, { command: 'ask', model }, [getApiKey(env), getTelegramToken(env)]);
@@ -1004,28 +1096,9 @@ export default {
 					}
 
 					const raw = result.choices[0].message.content || "";
-					const processed = fixLink(processMarkdownLinks(raw));
-					const promptHeader = `> 💬 提问：${question}\n\n`;
-					const fullContent = promptHeader + processed;
-
-					const blocks = markdownToRichBlocks(fullContent);
-					blocks.push(
-						{ type: "divider" },
-						{
-							type: "heading",
-							size: 6,
-							text: [
-								{ type: "code", text: model },
-								" · ChatGist 智能问答"
-							]
-						}
-					);
-
-					const response_text = formatAnswerMessage(raw);
+					const richData = parseRichMessageResponse(raw);
 					const token = getTelegramToken(env);
-					await sendTelegramRichMessage(token, userId, blocks, {
-						fallbackMarkdownV2: response_text,
-					});
+					await sendTelegramRichMessage(token, userId, richData.blocks);
 				} finally {
 					if (groupAckMessageId) {
 						await deleteTelegramMessage(getTelegramToken(env), groupId, groupAckMessageId);
@@ -1135,7 +1208,7 @@ export default {
 									content: formatChatHistoryForAi(results)
 								}
 							],
-							...getCompletionOptions(model),
+							...getCompletionOptions(model, true),
 						});
 						raw = result.choices[0].message.content || "";
 					} catch (e) {
@@ -1144,35 +1217,18 @@ export default {
 						return new Response('ok');
 					}
 
-					const processed = fixLink(processMarkdownLinks(raw));
-					let contentToParse = processed;
+					const richData = parseRichMessageResponse(raw);
 					if (isDefault) {
-						contentToParse = `> 💡 【未指定参数，默认总结近期 50 条消息】\n\n` + contentToParse;
-					}
-
-					const blocks = markdownToRichBlocks(contentToParse);
-					blocks.push(
-						{ type: "divider" },
-						{
-							type: "heading",
-							size: 6,
-							text: [
-								{ type: "code", text: model },
-								" · ChatGist 群聊动态深度概括"
+						richData.blocks.unshift({
+							type: "blockquote",
+							blocks: [
+								{ type: "paragraph", text: "💡 未指定参数，默认总结近期 50 条消息" }
 							]
-						}
-					);
-
-					const formatted = formatSummaryWithHighlights(raw);
-					let replyContent = messageTemplate(formatted, model);
-					if (isDefault) {
-						replyContent = `💡【未指定参数，默认总结近期 50 条消息】\n\n` + replyContent;
+						});
 					}
 
 					const token = getTelegramToken(env);
-					await sendTelegramRichMessage(token, groupId, blocks, {
-						fallbackMarkdownV2: replyContent,
-					});
+					await sendTelegramRichMessage(token, groupId, richData.blocks);
 				} finally {
 					if (statusMessageId) {
 						await deleteTelegramMessage(getTelegramToken(env), groupId, statusMessageId);
