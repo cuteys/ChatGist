@@ -15,6 +15,7 @@ import {
 	fixLink,
 	stripMarkdownV2Escapes,
 	splitTelegramMessage,
+	removeThematicBreaks,
 } from './richFormat';
 import {
 	initWhitelistTables,
@@ -44,6 +45,7 @@ export {
 	formatSummaryWithHighlights,
 	stripMarkdownV2Escapes,
 	splitTelegramMessage,
+	removeThematicBreaks,
 };
 
 function dispatchContent(content: string): { type: "text", text: string } | { type: "image_url", image_url: { url: string } } {
@@ -554,6 +556,7 @@ export default {
 						}),
 					});
 					if (!res?.ok) {
+						console.error("Scheduled summary MarkdownV2 send failed:", res?.statusText, await res?.text());
 						const plainText = stripMarkdownV2Escapes(chunk);
 						await fetch(`https://api.telegram.org/bot${getTelegramToken(env)}/sendMessage`, {
 							method: 'POST',
@@ -960,6 +963,7 @@ export default {
 							reply_to_message_id: -1,
 						});
 						if (!sendRes.ok) {
+							console.error("Ask MarkdownV2 send failed:", sendRes?.statusText, await sendRes?.text());
 							const plainText = stripMarkdownV2Escapes(chunk);
 							await ctx.api.sendMessage(ctx.bot.api.toString(), {
 								chat_id: userId,
@@ -1097,6 +1101,7 @@ export default {
 					for (const chunk of chunks) {
 						const res = await bot.reply(chunk, 'MarkdownV2');
 						if (!res?.ok) {
+							console.error("Summary MarkdownV2 reply failed:", res?.statusText, await res?.text());
 							const plainText = stripMarkdownV2Escapes(chunk);
 							await bot.reply(plainText);
 						}

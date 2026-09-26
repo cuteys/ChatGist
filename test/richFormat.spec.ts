@@ -9,6 +9,7 @@ import {
 	formatAnswerMessage,
 	stripMarkdownV2Escapes,
 	splitTelegramMessage,
+	removeThematicBreaks,
 } from '../src/richFormat';
 
 describe('richFormat tests', () => {
@@ -31,12 +32,21 @@ describe('richFormat tests', () => {
 	it('wraps content in Telegram expandable quote', () => {
 		const content = '第一行\n第二行';
 		const quoted = foldText(content);
-		expect(quoted).toBe('**>第一行\n>第二行||');
+		expect(quoted).toBe('>第一行\n>第二行||');
 	});
 
 	it('normalizes spacing and collapses redundant newlines', () => {
 		const messy = `第一行\n\n\n\n第二行   \n\n\n第三行`;
 		expect(normalizeSpacing(messy)).toBe(`第一行\n\n第二行\n\n第三行`);
+	});
+
+	it('removes thematic break dividers such as ***, ---, ___ without affecting other text', () => {
+		const raw = `要点速览\n\n***\n\n【💬 详细脉络】\n---\n内容条目\n___`;
+		expect(removeThematicBreaks(raw)).toBe(`要点速览\n\n\n\n【💬 详细脉络】\n\n内容条目\n`);
+		const formatted = formatSummaryWithHighlights(raw);
+		expect(formatted).not.toContain('***');
+		expect(formatted).not.toContain('---');
+		expect(formatted).not.toContain('___');
 	});
 
 	it('formats summary with highlights at top and details folded in expandable quote', () => {
@@ -45,6 +55,8 @@ describe('richFormat tests', () => {
 • 📌 确认本周发布上线
 • 💡 优化了折叠与速览体验
 
+***
+
 【💬 详细脉络与讨论溯源】
 1. **发布时间**：讨论了上线计划，见 [引用1](https://tme.cat/123/456)。
 2. **体验优化**：采用 MarkdownV2 格式发送 [引用2](https://tme.cat/123/789)。
@@ -52,7 +64,9 @@ describe('richFormat tests', () => {
 		const result = formatSummaryWithHighlights(raw);
 		expect(result).toContain('【💡 核心要点速览】');
 		expect(result).toContain('• 📌 确认本周发布上线');
-		expect(result).toContain('**>【💬 详细脉络与讨论溯源】');
+		expect(result).not.toContain('***');
+		expect(result).not.toContain('**>');
+		expect(result).toContain('>【💬 详细脉络与讨论溯源】');
 		expect(result).toContain('https://t.me/c/123/456');
 		expect(result).toContain('https://t.me/c/123/789');
 		expect(result.endsWith('||')).toBe(true);
@@ -61,7 +75,8 @@ describe('richFormat tests', () => {
 	it('formats summary without delimiter by folding the entire text', () => {
 		const raw = `本日群聊总结如下：\n1. 讨论了系统部署\n2. 解决了相关配置问题`;
 		const result = formatSummaryWithHighlights(raw);
-		expect(result.startsWith('**>')).toBe(true);
+		expect(result.startsWith('>')).toBe(true);
+		expect(result).not.toContain('**>');
 		expect(result.endsWith('||')).toBe(true);
 		expect(result).toContain('讨论了系统部署');
 	});
@@ -69,7 +84,8 @@ describe('richFormat tests', () => {
 	it('formats answer message using formatAnswerMessage', () => {
 		const raw = `回答如下：大家在讨论部署方案 [https://tme.cat/123/1](https://tme.cat/123/1)`;
 		const result = formatAnswerMessage(raw);
-		expect(result.startsWith('**>')).toBe(true);
+		expect(result.startsWith('>')).toBe(true);
+		expect(result).not.toContain('**>');
 		expect(result.endsWith('||')).toBe(true);
 		expect(result).toContain('https://t.me/c/123/1');
 	});

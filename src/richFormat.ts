@@ -51,20 +51,27 @@ export function fixLink(text: string): string {
 	return text.replace(/tme\.cat/g, 't.me/c').replace(/\/c\/c/g, '/c');
 }
 
+export function removeThematicBreaks(text: string): string {
+	return text.replace(/^[ \t]*([*\-_])(?:[ \t]*\1){2,}[ \t]*$/gm, '');
+}
+
 export function foldText(text: string): string {
 	const trimmed = text.trim();
 	if (!trimmed) return '';
 	const lines = trimmed.split('\n');
-	if (lines.length === 1) {
-		return `**>${lines[0]}||`;
-	}
-	const firstLine = `**>${lines[0]}`;
-	const restLines = lines.slice(1).map((line) => `>${line}`);
-	return `${firstLine}\n${restLines.join('\n')}||`;
+	const quotedLines = lines.map((line) => {
+		const trimmedLine = line.trim();
+		if (!trimmedLine) {
+			return '>';
+		}
+		return trimmedLine.startsWith('>') ? trimmedLine : `>${line}`;
+	});
+	return `${quotedLines.join('\n')}||`;
 }
 
 export function formatSummaryWithHighlights(rawContent: string): string {
-	const processed = fixLink(processMarkdownLinks(rawContent));
+	const cleaned = removeThematicBreaks(rawContent);
+	const processed = fixLink(processMarkdownLinks(cleaned));
 	const normalized = normalizeSpacing(processed);
 
 	const match = normalized.match(/\n+(?=【💬|##\s*详细|【详细|详细讨论与消息溯源|详细讨论)/i);
@@ -84,7 +91,8 @@ export function formatSummaryWithHighlights(rawContent: string): string {
 }
 
 export function formatAnswerMessage(rawContent: string): string {
-	const processed = fixLink(processMarkdownLinks(rawContent));
+	const cleaned = removeThematicBreaks(rawContent);
+	const processed = fixLink(processMarkdownLinks(cleaned));
 	const normalized = normalizeSpacing(processed);
 	const convertedV2 = normalizeSpacing(telegramifyMarkdown(normalized, 'keep'));
 	return foldText(convertedV2);
@@ -102,7 +110,9 @@ export function normalizeSpacing(text: string): string {
  * 将转义过的 MarkdownV2 文本恢复为无转义的纯文本，作为发送失败时的降级方案
  */
 export function stripMarkdownV2Escapes(text: string): string {
-	return text.replace(/\\([_*[\]()~`>#+\-=|{}.!])/g, '$1');
+	return text
+		.replace(/\\([_*[\]()~`>#+\-=|{}.!])/g, '$1')
+		.replace(/\|\|$/g, '');
 }
 
 /**
