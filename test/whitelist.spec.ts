@@ -549,6 +549,8 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			const decoded = decodeURIComponent(sentMessages[0]).replace(/\+/g, ' ');
 			expect(decoded).not.toContain('原生富文本');
 			expect(decoded).not.toContain('sendRichMessage');
+			expect(decoded).toContain('单群保留上限');
+			expect(decoded).toContain('数据库总消息');
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
@@ -557,6 +559,13 @@ describe('Worker fetch whitelist gatekeeping', () => {
 	it('should reply directly in group for /ask without sending to private message', async () => {
 		const groupId = '-100888888';
 		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		// Insert a message within the last 48 hours
+		await testEnv.DB.prepare(
+			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)'
+		)
+			.bind('msg-ask-1', groupId, Date.now() - 3600 * 1000, 'Bob', '讨论新版本的部署测试', 10, 'Authorized Group')
+			.run();
 
 		const telegramCalls: Array<{ url: string; body?: any }> = [];
 		const originalFetch = globalThis.fetch;
@@ -635,6 +644,144 @@ describe('Worker fetch whitelist gatekeeping', () => {
 				return c.url.includes(groupId) || bodyStr.includes(groupId);
 			});
 			expect(groupSendCalls.length).toBeGreaterThan(0);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should clamp /summary to 48 hours for normal users when exceeding limit', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		// Insert messages: one recent (10h ago) and one old (60h ago)
+		await testEnv.DB.prepare(
+			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)'
+		)
+			.bind('msg-recent', groupId, Date.now() - 10 * 3600 * 1000, 'Alice', 'Recent discussion', 1, 'Authorized Group')
+			.run();
+
+		await testEnv.DB.prepare(
+			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)'
+		)
+			.bind('msg-old', groupId, Date.now() - 60 * 3600 * 1000, 'OldUser', 'Old discussion', 2, 'Authorized Group')
+			.run();
+
+		let requestedMessages: any[] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/chat/completions')) {
+				const body = JSON.parse(init.body);
+				requestedMessages = body.messages;
+				return new Response(
+					JSON.stringify({
+						id: 'chatcmpl-test',
+						object: 'chat.completion',
+						created: Math.floor(Date.now() / 1000),
+						model: 'gpt-4o-mini',
+						choices: [{ index: 0, message: { role: 'assistant', content: '总结内容' }, finish_reason: 'stop' }],
+					}),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
+			return new Response(JSON.stringify({ ok: true, result: { message_id: 777 } }), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		}) as any;
+
+		try {
+			const testEnvWithModel: Env = {
+				...testEnv,
+				AI_MODEL: 'gpt-4o-mini',
+				AI_API_KEY: 'test-key',
+			};
+
+			// Normal user requests 72h summary
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 18,
+					message: {
+						message_id: 402,
+						from: { id: 88888, first_name: 'Alice' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/summary 72h',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
+			expect(res.status).toBe(200);
+
+			// AI input should contain recent message, but NOT old message (> 48h)
+			const userPromptText = JSON.stringify(requestedMessages);
+			expect(userPromptText).toContain('Recent discussion');
+			expect(userPromptText).not.toContain('Old discussion');
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should notify normal user when no messages found in the last 48 hours for /ask', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		// Insert message from 60 hours ago
+		await testEnv.DB.prepare(
+			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)'
+		)
+			.bind('msg-old-ask', groupId, Date.now() - 60 * 3600 * 1000, 'OldUser', 'Old topic', 3, 'Authorized Group')
+			.run();
+
+		let repliedText = '';
+		let aiCalled = false;
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/chat/completions')) {
+				aiCalled = true;
+			}
+			if (url.includes('/sendMessage')) {
+				const parsed = new URL(url);
+				repliedText = parsed.searchParams.get('text') || '';
+				if (!repliedText && init?.body) {
+					try {
+						repliedText = JSON.parse(init.body).text || '';
+					} catch (_) {}
+				}
+			}
+			return new Response(JSON.stringify({ ok: true, result: { message_id: 666 } }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvWithModel: Env = {
+				...testEnv,
+				AI_MODEL: 'gpt-4o-mini',
+				AI_API_KEY: 'test-key',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 19,
+					message: {
+						message_id: 403,
+						from: { id: 88888, first_name: 'Alice' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/ask 有讨论新功能吗？',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
+			expect(res.status).toBe(200);
+			expect(aiCalled).toBe(false);
+			expect(repliedText).toContain('最近 48 小时内暂无消息记录');
 		} finally {
 			globalThis.fetch = originalFetch;
 		}

@@ -46,11 +46,11 @@ export function getCommandLimit(env: Env, command: TrackedCommand): number {
 		case 'summary':
 			return env.LIMIT_SUMMARY ? parseInt(env.LIMIT_SUMMARY, 10) : (globalLimit ?? 5);
 		case 'ask':
-			return env.LIMIT_ASK ? parseInt(env.LIMIT_ASK, 10) : (globalLimit ?? 10);
+			return env.LIMIT_ASK ? parseInt(env.LIMIT_ASK, 10) : (globalLimit ?? 5);
 		case 'query':
 			return env.LIMIT_QUERY ? parseInt(env.LIMIT_QUERY, 10) : (globalLimit ?? 20);
 		default:
-			return 10;
+			return 5;
 	}
 }
 

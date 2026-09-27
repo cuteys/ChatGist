@@ -10,6 +10,8 @@ export interface DatabaseStorageStats {
 	totalBytes: number;
 	payloadBytes: number;
 	limitBytes: number;
+	totalTextCount: number;
+	totalImageCount: number;
 	groupStats: GroupStorageStat[];
 }
 
@@ -51,6 +53,8 @@ export async function getDatabaseStorageStats(env: Env): Promise<DatabaseStorage
 	}
 
 	const payloadBytes = groupStats.reduce((sum, g) => sum + g.estimatedBytes, 0);
+	const totalImageCount = groupStats.reduce((sum, g) => sum + g.imageCount, 0);
+	const totalTextCount = groupStats.reduce((sum, g) => sum + Math.max(0, g.totalCount - g.imageCount), 0);
 
 	let totalBytes = 0;
 	try {
@@ -73,19 +77,35 @@ export async function getDatabaseStorageStats(env: Env): Promise<DatabaseStorage
 		totalBytes,
 		payloadBytes,
 		limitBytes,
+		totalTextCount,
+		totalImageCount,
 		groupStats,
 	};
 }
 
-/**
- * 常规清理：各群保留最新 3000 条消息，且图片仅保留最新 100 张
- */
+export function getGroupTextLimit(env: Env): number {
+	const val = env.LIMIT_GROUP_MESSAGES || env.GROUP_MESSAGE_LIMIT;
+	if (val && !isNaN(Number(val)) && Number(val) > 0) {
+		return Math.floor(Number(val));
+	}
+	return 3000;
+}
+
+export function getGroupImageLimit(env: Env): number {
+	const val = env.LIMIT_GROUP_IMAGES || env.GROUP_IMAGE_LIMIT;
+	if (val && !isNaN(Number(val)) && Number(val) > 0) {
+		return Math.floor(Number(val));
+	}
+	return 100;
+}
+
 export async function cleanupOldMessagesAndImages(env: Env): Promise<{ textCleaned: number; imagesCleaned: number }> {
 	let textCleaned = 0;
 	let imagesCleaned = 0;
+	const textLimit = getGroupTextLimit(env);
+	const imageLimit = getGroupImageLimit(env);
 
 	try {
-		// 1. 各群文本消息保留最新 3000 条
 		const textRes = await env.DB.prepare(`
 			DELETE FROM Messages
 			WHERE id IN (
@@ -99,12 +119,11 @@ export async function cleanupOldMessagesAndImages(env: Env): Promise<{ textClean
 						) as row_num
 					FROM Messages
 				) ranked
-				WHERE row_num > 3000
+				WHERE row_num > ?
 			);
-		`).run();
+		`).bind(textLimit).run();
 		textCleaned = textRes?.meta?.changes || 0;
 
-		// 2. 各群图片保留最新 100 张
 		const imgRes = await env.DB.prepare(`
 			DELETE FROM Messages
 			WHERE id IN (
@@ -119,9 +138,9 @@ export async function cleanupOldMessagesAndImages(env: Env): Promise<{ textClean
 					FROM Messages
 					WHERE content LIKE 'data:image/%'
 				) ranked_img
-				WHERE row_num > 100
+				WHERE row_num > ?
 			);
-		`).run();
+		`).bind(imageLimit).run();
 		imagesCleaned = imgRes?.meta?.changes || 0;
 	} catch (e) {
 		console.error("Failed to cleanup old messages/images:", e);

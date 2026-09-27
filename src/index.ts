@@ -42,6 +42,8 @@ import {
 	cleanupOldMessagesAndImages,
 	checkAndEnforceStorageLimit,
 	formatBytes,
+	getGroupTextLimit,
+	getGroupImageLimit,
 } from './storage';
 
 export {
@@ -78,7 +80,7 @@ function escapeMarkdownV2(text: string) {
 }
 
 export const BOT_COMMANDS = [
-	{ command: "summary", description: "概括群聊消息（如 /summary 20 或 /summary 12h）" },
+	{ command: "summary", description: "概括群聊消息" },
 	{ command: "ask", description: "基于群聊记录提问并回答" },
 	{ command: "query", description: "在群聊历史中检索关键词" },
 	{ command: "quota", description: "查询今日剩余指令使用配额" },
@@ -87,7 +89,7 @@ export const BOT_COMMANDS = [
 	{ command: "addgroup", description: "【超管】将当前群或指定群加入白名单" },
 	{ command: "delgroup", description: "【超管】将群组移出白名单" },
 	{ command: "whitelist", description: "【超管】查看已授权白名单群组" },
-	{ command: "addadmin", description: "【超管】添加管理员（免流特权）" },
+	{ command: "addadmin", description: "【超管】添加管理员" },
 	{ command: "deladmin", description: "【超管】移除管理员" },
 	{ command: "admins", description: "【超管】查看所有管理员列表" },
 	{ command: "clearmessages", description: "【超管】清空指定群组的历史消息记录" },
@@ -369,7 +371,7 @@ function getRoleHelpText(env: Env, userId: string, superAdmin: boolean, admin: b
 		return `👑 <b>【超级管理员使用指南】</b>\n` +
 			`您拥有本机器人的最高控制权限，不受任何使用频次限制。\n\n` +
 			`🛠️ <b>白名单与权限管理：</b>\n` +
-			`• /addgroup [群ID] [名称] - 授权群组（群内发送可一键授权当前群）\n` +
+			`• /addgroup [群ID] [名称] - 授权群组\n` +
 			`• /delgroup [群ID] - 移出白名单\n` +
 			`• /whitelist - 查看白名单群组列表\n` +
 			`• /addadmin &lt;用户ID&gt; [备注] - 添加免流管理员\n` +
@@ -378,38 +380,38 @@ function getRoleHelpText(env: Env, userId: string, superAdmin: boolean, admin: b
 			`• /clearmessages [群ID] - 清空指定群组的历史消息记录\n` +
 			`• /setcommands - 向 Telegram 同步指令菜单\n\n` +
 			`💬 <b>群聊常用指令：</b>\n` +
-			`• /summary &lt;数量/时间&gt; - 概括群聊消息（如 /summary 20 或 /summary 12h）\n` +
+			`• /summary &lt;数量/时间&gt; - 概括群聊消息\n` +
 			`• /ask &lt;问题&gt; - 基于群聊记录提问并回答\n` +
 			`• /query &lt;关键词&gt; - 检索历史消息\n` +
 			`• /quota - 查看今日剩余配额\n` +
 			`• /status - 检查运行状态与群组授权\n\n` +
-			`ℹ️ 您的 Telegram 用户 ID 为：<code>${userId}</code>（点击可复制）`;
+			`ℹ️ 您的 Telegram 用户 ID 为：<code>${userId}</code>`;
 	}
 
 	if (admin) {
 		return `🛡️ <b>【管理员使用指南】</b>\n` +
 			`您已被系统授权为机器人管理员，享有<b>【无限次免流特权】</b>！\n\n` +
-			`💬 <b>群聊可用指令（无使用频次限制）：</b>\n` +
-			`• /summary &lt;数量/时间&gt; - 概括群聊消息（如 /summary 20 或 /summary 12h）\n` +
+			`💬 <b>群聊可用指令：</b>\n` +
+			`• /summary &lt;数量/时间&gt; - 概括群聊消息\n` +
 			`• /ask &lt;问题&gt; - 基于群聊记录提问并回答\n` +
 			`• /query &lt;关键词&gt; - 检索群聊历史消息\n` +
 			`• /quota - 查看指令免流特权状态\n` +
 			`• /status - 检查运行状态与群组授权\n` +
 			`• /help - 查看本使用帮助\n\n` +
-			`ℹ️ 您的 Telegram 用户 ID 为：<code>${userId}</code>（点击可复制）`;
+			`ℹ️ 您的 Telegram 用户 ID 为：<code>${userId}</code>`;
 	}
 
 	return `📖 <b>【ChatGist 群聊助手使用指南】</b>\n` +
 		`欢迎使用群聊智能总结与检索助手！\n\n` +
 		`💬 <b>可用群聊指令：</b>\n` +
-		`• /summary &lt;数量/时间&gt; - 概括近期群聊重点（每日限 5 次）\n` +
-		`• /ask &lt;问题&gt; - 基于近期群聊记录回答（每日限 10 次）\n` +
-		`• /query &lt;关键词&gt; - 检索群聊历史消息（每日限 20 次）\n` +
+		`• /summary &lt;数量/时间&gt; - 概括近期群聊重点，每日限 5 次\n` +
+		`• /ask &lt;问题&gt; - 基于近期群聊记录回答，每日限 5 次\n` +
+		`• /query &lt;关键词&gt; - 检索群聊历史消息，每日限 20 次\n` +
 		`• /quota - 快速查看今日剩余配额\n` +
 		`• /status - 检查机器人运行状态及群组授权\n` +
 		`• /help - 查看本指令使用指南\n\n` +
 		`ℹ️ <b>使用须知：</b>\n` +
-		`1. 您的 Telegram 用户 ID 为：<code>${userId}</code>（点击可复制）\n` +
+		`1. 您的 Telegram 用户 ID 为：<code>${userId}</code>\n` +
 		`2. 机器人仅在管理员授权的白名单群组中记录与响应；\n` +
 		`3. /summary、/ask、/query 仅限在授权群聊中使用；\n` +
 		`4. 每日使用额度于北京时间 00:00 自动刷新。`;
@@ -825,9 +827,13 @@ export default {
 					try {
 						const storageStats = await getDatabaseStorageStats(env);
 						const percent = ((storageStats.totalBytes / storageStats.limitBytes) * 100).toFixed(1);
+						const textLimit = getGroupTextLimit(env);
+						const imageLimit = getGroupImageLimit(env);
 
 						statusText += `\n💾 数据库存储统计：\n` +
 							`• 数据库总大小：${formatBytes(storageStats.totalBytes)} / 500 MB (${percent}%)\n` +
+							`• 单群保留上限：文本 ${textLimit} 条 | 图片 ${imageLimit} 张\n` +
+							`• 数据库总消息：文本 ${storageStats.totalTextCount} 条 | 图片 ${storageStats.totalImageCount} 张\n` +
 							`• 统计群组总数：${storageStats.groupStats.length} 个\n`;
 
 						if (storageStats.groupStats.length > 0) {
@@ -993,6 +999,27 @@ export default {
 					return new Response('ok');
 				}
 
+				const isNormalUser = !(await isAdmin(env, userId));
+				const timeThreshold = isNormalUser ? Date.now() - 48 * 60 * 60 * 1000 : 0;
+
+				const { results } = await env.DB.prepare(`
+					WITH latest_pool AS (
+						SELECT * FROM Messages
+						WHERE groupId=? AND timeStamp >= ?
+						ORDER BY timeStamp DESC
+						LIMIT ?
+					)
+					SELECT * FROM latest_pool
+					ORDER BY timeStamp ASC
+					`)
+					.bind(groupId, timeThreshold, 3000)
+					.all();
+
+				if (!results || results.length === 0) {
+					await ctx.reply(isNormalUser ? '📋 本群最近 48 小时内暂无消息记录，无法回答。' : '📋 本群暂无消息记录，无法回答。');
+					return new Response('ok');
+				}
+
 				const quota = await checkAndIncrementQuota(env, userId, 'ask');
 				if (!quota.allowed) {
 					await ctx.reply(`⚠️ 您今日的 /ask 提问次数已达上限（${quota.current}/${quota.limit} 次）。配额将在次日 00:00 自动刷新。`);
@@ -1006,19 +1033,6 @@ export default {
 					groupId,
 					"⏳ 收到提问，正在分析近期群聊并解答，请稍候...",
 					async () => {
-						const { results } = await env.DB.prepare(`
-							WITH latest_1000 AS (
-								SELECT * FROM Messages
-								WHERE groupId=?
-								ORDER BY timeStamp DESC
-								LIMIT 1000
-							)
-							SELECT * FROM latest_1000
-							ORDER BY timeStamp ASC
-							`)
-							.bind(groupId)
-							.all();
-
 						let result;
 						try {
 							result = await getGenModel(env)
@@ -1090,7 +1104,7 @@ export default {
 				} else {
 					const match = summaryArg.match(/^(\d+)(h|小时|d|天|m|分|分钟)?$/i);
 					if (!match) {
-						await bot.reply('⚠️ 请输入有效的时间范围或消息数量，例如：\n• /summary 20（最近 20 条）\n• /summary 12h 或 1天（最近时间范围）');
+						await bot.reply('⚠️ 请输入有效的时间范围或消息数量，例如：/summary 20 或 /summary 12h');
 						return new Response('ok');
 					}
 					const num = parseInt(match[1], 10);
@@ -1110,6 +1124,19 @@ export default {
 					}
 				}
 
+				const isNormalUser = !(await isAdmin(env, userId));
+				let noticeNote = "";
+
+				if (isNormalUser) {
+					if (hours !== undefined && hours > 48) {
+						hours = 48;
+						noticeNote = "，普通用户单次上限 48 小时";
+					} else if (hours === undefined && limitCount > 3000) {
+						limitCount = 3000;
+						noticeNote = "，普通用户单次上限 3000 条";
+					}
+				}
+
 				const quota = await checkAndIncrementQuota(env, userId, 'summary');
 				if (!quota.allowed) {
 					await bot.reply(`⚠️ 您今日的 /summary 总结次数已达上限（${quota.current}/${quota.limit} 次）。配额将在次日 00:00 自动刷新。`);
@@ -1117,11 +1144,15 @@ export default {
 				}
 
 				const botToken = getTelegramToken(env);
+				const statusPrompt = noticeNote
+					? `⏳ 已按普通用户上限调整${noticeNote}，正在生成总结，请稍候...`
+					: "⏳ 正在读取群聊记录并生成总结，请稍候...";
+
 				await withTemporaryStatus(
 					(text) => bot.reply(text),
 					botToken,
 					groupId,
-					"⏳ 正在读取群聊记录并生成总结，请稍候...",
+					statusPrompt,
 					async () => {
 						let results: Record<string, unknown>[];
 						if (hours !== undefined) {
@@ -1130,22 +1161,38 @@ export default {
 								FROM Messages
 								WHERE groupId=? AND timeStamp >= ?
 								ORDER BY timeStamp ASC
+								LIMIT ?
 								`)
-								.bind(groupId, Date.now() - hours * 60 * 60 * 1000)
+								.bind(groupId, Date.now() - hours * 60 * 60 * 1000, isNormalUser ? 3000 : 4000)
 								.all()).results;
 						} else {
-							results = (await env.DB.prepare(`
-								WITH latest_n AS (
-									SELECT * FROM Messages
-									WHERE groupId=?
-									ORDER BY timeStamp DESC
-									LIMIT ?
-								)
-								SELECT * FROM latest_n
-								ORDER BY timeStamp ASC
-								`)
-								.bind(groupId, limitCount)
-								.all()).results;
+							if (isNormalUser) {
+								results = (await env.DB.prepare(`
+									WITH latest_n AS (
+										SELECT * FROM Messages
+										WHERE groupId=? AND timeStamp >= ?
+										ORDER BY timeStamp DESC
+										LIMIT ?
+									)
+									SELECT * FROM latest_n
+									ORDER BY timeStamp ASC
+									`)
+									.bind(groupId, Date.now() - 48 * 60 * 60 * 1000, limitCount)
+									.all()).results;
+							} else {
+								results = (await env.DB.prepare(`
+									WITH latest_n AS (
+										SELECT * FROM Messages
+										WHERE groupId=?
+										ORDER BY timeStamp DESC
+										LIMIT ?
+									)
+									SELECT * FROM latest_n
+									ORDER BY timeStamp ASC
+									`)
+									.bind(groupId, limitCount)
+									.all()).results;
+							}
 						}
 
 						if (!results || results.length === 0) {
@@ -1163,7 +1210,7 @@ export default {
 						const groupTitle = msg.chat?.title ? `「${msg.chat.title}」` : "";
 						const quoteNotice = isDefault
 							? `💡 未指定参数，默认总结群聊${groupTitle}近期 50 条消息`
-							: `总结群聊${groupTitle}${countDesc}聊天记录`;
+							: `总结群聊${groupTitle}${countDesc}聊天记录${noticeNote}`;
 
 						try {
 							const { blocks, raw } = await generateSummaryRichMessage(env, results, model, quoteNotice);

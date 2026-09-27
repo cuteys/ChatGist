@@ -59,6 +59,8 @@ describe('Storage management tests', () => {
 		expect(stats.groupStats[0].imageCount).toBe(3);
 		expect(stats.groupStats[0].estimatedBytes).toBeGreaterThan(0);
 		expect(stats.totalBytes).toBeGreaterThan(0);
+		expect(stats.totalTextCount).toBe(5);
+		expect(stats.totalImageCount).toBe(3);
 	});
 
 	it('cleans up images keeping latest 100 images per group', async () => {
@@ -150,5 +152,41 @@ describe('Storage management tests', () => {
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
+	});
+
+	it('respects LIMIT_GROUP_MESSAGES and LIMIT_GROUP_IMAGES from environment', async () => {
+		const customEnv: Env = {
+			...env,
+			LIMIT_GROUP_MESSAGES: '5',
+			LIMIT_GROUP_IMAGES: '2',
+		};
+		const groupId = '-100666666';
+
+		// Insert 8 text messages and 4 images
+		for (let i = 1; i <= 8; i++) {
+			await env.DB.prepare(
+				'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)'
+			)
+				.bind(`text_${i}`, groupId, 3000000 + i, 'User', `Text message ${i}`, i, 'Custom Group')
+				.run();
+		}
+		for (let i = 1; i <= 4; i++) {
+			await env.DB.prepare(
+				'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)'
+			)
+				.bind(`img_${i}`, groupId, 4000000 + i, 'User', `data:image/jpeg;base64,data_${i}`, 10 + i, 'Custom Group')
+				.run();
+		}
+
+		const { textCleaned, imagesCleaned } = await cleanupOldMessagesAndImages(customEnv);
+		expect(textCleaned).toBe(7); // Total messages were 12 (8 text + 4 img), row_num > 5 deleted 7
+		expect(imagesCleaned).toBe(2); // 4 images, row_num > 2 deleted 2
+
+		const remainingImages = await env.DB.prepare(
+			"SELECT COUNT(*) as c FROM Messages WHERE groupId = ? AND content LIKE 'data:image/%'"
+		)
+			.bind(groupId)
+			.first<{ c: number }>();
+		expect(remainingImages?.c).toBe(2);
 	});
 });

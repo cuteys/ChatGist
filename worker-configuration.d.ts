@@ -19,5 +19,9 @@ interface Env {
 	LIMIT_ASK?: string;
 	LIMIT_QUERY?: string;
 	USER_DAILY_LIMIT?: string;
+	LIMIT_GROUP_MESSAGES?: string;
+	GROUP_MESSAGE_LIMIT?: string;
+	LIMIT_GROUP_IMAGES?: string;
+	GROUP_IMAGE_LIMIT?: string;
 	DB: D1Database;
 }

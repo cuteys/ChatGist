@@ -87,4 +87,11 @@ describe('User Quota and Rate Limiting', () => {
 		expect(status.query.current).toBe(0);
 		expect(status.query.limit).toBe(4);
 	});
+
+	it('should provide default limits when environment variables are not set', () => {
+		const emptyEnv: Env = { ...env, LIMIT_SUMMARY: undefined, LIMIT_ASK: undefined, LIMIT_QUERY: undefined, USER_DAILY_LIMIT: undefined };
+		expect(getCommandLimit(emptyEnv, 'summary')).toBe(5);
+		expect(getCommandLimit(emptyEnv, 'ask')).toBe(5);
+		expect(getCommandLimit(emptyEnv, 'query')).toBe(20);
+	});
 });
