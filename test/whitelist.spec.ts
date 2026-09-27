@@ -173,6 +173,59 @@ describe('Worker fetch whitelist gatekeeping', () => {
 		expect((row as any).content).toBe('Hello world in authorized group');
 	});
 
+	it('should correctly record messages with forward_origin and legacy forward fields', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		// 1. New Telegram 7.0+ forward_origin format
+		const reqOrigin = new Request('https://chatgist.example.com/', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				update_id: 205,
+				message: {
+					message_id: 105,
+					from: { id: 88888, first_name: 'Alice' },
+					chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+					date: Math.floor(Date.now() / 1000),
+					text: 'Origin message',
+					forward_origin: {
+						type: 'channel',
+						chat: { title: 'News Channel' },
+					},
+				},
+			}),
+		});
+		const resOrigin = await worker.fetch(reqOrigin, testEnv, mockCtx);
+		expect(resOrigin.status).toBe(200);
+		const rowOrigin = await testEnv.DB.prepare('SELECT * FROM Messages WHERE messageId = 105').first();
+		expect((rowOrigin as any).content).toBe('转发自 News Channel: Origin message');
+
+		// 2. Legacy forward_from format
+		const reqLegacy = new Request('https://chatgist.example.com/', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				update_id: 206,
+				message: {
+					message_id: 106,
+					from: { id: 88888, first_name: 'Alice' },
+					chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+					date: Math.floor(Date.now() / 1000),
+					text: 'Legacy message',
+					forward_from: {
+						id: 99999,
+						first_name: 'Bob',
+					},
+				},
+			}),
+		});
+		const resLegacy = await worker.fetch(reqLegacy, testEnv, mockCtx);
+		expect(resLegacy.status).toBe(200);
+		const rowLegacy = await testEnv.DB.prepare('SELECT * FROM Messages WHERE messageId = 106').first();
+		expect((rowLegacy as any).content).toBe('转发自 Bob: Legacy message');
+	});
+
 	it('should allow admin to add group from inside non-whitelisted group', async () => {
 		const groupId = '-100777777';
 		const addGroupPayload = {

@@ -367,6 +367,32 @@ function getUserName(msg: any): string {
 	return msg?.from?.username || "anonymous";
 }
 
+function getForwardSender(msg: any): string {
+	const origin = msg?.forward_origin;
+	if (origin) {
+		switch (origin.type) {
+			case 'user':
+				return [origin.sender_user?.first_name, origin.sender_user?.last_name].filter(Boolean).join(" ");
+			case 'hidden_user':
+				return origin.sender_user_name || "";
+			case 'chat':
+				return origin.sender_chat?.title || "";
+			case 'channel':
+				return origin.chat?.title || "";
+		}
+	}
+	if (msg?.forward_from) {
+		return [msg.forward_from.first_name, msg.forward_from.last_name].filter(Boolean).join(" ");
+	}
+	if (msg?.forward_sender_name) {
+		return msg.forward_sender_name;
+	}
+	if (msg?.forward_from_chat?.title) {
+		return msg.forward_from_chat.title;
+	}
+	return "";
+}
+
 function formatChatHistoryForAi(results: any[]) {
 	return results.flatMap((r: any) => [
 		dispatchContent(`====================`),
@@ -1330,14 +1356,7 @@ export default {
 						}
 						let content = msg.text || "";
 						const replyTo = msg.reply_to_message?.message_id;
-						let fwdSender = "";
-						if (msg.forward_from) {
-							fwdSender = [msg.forward_from.first_name, msg.forward_from.last_name].filter(Boolean).join(" ");
-						} else if (msg.forward_sender_name) {
-							fwdSender = msg.forward_sender_name;
-						} else if (msg.forward_from_chat?.title) {
-							fwdSender = msg.forward_from_chat.title;
-						}
+						const fwdSender = getForwardSender(msg);
 						if (fwdSender) {
 							content = `转发自 ${fwdSender}: ${content}`;
 						}
