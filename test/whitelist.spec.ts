@@ -83,7 +83,7 @@ describe('Whitelist and Admin DB operations', () => {
 	});
 });
 
-import worker from '../src/index';
+import worker, { clearProcessingUpdatesForTest } from '../src/index';
 
 describe('Worker fetch whitelist gatekeeping', () => {
 	const mockCtx = {
@@ -98,6 +98,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 	};
 
 	beforeEach(async () => {
+		clearProcessingUpdatesForTest();
 		invalidateWhitelistCache();
 		await testEnv.DB.prepare(`
 			CREATE TABLE IF NOT EXISTS Messages (
@@ -459,14 +460,16 @@ describe('Worker fetch whitelist gatekeeping', () => {
 		}) as any;
 
 		try {
-			for (const cmd of ['summary', 'ask', 'query']) {
+			const cmds = ['summary', 'ask', 'query'];
+			for (let i = 0; i < cmds.length; i++) {
+				const cmd = cmds[i];
 				const req = new Request('https://chatgist.example.com/', {
 					method: 'POST',
 					headers: { 'Content-Type': 'application/json' },
 					body: JSON.stringify({
-						update_id: 15,
+						update_id: 150 + i,
 						message: {
-							message_id: 301,
+							message_id: 301 + i,
 							from: { id: 77777, first_name: 'David' },
 							chat: { id: 77777, type: 'private' },
 							date: Math.floor(Date.now() / 1000),
@@ -700,16 +703,9 @@ describe('Worker fetch whitelist gatekeeping', () => {
 		}
 	});
 
-	it('should notify normal user when no messages found in the last 48 hours for /ask', async () => {
+	it('should query messages without 48h restriction for /ask and notify when empty', async () => {
 		const groupId = '-100888888';
 		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
-
-		// Insert message from 60 hours ago
-		await testEnv.DB.prepare(
-			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)'
-		)
-			.bind('msg-old-ask', groupId, Date.now() - 60 * 3600 * 1000, 'OldUser', 'Old topic', 3, 'Authorized Group')
-			.run();
 
 		let repliedText = '';
 		let aiCalled = false;
@@ -738,11 +734,12 @@ describe('Worker fetch whitelist gatekeeping', () => {
 				AI_API_KEY: 'test-key',
 			};
 
-			const req = new Request('https://chatgist.example.com/', {
+			// 1. When group is empty
+			const reqEmpty = new Request('https://chatgist.example.com/', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
-					update_id: 19,
+					update_id: 191,
 					message: {
 						message_id: 403,
 						from: { id: 88888, first_name: 'Alice' },
@@ -753,10 +750,91 @@ describe('Worker fetch whitelist gatekeeping', () => {
 				}),
 			});
 
-			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
-			expect(res.status).toBe(200);
+			const resEmpty = await worker.fetch(reqEmpty, testEnvWithModel, mockCtx);
+			expect(resEmpty.status).toBe(200);
 			expect(aiCalled).toBe(false);
-			expect(repliedText).toContain('最近 48 小时内暂无消息记录');
+			expect(repliedText).toContain('暂无消息记录');
+
+			// 2. When message is older than 48h, /ask still works because time is not restricted
+			await testEnv.DB.prepare(
+				'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)'
+			)
+				.bind('msg-old-ask', groupId, Date.now() - 60 * 3600 * 1000, 'OldUser', 'Old topic', 3, 'Authorized Group')
+				.run();
+
+			const reqWithOldMsg = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 192,
+					message: {
+						message_id: 404,
+						from: { id: 88888, first_name: 'Alice' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/ask 有讨论旧功能吗？',
+					},
+				}),
+			});
+
+			globalThis.fetch = (async (input: any) => {
+				const url = typeof input === 'string' ? input : input.url;
+				if (url.includes('/chat/completions')) {
+					aiCalled = true;
+					return new Response(JSON.stringify({
+						choices: [{ message: { content: '关于旧功能的回答' } }]
+					}), { status: 200, headers: { 'Content-Type': 'application/json' } });
+				}
+				return new Response(JSON.stringify({ ok: true, result: { message_id: 667 } }), { status: 200 });
+			}) as any;
+
+			const resWithOldMsg = await worker.fetch(reqWithOldMsg, testEnvWithModel, mockCtx);
+			expect(resWithOldMsg.status).toBe(200);
+			expect(aiCalled).toBe(true);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should immediately return ok and ignore duplicate update_id', async () => {
+		let callCount = 0;
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () => {
+			callCount++;
+			return new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 });
+		}) as any;
+
+		try {
+			const payload = {
+				update_id: 9999,
+				message: {
+					message_id: 1001,
+					from: { id: 55555, first_name: 'Bob' },
+					chat: { id: 55555, type: 'private' },
+					date: Math.floor(Date.now() / 1000),
+					text: '/status',
+				},
+			};
+
+			const req1 = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(payload),
+			});
+			const res1 = await worker.fetch(req1, testEnv, mockCtx);
+			expect(res1.status).toBe(200);
+			const firstCallCount = callCount;
+			expect(firstCallCount).toBeGreaterThan(0);
+
+			// Second request with same update_id (simulating Telegram retry)
+			const req2 = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(payload),
+			});
+			const res2 = await worker.fetch(req2, testEnv, mockCtx);
+			expect(res2.status).toBe(200);
+			expect(callCount).toBe(firstCallCount);
 		} finally {
 			globalThis.fetch = originalFetch;
 		}

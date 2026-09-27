@@ -6,6 +6,7 @@ import { extractAllOGInfo } from "./og";
 import { logModelError } from './logModelError';
 import {
 	deleteTelegramMessage,
+	getMessageLink,
 	toSuperscript,
 	processMarkdownLinks,
 	fixLink,
@@ -54,6 +55,27 @@ export {
 	fixLink,
 };
 
+const processingUpdates = new Map<number, number>();
+
+export function clearProcessingUpdatesForTest() {
+	processingUpdates.clear();
+}
+
+function isDuplicateUpdate(updateId?: number): boolean {
+	if (!updateId) return false;
+	const now = Date.now();
+	for (const [id, ts] of processingUpdates.entries()) {
+		if (now - ts > 5 * 60 * 1000) {
+			processingUpdates.delete(id);
+		}
+	}
+	if (processingUpdates.has(updateId)) {
+		return true;
+	}
+	processingUpdates.set(updateId, now);
+	return false;
+}
+
 function dispatchContent(content: string): { type: "text", text: string } | { type: "image_url", image_url: { url: string } } {
 	if (content.startsWith("data:image/")) {
 		return {
@@ -69,10 +91,6 @@ function dispatchContent(content: string): { type: "text", text: string } | { ty
 	};
 }
 
-function getMessageLink(r: { groupId: string; messageId: number }) {
-	const cleanGroupId = r.groupId.replace(/^-100/, '').replace(/^-/, '');
-	return `https://t.me/c/${cleanGroupId}/${r.messageId}`;
-}
 
 function escapeMarkdownV2(text: string) {
 	const reservedChars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
@@ -189,7 +207,7 @@ function getGenModel(env: Env) {
 	return new OpenAI({
 		apiKey: getApiKey(env),
 		...(baseURL ? { baseURL } : {}),
-		timeout: 60000,
+		timeout: 45000,
 	});
 }
 
@@ -348,13 +366,26 @@ function getUserName(msg: any): string {
 	return msg?.from?.username || "anonymous";
 }
 
-function formatChatHistoryForAi(results: any[]) {
-	return results.flatMap((r: any) => [
-		dispatchContent(`====================`),
-		dispatchContent(`${r.userName}:`),
-		dispatchContent(r.content),
-		dispatchContent(getMessageLink(r)),
-	]);
+function formatChatHistoryForAi(results: any[], maxImages = 3) {
+	const totalImages = results.filter((r) => r.content?.startsWith("data:image/")).length;
+	const skipImageUrls = Math.max(0, totalImages - maxImages);
+	let currentImageIdx = 0;
+
+	return results.flatMap((r: any) => {
+		let content = r.content || "";
+		if (content.startsWith("data:image/")) {
+			currentImageIdx++;
+			if (currentImageIdx <= skipImageUrls) {
+				content = "[图片]";
+			}
+		}
+		return [
+			dispatchContent(`====================`),
+			dispatchContent(`${r.userName}:`),
+			dispatchContent(content),
+			dispatchContent(getMessageLink(r)),
+		];
+	});
 }
 
 async function saveMessage(env: Env, params: {
@@ -750,6 +781,10 @@ export default {
 				return new Response("bad request", { status: 400 });
 			}
 
+			if (isDuplicateUpdate(body?.update_id)) {
+				return new Response("ok");
+			}
+
 			if (!body?.message && body?.edited_message) {
 				body.message = body.edited_message;
 			}
@@ -1080,24 +1115,21 @@ export default {
 					return new Response('ok');
 				}
 
-				const isNormalUser = !(await isAdmin(env, userId));
-				const timeThreshold = isNormalUser ? Date.now() - 48 * 60 * 60 * 1000 : 0;
-
 				const { results } = await env.DB.prepare(`
 					WITH latest_pool AS (
 						SELECT * FROM Messages
-						WHERE groupId=? AND timeStamp >= ?
+						WHERE groupId=?
 						ORDER BY timeStamp DESC
-						LIMIT ?
+						LIMIT 1500
 					)
 					SELECT * FROM latest_pool
 					ORDER BY timeStamp ASC
 					`)
-					.bind(groupId, timeThreshold, 3000)
+					.bind(groupId)
 					.all();
 
 				if (!results || results.length === 0) {
-					await ctx.reply(isNormalUser ? '📋 本群最近 48 小时内暂无消息记录，无法回答。' : '📋 本群暂无消息记录，无法回答。');
+					await ctx.reply('📋 本群暂无消息记录，无法回答。');
 					return new Response('ok');
 				}
 
