@@ -207,7 +207,7 @@ function getGenModel(env: Env) {
 	return new OpenAI({
 		apiKey: getApiKey(env),
 		...(baseURL ? { baseURL } : {}),
-		timeout: 45000,
+		timeout: 60000,
 	});
 }
 
@@ -366,26 +366,13 @@ function getUserName(msg: any): string {
 	return msg?.from?.username || "anonymous";
 }
 
-function formatChatHistoryForAi(results: any[], maxImages = 3) {
-	const totalImages = results.filter((r) => r.content?.startsWith("data:image/")).length;
-	const skipImageUrls = Math.max(0, totalImages - maxImages);
-	let currentImageIdx = 0;
-
-	return results.flatMap((r: any) => {
-		let content = r.content || "";
-		if (content.startsWith("data:image/")) {
-			currentImageIdx++;
-			if (currentImageIdx <= skipImageUrls) {
-				content = "[图片]";
-			}
-		}
-		return [
-			dispatchContent(`====================`),
-			dispatchContent(`${r.userName}:`),
-			dispatchContent(content),
-			dispatchContent(getMessageLink(r)),
-		];
-	});
+function formatChatHistoryForAi(results: any[]) {
+	return results.flatMap((r: any) => [
+		dispatchContent(`====================`),
+		dispatchContent(`${r.userName}:`),
+		dispatchContent(r.content),
+		dispatchContent(getMessageLink(r)),
+	]);
 }
 
 async function saveMessage(env: Env, params: {
