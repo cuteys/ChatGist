@@ -8,7 +8,6 @@ interface Env {
 	GEMINI_API_KEY?: string;
 	ADMIN_USER_IDS?: string;
 	ADMIN_USER_ID?: string;
-	account_id?: string;
 	AI_BASE_URL?: string;
 	AI_MODEL?: string;
 	BASE_URL?: string;

@@ -1,6 +1,6 @@
-// test/index.spec.ts
 import { describe, it, expect } from 'vitest';
-import { processMarkdownLinks, toSuperscript } from "./../src/index"
+import { processMarkdownLinks, toSuperscript } from '../src/richFormat';
+import { isJPEG, isJPEGBase64, isPNG, isWEBP, detectImageMimeType } from '../src/image';
 
 describe("test fix link", () => {
 	it("should fix link", () => {
@@ -21,15 +21,15 @@ describe("test fix link", () => {
 		[引用²](链接22222)     // 完全相同，会被处理
 		[引用¹](链接11111)     // 完全相同，会复用编号
 		`);
-	})
-})
+	});
+});
+
 describe("upper number", () => {
 	it("should upper number", () => {
 		expect(toSuperscript(1234)).toBe("¹²³⁴");
 	});
 });
 
-import { isJPEG, isJPEGBase64, isPNG, isWEBP, detectImageMimeType } from "../src/isJpeg";
 
 describe("JPEG validation", () => {
 	it("should validate JPEG ArrayBuffer correctly", () => {
@@ -77,4 +77,16 @@ describe("JPEG validation", () => {
 		expect(detectImageMimeType(unknownBytes)).toBeNull();
 	});
 });
+
+import { extractAllOGInfo } from "../src/og";
+
+describe("OG info security", () => {
+	it("should reject private and local hosts without fetching", async () => {
+		expect(await extractAllOGInfo("http://localhost/test")).toBe("http://localhost/test");
+		expect(await extractAllOGInfo("http://127.0.0.1/admin")).toBe("http://127.0.0.1/admin");
+		expect(await extractAllOGInfo("http://192.168.1.1/router")).toBe("http://192.168.1.1/router");
+		expect(await extractAllOGInfo("ftp://example.com/file")).toBe("ftp://example.com/file");
+	});
+});
+
 

@@ -1,3 +1,5 @@
+import { getSuperAdminIds } from './whitelist';
+
 export interface GroupStorageStat {
 	groupId: string;
 	groupName: string;
@@ -212,8 +214,7 @@ export async function checkAndEnforceStorageLimit(
 	// 发送告警通知给超级管理员
 	let notifiedCount = 0;
 	if (botToken) {
-		const rawAdmins = env.ADMIN_USER_IDS || env.ADMIN_USER_ID || '';
-		const superAdmins = rawAdmins.split(',').map((s) => s.trim()).filter(Boolean);
+		const superAdmins = getSuperAdminIds(env);
 
 		const alertText =
 			`⚠️ 【数据库存储容量预警与自动清理通知】\n\n` +

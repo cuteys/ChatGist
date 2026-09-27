@@ -35,14 +35,16 @@ async function withAutoInit<T>(env: Env, queryFn: () => Promise<T>): Promise<T> 
 	}
 }
 
+export function getSuperAdminIds(env: Env): string[] {
+	const envAdminStr = env.ADMIN_USER_IDS || env.ADMIN_USER_ID || "";
+	return envAdminStr.split(",").map((s: string) => s.trim()).filter(Boolean);
+}
+
 export function isSuperAdmin(env: Env, userId?: string | number): boolean {
 	if (!userId) return false;
 	const uid = userId.toString().trim();
 	if (!uid) return false;
-
-	const envAdminStr = env.ADMIN_USER_IDS || env.ADMIN_USER_ID || "";
-	const envAdmins = envAdminStr.split(",").map((s: string) => s.trim()).filter(Boolean);
-	return envAdmins.includes(uid);
+	return getSuperAdminIds(env).includes(uid);
 }
 
 export async function isAdmin(env: Env, userId?: string | number): Promise<boolean> {
@@ -176,8 +178,7 @@ export async function getAdmins(env: Env): Promise<{
 	envAdmins: string[];
 	dbAdmins: Array<{ userId: string; userName: string; addedBy: string; createdAt: number }>;
 }> {
-	const envAdminStr = env.ADMIN_USER_IDS || env.ADMIN_USER_ID || "";
-	const envAdmins = envAdminStr.split(",").map((s: string) => s.trim()).filter(Boolean);
+	const envAdmins = getSuperAdminIds(env);
 	try {
 		const res = await withAutoInit(env, () =>
 			env.DB.prepare(

@@ -7,9 +7,6 @@ import { logModelError } from './logModelError';
 import {
 	deleteTelegramMessage,
 	getMessageLink,
-	toSuperscript,
-	processMarkdownLinks,
-	fixLink,
 	sendTelegramRichMessage,
 	editTelegramRichMessage,
 	parseRichMessageResponse,
@@ -18,12 +15,11 @@ import {
 	buildQueryRichBlocks,
 	generateQueryPaginationKeyboard,
 	richBlocksToHtml,
-	normalizeSpacing,
 	splitTelegramMessage,
-	stripMarkdownV2Escapes,
 } from './richFormat';
 import {
 	initWhitelistTables,
+	getSuperAdminIds,
 	isSuperAdmin,
 	isAdmin,
 	isGroupWhitelisted,
@@ -50,11 +46,25 @@ import {
 	getGroupImageLimit,
 } from './storage';
 
-export {
-	toSuperscript,
-	processMarkdownLinks,
-	fixLink,
-};
+function isGroupChat(chat?: { type?: string }): boolean {
+	return Boolean(chat && (chat.type === 'group' || chat.type === 'supergroup' || chat.type?.includes('group')));
+}
+
+function escapeGlobPattern(pattern: string): string {
+	return pattern.replace(/([*?\[\]])/g, '[$1]');
+}
+
+async function sendChatAction(token: string, chatId: string | number, action = 'typing') {
+	try {
+		await fetch(`https://api.telegram.org/bot${token}/sendChatAction`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ chat_id: chatId.toString(), action }),
+		});
+	} catch (e) {
+		console.error('Failed to send chat action:', e);
+	}
+}
 
 const processingUpdates = new Map<number, number>();
 
@@ -90,14 +100,6 @@ function dispatchContent(content: string): { type: "text", text: string } | { ty
 		type: "text",
 		text: content,
 	};
-}
-
-
-function escapeMarkdownV2(text: string) {
-	const reservedChars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
-	const escapedChars = reservedChars.map(char => '\\' + char).join('');
-	const regex = new RegExp(`([${escapedChars}])`, 'g');
-	return text.replace(regex, '\\$1');
 }
 
 export const GROUP_COMMANDS = [
@@ -309,6 +311,10 @@ async function withTemporaryStatus<T>(
 		console.error("Failed to send temporary status message:", e);
 	}
 
+	if (botToken && chatId) {
+		await sendChatAction(botToken, chatId, 'typing');
+	}
+
 	try {
 		return await task();
 	} finally {
@@ -409,8 +415,8 @@ async function saveMessage(env: Env, params: {
 	content: string;
 	groupName: string;
 }) {
-	try {
-		await env.DB.prepare(
+	const doInsert = () =>
+		env.DB.prepare(
 			`INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)`
 		)
 			.bind(
@@ -423,24 +429,15 @@ async function saveMessage(env: Env, params: {
 				params.groupName
 			)
 			.run();
+
+	try {
+		await doInsert();
 	} catch (e: any) {
 		console.error("Failed to save message:", e);
 		if (e?.message && /storage|full|limit/i.test(e.message)) {
 			try {
 				await checkAndEnforceStorageLimit(env, getTelegramToken(env), 300);
-				await env.DB.prepare(
-					`INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)`
-				)
-					.bind(
-						getMessageLink({ groupId: params.groupId, messageId: params.messageId }),
-						params.groupId,
-						Date.now(),
-						params.userName,
-						params.content,
-						params.messageId,
-						params.groupName
-					)
-					.run();
+				await doInsert();
 			} catch (retryErr) {
 				console.error("Retry save message after emergency cleanup failed:", retryErr);
 			}
@@ -468,7 +465,7 @@ function getRoleHelpText(env: Env, userId: string, superAdmin: boolean, admin: b
 			`• /addgroup [群ID] [名称] - 授权群组\n` +
 			`• /delgroup [群ID] - 移出白名单\n` +
 			`• /whitelist - 查看白名单群组列表\n` +
-			`• /addadmin &lt;用户ID&gt; [备注] - 添加免流管理员\n` +
+			`• /addadmin &lt;用户ID&gt; [备注] - 添加管理员\n` +
 			`• /deladmin &lt;用户ID&gt; - 移除管理员\n` +
 			`• /admins - 查看管理员列表\n` +
 			`• /clearmessages [群ID] - 清空指定群组的历史消息记录\n` +
@@ -485,7 +482,7 @@ function getRoleHelpText(env: Env, userId: string, superAdmin: boolean, admin: b
 
 	if (admin) {
 		return `🛡️ <b>【管理员使用指南】</b>\n` +
-			`您已被系统授权为机器人管理员，享有<b>【无限次免流特权】</b>！\n\n` +
+			`您已被系统授权为机器人管理员，享有<b>无限次使用特权</b>！\n\n` +
 			`💬 <b>群聊可用指令：</b>\n` +
 			`• /summary &lt;数量/时间&gt; - 概括群聊消息\n` +
 			`• /ask &lt;问题&gt; - 基于群聊记录提问并回答\n` +
@@ -515,8 +512,7 @@ function getRoleHelpText(env: Env, userId: string, superAdmin: boolean, admin: b
 
 async function requireGroupChat(ctx: any, commandName: string): Promise<boolean> {
 	const chat = ctx.update?.message?.chat;
-	const isGroup = Boolean(chat && (chat.type === 'group' || chat.type === 'supergroup' || chat.type?.includes('group')));
-	if (!isGroup) {
+	if (!isGroupChat(chat)) {
 		await ctx.reply(`⚠️ /${commandName} 指令仅支持在群聊中使用。\n请将机器人添加到群组并由管理员授权后在群内使用。`);
 		return false;
 	}
@@ -527,7 +523,7 @@ async function requireSuperAdmin(ctx: any, env: Env, userId: string): Promise<bo
 	if (isSuperAdmin(env, userId)) {
 		return true;
 	}
-	const isGroup = ctx.update.message?.chat?.type?.includes('group');
+	const isGroup = isGroupChat(ctx.update.message?.chat);
 	if (!isGroup) {
 		await ctx.reply(`❌ 权限不足：仅系统超级管理员可执行该管理指令。\n您的 Telegram 用户 ID 为：${userId}`);
 	}
@@ -536,7 +532,7 @@ async function requireSuperAdmin(ctx: any, env: Env, userId: string): Promise<bo
 
 async function handleAddGroup(ctx: any, env: Env, userId: string, targetGroupId?: string, targetGroupName?: string) {
 	const chat = ctx.update.message?.chat;
-	const isGroup = chat && (chat.type === 'group' || chat.type === 'supergroup');
+	const isGroup = isGroupChat(chat);
 
 	let gid = targetGroupId || "";
 	let gname = targetGroupName || "";
@@ -563,7 +559,7 @@ async function handleAddGroup(ctx: any, env: Env, userId: string, targetGroupId?
 
 async function handleDelGroup(ctx: any, env: Env, targetGroupId?: string) {
 	const chat = ctx.update.message?.chat;
-	const isGroup = chat && (chat.type === 'group' || chat.type === 'supergroup');
+	const isGroup = isGroupChat(chat);
 
 	let gid = targetGroupId || "";
 	if (!gid) {
@@ -635,8 +631,7 @@ async function handleDelAdmin(ctx: any, env: Env, targetUserId?: string) {
 		await ctx.reply("⚠️ 请输入要移除的管理员 Telegram 用户 ID，例如：\n/deladmin 123456789");
 		return;
 	}
-	const envAdminStr = env.ADMIN_USER_IDS || env.ADMIN_USER_ID || "";
-	const envAdmins = envAdminStr.split(",").map((s) => s.trim()).filter(Boolean);
+	const envAdmins = getSuperAdminIds(env);
 	if (envAdmins.includes(targetUserId)) {
 		await ctx.reply(`⚠️ 用户 ${targetUserId} 是环境变量超级管理员，无法通过指令删除。如需移除请在环境变量中修改。`);
 		return;
@@ -736,28 +731,34 @@ export default {
 
 		console.debug(`Scheduled summary: found ${groups.length} active groups.`);
 
-		// 3. 逐个群组生成并推送总结，单群异常不影响其它群
-		for (const group of groups) {
-			try {
-				const { results } = await env.DB.prepare(
-					'SELECT * FROM Messages WHERE groupId=? AND timeStamp >= ? ORDER BY timeStamp ASC'
-				)
-					.bind(group.groupId, Date.now() - 24 * 60 * 60 * 1000)
-					.all();
+		// 3. 逐个群组生成并推送总结，受控并发处理
+		const BATCH_SIZE = 3;
+		for (let i = 0; i < groups.length; i += BATCH_SIZE) {
+			const batch = groups.slice(i, i + BATCH_SIZE);
+			await Promise.all(
+				batch.map(async (group) => {
+					try {
+						const { results } = await env.DB.prepare(
+							'SELECT * FROM Messages WHERE groupId=? AND timeStamp >= ? ORDER BY timeStamp ASC'
+						)
+							.bind(group.groupId, Date.now() - 24 * 60 * 60 * 1000)
+							.all();
 
-				if (!results || results.length === 0) continue;
+						if (!results || results.length === 0) return;
 
-				const { blocks, raw } = await generateSummaryRichMessage(
-					env,
-					results,
-					model,
-					'每日定时总结：过去 24 小时活跃群聊概览'
-				);
+						const { blocks, raw } = await generateSummaryRichMessage(
+							env,
+							results,
+							model,
+							'每日定时总结：过去 24 小时活跃群聊概览'
+						);
 
-				await sendTelegramRichMessage(getTelegramToken(env), group.groupId, blocks, { rawMarkdown: raw });
-			} catch (err) {
-				console.error(`Error processing scheduled summary for group ${group.groupId}:`, err);
-			}
+						await sendTelegramRichMessage(getTelegramToken(env), group.groupId, blocks, { rawMarkdown: raw });
+					} catch (err) {
+						console.error(`Error processing scheduled summary for group ${group.groupId}:`, err);
+					}
+				})
+			);
 		}
 		console.debug("Scheduled cron completed.");
 	},
@@ -766,7 +767,7 @@ export default {
 		if (request.method === "GET") {
 			const url = new URL(request.url);
 			if (url.pathname === "/setcommands") {
-				const adminIds = (env.ADMIN_USER_IDS || "").split(",").map((s) => s.trim()).filter(Boolean);
+				const adminIds = getSuperAdminIds(env);
 				await registerBotCommands(botToken, adminIds);
 				return new Response(JSON.stringify({ ok: true, message: "Commands registered to Telegram", commands: BOT_COMMANDS }), {
 					headers: { "Content-Type": "application/json; charset=utf-8" },
@@ -831,7 +832,7 @@ export default {
 					const messageId = cq.message?.message_id;
 
 					if (cqChatId && messageId && keyword) {
-						const isGroup = cqChat && (cqChat.type === "group" || cqChat.type === "supergroup");
+						const isGroup = isGroupChat(cqChat);
 						if (isGroup && !(await isGroupWhitelisted(env, cqChatId))) {
 							return new Response("ok");
 						}
@@ -840,7 +841,7 @@ export default {
 							SELECT * FROM Messages
 							WHERE groupId = ? AND content NOT LIKE 'data:image%' AND content GLOB ?
 							ORDER BY timeStamp DESC`)
-							.bind(cqChatId, `*${keyword}*`)
+							.bind(cqChatId, `*${escapeGlobPattern(keyword)}*`)
 							.all();
 
 						if (results && results.length > 0) {
@@ -869,7 +870,7 @@ export default {
 
 			const msg = body.message;
 			const chat = msg?.chat;
-			const isGroup = chat && (chat.type === "group" || chat.type === "supergroup");
+			const isGroup = isGroupChat(chat);
 
 			if (isGroup) {
 				const groupId = chat.id.toString();
@@ -914,8 +915,7 @@ export default {
 		const res = await new TelegramBot(botToken)
 			.on('start', async (ctx) => {
 				const chat = ctx.update.message?.chat;
-				const isGroup = Boolean(chat && (chat.type === 'group' || chat.type === 'supergroup' || chat.type?.includes('group')));
-				if (isGroup) {
+				if (isGroupChat(chat)) {
 					return new Response('ok');
 				}
 
@@ -924,8 +924,7 @@ export default {
 			})
 			.on('help', async (ctx) => {
 				const chat = ctx.update.message?.chat;
-				const isGroup = Boolean(chat && (chat.type === 'group' || chat.type === 'supergroup' || chat.type?.includes('group')));
-				if (isGroup) {
+				if (isGroupChat(chat)) {
 					return new Response('ok');
 				}
 
@@ -938,14 +937,13 @@ export default {
 				return new Response('ok');
 			})
 			.on('setcommands', (ctx) => withAdminAuth(ctx, env, async () => {
-				const adminIds = (env.ADMIN_USER_IDS || "").split(",").map((s) => s.trim()).filter(Boolean);
+				const adminIds = getSuperAdminIds(env);
 				await registerBotCommands(botToken, adminIds);
 				await ctx.reply('✅ 已向 Telegram 同步注册指令列表！');
 			}))
 			.on('status', async (ctx) => {
 				const chat = ctx.update.message?.chat;
-				const isGroup = Boolean(chat && (chat.type === "group" || chat.type === "supergroup" || chat.type?.includes("group")));
-				if (isGroup) {
+				if (isGroupChat(chat)) {
 					return new Response('ok');
 				}
 
@@ -988,6 +986,38 @@ export default {
 						}
 					} catch (e: any) {
 						console.error("Failed to get storage stats in /status:", e);
+					}
+				}
+
+				if (superAdmin) {
+					try {
+						const d1Start = Date.now();
+						await env.DB.prepare("SELECT 1").first();
+						const d1Latency = Date.now() - d1Start;
+
+						let aiLatencyText = "未配置";
+						const apiKey = getApiKey(env);
+						const model = getModelName(env);
+						if (apiKey && model) {
+							const aiStart = Date.now();
+							try {
+								const baseUrl = getBaseUrl(env) || "https://api.openai.com/v1";
+								const aiRes = await fetch(`${baseUrl}/models`, {
+									headers: { Authorization: `Bearer ${apiKey}` },
+									signal: AbortSignal.timeout(3000),
+								});
+								const aiLatency = Date.now() - aiStart;
+								aiLatencyText = aiRes.ok ? `正常 (${aiLatency}ms)` : `响应异常 (${aiRes.status}, ${aiLatency}ms)`;
+							} catch (err: any) {
+								aiLatencyText = `连接失败 (${err?.name === "TimeoutError" ? "超时" : "异常"})`;
+							}
+						}
+
+						statusText += `\n⚡ 系统连通性诊断：\n` +
+							`• D1 数据库延迟：${d1Latency}ms\n` +
+							`• AI 接口状态：${aiLatencyText}\n`;
+					} catch (e) {
+						console.error("Failed to run diagnostics in /status:", e);
 					}
 				}
 
@@ -1062,7 +1092,7 @@ export default {
 							SELECT * FROM Messages
 							WHERE groupId = ? AND content NOT LIKE 'data:image%' AND content GLOB ?
 							ORDER BY timeStamp DESC`)
-							.bind(groupId, `*${keyword}*`)
+							.bind(groupId, `*${escapeGlobPattern(keyword)}*`)
 							.all();
 
 						if (!results || results.length === 0) {
@@ -1140,6 +1170,16 @@ export default {
 					return new Response('ok');
 				}
 
+				let replyPromptContext = "";
+				const replyMsg = msg.reply_to_message;
+				if (replyMsg) {
+					const repliedUser = getUserName(replyMsg);
+					const repliedContent = replyMsg.text || (replyMsg.photo ? '[图片]' : '');
+					if (repliedContent) {
+						replyPromptContext = `\n【用户重点追问的引用消息】\n${repliedUser}: ${repliedContent}\n`;
+					}
+				}
+
 				const botToken = getTelegramToken(env);
 				await withTemporaryStatus(
 					(text) => ctx.reply(text),
@@ -1163,7 +1203,7 @@ export default {
 										},
 										{
 											role: "user",
-											content: `问题：${question}`
+											content: `${replyPromptContext}问题：${question}`
 										}
 									],
 									...getCompletionOptions(model, false),
@@ -1343,7 +1383,7 @@ export default {
 				if (!msg || !msg.chat) {
 					return new Response('ok');
 				}
-				if (!msg.chat.type || !msg.chat.type.includes('group')) {
+				if (!isGroupChat(msg.chat)) {
 					await bot.reply('我是群聊总结机器人，请将我添加到群组中使用。\n发送 /help 可查看指令说明。');
 					return new Response('ok');
 				}
@@ -1355,6 +1395,9 @@ export default {
 							return new Response('ok');
 						}
 						let content = msg.text || "";
+						if (content.startsWith('/')) {
+							return new Response('ok');
+						}
 						const replyTo = msg.reply_to_message?.message_id;
 						const fwdSender = getForwardSender(msg);
 						if (fwdSender) {
@@ -1382,16 +1425,17 @@ export default {
 						const groupName = msg.chat.title || "anonymous";
 						const userName = getUserName(msg);
 
+						const MAX_PHOTO_BYTES = 512 * 1024;
 						const candidatePhotos = [...(msg.photo || [])].reverse();
 						let file: ArrayBuffer | null = null;
 
 						for (const p of candidatePhotos) {
-							if (p.file_size && p.file_size > 950 * 1024) {
+							if (p.file_size && p.file_size > MAX_PHOTO_BYTES) {
 								continue;
 							}
 							try {
 								const buf = await bot.getFile(p.file_id).then((response) => response.arrayBuffer());
-								if (buf.byteLength <= 950 * 1024) {
+								if (buf.byteLength <= MAX_PHOTO_BYTES) {
 									file = buf;
 									break;
 								}

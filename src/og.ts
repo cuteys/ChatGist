@@ -1,7 +1,31 @@
+function isPrivateHost(hostname: string): boolean {
+	const h = hostname.toLowerCase().trim();
+	if (h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0') {
+		return true;
+	}
+	const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+	if (m) {
+		const b1 = parseInt(m[1], 10);
+		const b2 = parseInt(m[2], 10);
+		if (b1 === 10 || b1 === 127 || b1 === 0) return true;
+		if (b1 === 169 && b2 === 254) return true;
+		if (b1 === 172 && b2 >= 16 && b2 <= 31) return true;
+		if (b1 === 192 && b2 === 168) return true;
+	}
+	return false;
+}
+
 export async function extractAllOGInfo(url: string): Promise<string> {
 	const ogData = new Map<string, string>();
 	try {
-		// 增加 3 秒超时限制，防止 slow-loris 或超时外链阻塞 Telegram Webhook
+		const parsed = new URL(url);
+		if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+			return url;
+		}
+		if (isPrivateHost(parsed.hostname)) {
+			return url;
+		}
+
 		const response = await fetch(url, {
 			signal: AbortSignal.timeout(3000),
 			headers: {
@@ -12,16 +36,19 @@ export async function extractAllOGInfo(url: string): Promise<string> {
 			return url;
 		}
 
-		// 检查 Content-Type，仅处理 HTML 网页，防止下载超大二进制文件或音视频
 		const contentType = response.headers.get('content-type') || '';
 		if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) {
+			return url;
+		}
+
+		const contentLength = Number(response.headers.get('content-length') || '0');
+		if (contentLength > 2 * 1024 * 1024) {
 			return url;
 		}
 
 		class MetaHandler {
 			element(element: Element) {
 				const propertyValue = element.getAttribute("property");
-				// og
 				if (propertyValue?.startsWith("og:")) {
 					const contentValue = element.getAttribute("content");
 					if (contentValue) {
@@ -29,7 +56,6 @@ export async function extractAllOGInfo(url: string): Promise<string> {
 					}
 					element.remove();
 				}
-				// youtube
 				const name = element.getAttribute("name");
 				const contentValue = element.getAttribute("content");
 

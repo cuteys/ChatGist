@@ -1105,7 +1105,7 @@ export function buildAdminsRichBlocks(
 			blocks: [
 				{
 					type: 'paragraph',
-					text: '超级管理员享有最高管理权限；所有管理员均享有指令无限次【免流特权】。',
+					text: '超级管理员享有最高管理权限；所有管理员均享有指令无限次使用特权。',
 				},
 			],
 		},

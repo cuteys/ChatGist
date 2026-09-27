@@ -1176,7 +1176,167 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			globalThis.fetch = originalFetch;
 		}
 	});
+
+	it('should safely escape glob characters like brackets in /query', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		await testEnv.DB.prepare(
+			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)'
+		)
+			.bind('msg-bracket', groupId, Date.now(), 'Dev', '遇到 [401] 认证错误排查', 601, 'Authorized Group')
+			.run();
+
+		let replied = false;
+		let replyBody: any = null;
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			replied = true;
+			if (init?.body) {
+				try { replyBody = JSON.parse(init.body); } catch (_) {}
+			}
+			return new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 });
+		}) as any;
+
+		try {
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 301,
+					message: {
+						message_id: 602,
+						from: { id: 88888, first_name: 'Alice' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/query [401]',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnv, mockCtx);
+			expect(res.status).toBe(200);
+			expect(replied).toBe(true);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should prioritize replied message context in /ask when reply_to_message is present', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		await testEnv.DB.prepare(
+			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)'
+		)
+			.bind('msg-ask-ref', groupId, Date.now() - 1000, 'Charlie', '配置文件中的 port 设置成了 8080', 701, 'Authorized Group')
+			.run();
+
+		let aiMessages: any[] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/chat/completions')) {
+				const body = JSON.parse(init.body);
+				aiMessages = body.messages;
+				return new Response(
+					JSON.stringify({
+						id: 'chatcmpl-ask-test',
+						choices: [{ index: 0, message: { role: 'assistant', content: '解答内容' }, finish_reason: 'stop' }],
+					}),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
+			return new Response(JSON.stringify({ ok: true, result: { message_id: 999 } }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvWithModel: Env = {
+				...testEnv,
+				AI_MODEL: 'gpt-4o-mini',
+				AI_API_KEY: 'test-key',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 302,
+					message: {
+						message_id: 702,
+						from: { id: 88888, first_name: 'Alice' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/ask 怎么修改？',
+						reply_to_message: {
+							message_id: 701,
+							from: { id: 66666, first_name: 'Charlie' },
+							text: '配置文件中的 port 设置成了 8080',
+						},
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
+			expect(res.status).toBe(200);
+
+			const userPrompt = aiMessages.find((m) => m.role === 'user' && typeof m.content === 'string' && m.content.includes('怎么修改？'));
+			expect(userPrompt).toBeDefined();
+			expect(userPrompt.content).toContain('用户重点追问的引用消息');
+			expect(userPrompt.content).toContain('Charlie: 配置文件中的 port 设置成了 8080');
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should include latency and connectivity diagnostics for superadmin in /status', async () => {
+		const sentMessages: string[] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			sentMessages.push(url);
+			if (url.includes('/models')) {
+				return new Response(JSON.stringify({ data: [] }), { status: 200 });
+			}
+			return new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvSuper: Env = {
+				...testEnv,
+				AI_MODEL: 'gpt-4o-mini',
+				AI_API_KEY: 'test-key',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 303,
+					message: {
+						message_id: 801,
+						from: { id: 10001, first_name: 'SuperAdmin' },
+						chat: { id: 10001, type: 'private' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/status',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvSuper, mockCtx);
+			expect(res.status).toBe(200);
+
+			expect(sentMessages.length).toBeGreaterThan(0);
+			const text = decodeURIComponent(sentMessages.find((u) => u.includes('text=')) || '').replace(/\+/g, ' ');
+			expect(text).toContain('系统连通性诊断');
+			expect(text).toContain('D1 数据库延迟');
+			expect(text).toContain('AI 接口状态');
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
 });
+
 
 
 
