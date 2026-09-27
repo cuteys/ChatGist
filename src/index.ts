@@ -14,6 +14,8 @@ import {
 	buildWhitelistRichBlocks,
 	buildAdminsRichBlocks,
 	buildQueryRichBlocks,
+	generateQueryPaginationKeyboard,
+	richBlocksToHtml,
 	normalizeSpacing,
 	splitTelegramMessage,
 	stripMarkdownV2Escapes,
@@ -79,13 +81,19 @@ function escapeMarkdownV2(text: string) {
 	return text.replace(regex, '\\$1');
 }
 
-export const BOT_COMMANDS = [
+export const GROUP_COMMANDS = [
 	{ command: "summary", description: "概括群聊消息" },
 	{ command: "ask", description: "基于群聊记录提问并回答" },
 	{ command: "query", description: "在群聊历史中检索关键词" },
-	{ command: "quota", description: "查询今日剩余指令使用配额" },
-	{ command: "status", description: "检查运行状态与群组授权" },
+];
+
+export const PRIVATE_COMMANDS = [
+	{ command: "status", description: "检查运行状态与配额" },
 	{ command: "help", description: "查看功能与指令使用帮助" },
+];
+
+export const SUPER_ADMIN_COMMANDS = [
+	...PRIVATE_COMMANDS,
 	{ command: "addgroup", description: "【超管】将当前群或指定群加入白名单" },
 	{ command: "delgroup", description: "【超管】将群组移出白名单" },
 	{ command: "whitelist", description: "【超管】查看已授权白名单群组" },
@@ -96,15 +104,56 @@ export const BOT_COMMANDS = [
 	{ command: "setcommands", description: "【超管】同步更新指令菜单" },
 ];
 
-export async function registerBotCommands(token: string) {
+export const BOT_COMMANDS = [
+	...GROUP_COMMANDS,
+	...PRIVATE_COMMANDS,
+	...SUPER_ADMIN_COMMANDS.slice(PRIVATE_COMMANDS.length),
+];
+
+export async function registerBotCommands(token: string, adminUserIds: string[] = []) {
 	try {
-		const res = await fetch(`https://api.telegram.org/bot${token}/setMyCommands`, {
+		// 1. 群聊菜单：仅群功能指令
+		await fetch(`https://api.telegram.org/bot${token}/setMyCommands`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ commands: BOT_COMMANDS }),
+			body: JSON.stringify({
+				commands: GROUP_COMMANDS,
+				scope: { type: "all_group_chats" },
+			}),
 		});
-		if (!res.ok) {
-			console.error("Failed to register bot commands:", res.status, await res.text());
+
+		// 2. 私聊菜单：/help 与 /status
+		await fetch(`https://api.telegram.org/bot${token}/setMyCommands`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				commands: PRIVATE_COMMANDS,
+				scope: { type: "all_private_chats" },
+			}),
+		});
+
+		// 3. 默认兜底菜单
+		await fetch(`https://api.telegram.org/bot${token}/setMyCommands`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				commands: PRIVATE_COMMANDS,
+				scope: { type: "default" },
+			}),
+		});
+
+		// 4. 超级管理员私聊专属菜单
+		for (const adminId of adminUserIds) {
+			const trimmed = adminId.trim();
+			if (!trimmed) continue;
+			await fetch(`https://api.telegram.org/bot${token}/setMyCommands`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					commands: SUPER_ADMIN_COMMANDS,
+					scope: { type: "chat", chat_id: trimmed },
+				}),
+			});
 		}
 	} catch (e) {
 		console.error("Failed to register bot commands:", e);
@@ -382,9 +431,10 @@ function getRoleHelpText(env: Env, userId: string, superAdmin: boolean, admin: b
 			`💬 <b>群聊常用指令：</b>\n` +
 			`• /summary &lt;数量/时间&gt; - 概括群聊消息\n` +
 			`• /ask &lt;问题&gt; - 基于群聊记录提问并回答\n` +
-			`• /query &lt;关键词&gt; - 检索历史消息\n` +
-			`• /quota - 查看今日剩余配额\n` +
-			`• /status - 检查运行状态与群组授权\n\n` +
+			`• /query &lt;关键词&gt; - 检索历史消息\n\n` +
+			`💬 <b>私聊指令：</b>\n` +
+			`• /status - 检查运行状态与群组存储统计\n` +
+			`• /help - 查看本使用帮助\n\n` +
 			`ℹ️ 您的 Telegram 用户 ID 为：<code>${userId}</code>`;
 	}
 
@@ -394,27 +444,28 @@ function getRoleHelpText(env: Env, userId: string, superAdmin: boolean, admin: b
 			`💬 <b>群聊可用指令：</b>\n` +
 			`• /summary &lt;数量/时间&gt; - 概括群聊消息\n` +
 			`• /ask &lt;问题&gt; - 基于群聊记录提问并回答\n` +
-			`• /query &lt;关键词&gt; - 检索群聊历史消息\n` +
-			`• /quota - 查看指令免流特权状态\n` +
-			`• /status - 检查运行状态与群组授权\n` +
+			`• /query &lt;关键词&gt; - 检索群聊历史消息\n\n` +
+			`💬 <b>私聊指令：</b>\n` +
+			`• /status - 检查运行状态与群组存储统计\n` +
 			`• /help - 查看本使用帮助\n\n` +
 			`ℹ️ 您的 Telegram 用户 ID 为：<code>${userId}</code>`;
 	}
 
 	return `📖 <b>【ChatGist 群聊助手使用指南】</b>\n` +
 		`欢迎使用群聊智能总结与检索助手！\n\n` +
-		`💬 <b>可用群聊指令：</b>\n` +
+		`💬 <b>群聊功能指令：</b>\n` +
 		`• /summary &lt;数量/时间&gt; - 概括近期群聊重点，每日限 5 次\n` +
 		`• /ask &lt;问题&gt; - 基于近期群聊记录回答，每日限 5 次\n` +
-		`• /query &lt;关键词&gt; - 检索群聊历史消息，每日限 20 次\n` +
-		`• /quota - 快速查看今日剩余配额\n` +
-		`• /status - 检查机器人运行状态及群组授权\n` +
+		`• /query &lt;关键词&gt; - 检索群聊历史消息，每日限 20 次\n\n` +
+		`💬 <b>私聊指令：</b>\n` +
+		`• /status - 检查机器人运行状态与个人今日配额\n` +
 		`• /help - 查看本指令使用指南\n\n` +
 		`ℹ️ <b>使用须知：</b>\n` +
 		`1. 您的 Telegram 用户 ID 为：<code>${userId}</code>\n` +
 		`2. 机器人仅在管理员授权的白名单群组中记录与响应；\n` +
 		`3. /summary、/ask、/query 仅限在授权群聊中使用；\n` +
-		`4. 每日使用额度于北京时间 00:00 自动刷新。`;
+		`4. /status、/help 仅限在私信中使用；\n` +
+		`5. 每日使用额度于北京时间 00:00 自动刷新。`;
 }
 
 async function requireGroupChat(ctx: any, commandName: string): Promise<boolean> {
@@ -670,7 +721,8 @@ export default {
 		if (request.method === "GET") {
 			const url = new URL(request.url);
 			if (url.pathname === "/setcommands") {
-				await registerBotCommands(botToken);
+				const adminIds = (env.ADMIN_USER_IDS || "").split(",").map((s) => s.trim()).filter(Boolean);
+				await registerBotCommands(botToken, adminIds);
 				return new Response(JSON.stringify({ ok: true, message: "Commands registered to Telegram", commands: BOT_COMMANDS }), {
 					headers: { "Content-Type": "application/json; charset=utf-8" },
 				});
@@ -700,6 +752,75 @@ export default {
 
 			if (!body?.message && body?.edited_message) {
 				body.message = body.edited_message;
+			}
+
+			if (body?.callback_query) {
+				const cq = body.callback_query;
+				const data = cq.data || "";
+				const cqId = cq.id;
+
+				try {
+					await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({ callback_query_id: cqId }),
+					});
+				} catch (err) {
+					console.error("Failed to answer callback query:", err);
+				}
+
+				if (data === "noop") {
+					return new Response("ok");
+				}
+
+				if (data.startsWith("qp:")) {
+					const [, pageStr, ...kwParts] = data.split(":");
+					const page = parseInt(pageStr, 10) || 1;
+					const keyword = kwParts.join(":");
+					const cqChat = cq.message?.chat;
+					const cqChatId = cqChat?.id?.toString() || "";
+					const messageId = cq.message?.message_id;
+
+					if (cqChatId && messageId && keyword) {
+						const isGroup = cqChat && (cqChat.type === "group" || cqChat.type === "supergroup");
+						if (isGroup && !(await isGroupWhitelisted(env, cqChatId))) {
+							return new Response("ok");
+						}
+
+						const { results } = await env.DB.prepare(`
+							SELECT * FROM Messages
+							WHERE groupId = ? AND content NOT LIKE 'data:image%' AND content GLOB ?
+							ORDER BY timeStamp DESC`)
+							.bind(cqChatId, `*${keyword}*`)
+							.all();
+
+						if (results && results.length > 0) {
+							const PAGE_SIZE = 6;
+							const totalPages = Math.ceil(results.length / PAGE_SIZE);
+							const clampedPage = Math.max(1, Math.min(page, totalPages));
+							const pageResults = results.slice((clampedPage - 1) * PAGE_SIZE, clampedPage * PAGE_SIZE);
+
+							const blocks = buildQueryRichBlocks(keyword, results.length, pageResults, clampedPage, PAGE_SIZE);
+							const htmlText = richBlocksToHtml(blocks);
+							const replyMarkup = generateQueryPaginationKeyboard(keyword, clampedPage, totalPages);
+
+							await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
+								method: "POST",
+								headers: { "Content-Type": "application/json" },
+								body: JSON.stringify({
+									chat_id: cqChatId,
+									message_id: messageId,
+									text: htmlText,
+									parse_mode: "HTML",
+									disable_web_page_preview: true,
+									reply_markup: replyMarkup,
+								}),
+							});
+						}
+					}
+				}
+
+				return new Response("ok");
 			}
 
 			if (!body?.message) {
@@ -759,7 +880,6 @@ export default {
 				const chat = ctx.update.message?.chat;
 				const isGroup = Boolean(chat && (chat.type === 'group' || chat.type === 'supergroup' || chat.type?.includes('group')));
 				if (isGroup) {
-					await ctx.reply('👋 你好！我是 ChatGist 群聊智能总结助手。\n在群内发送 /summary 可概括消息，/help 查看详细帮助。');
 					return new Response('ok');
 				}
 
@@ -769,58 +889,41 @@ export default {
 			.on('help', async (ctx) => {
 				const chat = ctx.update.message?.chat;
 				const isGroup = Boolean(chat && (chat.type === 'group' || chat.type === 'supergroup' || chat.type?.includes('group')));
+				if (isGroup) {
+					return new Response('ok');
+				}
+
 				const userId = ctx.update.message?.from?.id?.toString() || "";
 				const superAdmin = isSuperAdmin(env, userId);
 				const admin = await isAdmin(env, userId);
 				const helpText = getRoleHelpText(env, userId, superAdmin, admin);
 
-				if (isGroup) {
-					let sentToPm = false;
-					try {
-						const pmRes = await ctx.api.sendMessage(ctx.bot.api.toString(), {
-							chat_id: userId,
-							parse_mode: "HTML",
-							text: helpText,
-						} as any);
-						sentToPm = Boolean(pmRes?.ok);
-					} catch (e) {
-						sentToPm = false;
-					}
-
-					if (sentToPm) {
-						await ctx.reply("📖 完整使用指南已私聊发送给您，请查看私聊消息（避免群内刷屏）。");
-					} else {
-						await ctx.reply("📖 为避免群内长消息刷屏，使用指南需在私聊中查看。\n👉 请先私聊机器人发送 /start，然后发送 /help 获取完整说明。");
-					}
-					return new Response('ok');
-				}
-
 				await ctx.reply(helpText, "HTML");
 				return new Response('ok');
 			})
 			.on('setcommands', (ctx) => withAdminAuth(ctx, env, async () => {
-				await registerBotCommands(botToken);
+				const adminIds = (env.ADMIN_USER_IDS || "").split(",").map((s) => s.trim()).filter(Boolean);
+				await registerBotCommands(botToken, adminIds);
 				await ctx.reply('✅ 已向 Telegram 同步注册指令列表！');
 			}))
 			.on('status', async (ctx) => {
 				const chat = ctx.update.message?.chat;
-				const isGroup = chat && (chat.type === "group" || chat.type === "supergroup");
+				const isGroup = Boolean(chat && (chat.type === "group" || chat.type === "supergroup" || chat.type?.includes("group")));
+				if (isGroup) {
+					return new Response('ok');
+				}
+
 				const userId = ctx.update.message?.from?.id?.toString() || "";
 				const superAdmin = isSuperAdmin(env, userId);
 				const admin = await isAdmin(env, userId);
 
 				let statusText = '🤖 机器人运行状态正常\n';
 				if (superAdmin) {
-					statusText += '👑 身份：系统超级管理员（无限制）\n';
+					statusText += '👑 身份：系统超级管理员\n';
 				} else if (admin) {
-					statusText += '🛡️ 身份：数据库管理员（无使用次数限制）\n';
+					statusText += '🛡️ 身份：数据库管理员\n';
 				} else {
 					statusText += '👤 身份：普通用户\n';
-				}
-
-				if (isGroup) {
-					const whitelisted = await isGroupWhitelisted(env, chat.id.toString());
-					statusText += whitelisted ? '📍 当前群组：已授权（白名单）\n' : '📍 当前群组：未授权\n';
 				}
 
 				if (admin) {
@@ -860,25 +963,7 @@ export default {
 						`• 检索 (/query): ${quota.query.current}/${quota.query.limit} 次`;
 				}
 
-				const res = (await ctx.reply(statusText))!;
-				if (!res.ok) {
-					console.error(`Error sending message:`, res);
-				}
-				return new Response('ok');
-			})
-			.on('quota', async (ctx) => {
-				const userId = ctx.update.message?.from?.id?.toString() || "";
-				const admin = await isAdmin(env, userId);
-				if (admin) {
-					await ctx.reply("🛡️ 您享有【无限次免流特权】，使用 /summary、/ask、/query 无任何调用频次限制。");
-					return new Response('ok');
-				}
-				const quota = await getUserQuotaStatus(env, userId);
-				const text = `📊 今日使用配额（次日 00:00 自动刷新）：\n` +
-					`• 总结 (/summary): ${quota.summary.current}/${quota.summary.limit} 次\n` +
-					`• 问答 (/ask): ${quota.ask.current}/${quota.ask.limit} 次\n` +
-					`• 检索 (/query): ${quota.query.current}/${quota.query.limit} 次`;
-				await ctx.reply(text);
+				await ctx.reply(statusText);
 				return new Response('ok');
 			})
 			.on('addgroup', (ctx) => withAdminAuth(ctx, env, (uid, parts) => handleAddGroup(ctx, env, uid, parts[0], parts.slice(1).join(" "))))
@@ -940,8 +1025,7 @@ export default {
 						const { results } = await env.DB.prepare(`
 							SELECT * FROM Messages
 							WHERE groupId = ? AND content NOT LIKE 'data:image%' AND content GLOB ?
-							ORDER BY timeStamp DESC
-							LIMIT 50`)
+							ORDER BY timeStamp DESC`)
 							.bind(groupId, `*${keyword}*`)
 							.all();
 
@@ -950,30 +1034,27 @@ export default {
 							return;
 						}
 
-						const blocks = buildQueryRichBlocks(keyword, results.length, results);
-						const richRes = await sendTelegramRichMessage(botToken, groupId, blocks);
+						const PAGE_SIZE = 6;
+						const totalPages = Math.ceil(results.length / PAGE_SIZE);
+						const pageResults = results.slice(0, PAGE_SIZE);
+
+						const blocks = buildQueryRichBlocks(keyword, results.length, pageResults, 1, PAGE_SIZE);
+						const replyMarkup = generateQueryPaginationKeyboard(keyword, 1, totalPages);
+						const richRes = await sendTelegramRichMessage(botToken, groupId, blocks, { replyMarkup });
 
 						if (!richRes.ok) {
-							const MAX_DISPLAY = 15;
-							const displayList = results.slice(0, MAX_DISPLAY);
-							let outputLines = [`🔍 关键词【${keyword}】检索结果（共找到 ${results.length} 条）：\n`];
-							for (const r of displayList as any[]) {
-								const contentPreview = r.content.length > 80 ? r.content.slice(0, 80) + '...' : r.content;
-								const link = r.messageId ? ` [链接](${getMessageLink(r)})` : '';
-								outputLines.push(`• ${r.userName}：${contentPreview}${link}`);
-							}
-							if (results.length > MAX_DISPLAY) {
-								outputLines.push(`\nℹ️ 结果较多，仅展示最近 ${MAX_DISPLAY} 条记录。`);
-							}
-
-							const responseText = normalizeSpacing(outputLines.join('\n'));
-							const chunks = splitTelegramMessage(escapeMarkdownV2(responseText));
-							for (const chunk of chunks) {
-								const res = await ctx.reply(chunk, "MarkdownV2");
-								if (!res?.ok) {
-									await ctx.reply(stripMarkdownV2Escapes(chunk));
-								}
-							}
+							const htmlText = richBlocksToHtml(blocks);
+							await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+								method: "POST",
+								headers: { "Content-Type": "application/json" },
+								body: JSON.stringify({
+									chat_id: groupId,
+									text: htmlText,
+									parse_mode: "HTML",
+									disable_web_page_preview: true,
+									reply_markup: replyMarkup,
+								}),
+							});
 						}
 					}
 				);

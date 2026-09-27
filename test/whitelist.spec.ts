@@ -212,7 +212,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 		}
 	});
 
-	it('should send help to PM and notify group when /help triggered in whitelisted group', async () => {
+	it('should silently ignore /help when triggered in group chat', async () => {
 		const groupId = '-100888888';
 		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
 
@@ -245,20 +245,13 @@ describe('Worker fetch whitelist gatekeeping', () => {
 
 			const res = await worker.fetch(req, testEnv, mockCtx);
 			expect(res.status).toBe(200);
-
-			// Should have sent 2 messages:
-			// 1. PM to userId 55555 with full guide
-			// 2. Reply in group with concise prompt avoiding spam
-			expect(sentMessages.length).toBe(2);
-			expect(sentMessages[0]).toContain('chat_id=55555');
-			expect(sentMessages[1]).toContain(`chat_id=${groupId}`);
-			expect(decodeURIComponent(sentMessages[1])).toContain('完整使用指南已私聊发送给您');
+			expect(sentMessages.length).toBe(0);
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
 	});
 
-	it('should guide user to PM when /help PM fails in whitelisted group', async () => {
+	it('should silently ignore /status when triggered in group chat', async () => {
 		const groupId = '-100888888';
 		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
 
@@ -267,13 +260,6 @@ describe('Worker fetch whitelist gatekeeping', () => {
 		globalThis.fetch = (async (input: any, init?: any) => {
 			const url = typeof input === 'string' ? input : input.url;
 			sentMessages.push(url);
-			// Simulate PM failure (user hasn't started bot)
-			if (url.includes('chat_id=55555')) {
-				return new Response(JSON.stringify({ ok: false, error_code: 403, description: 'Forbidden' }), {
-					status: 403,
-					headers: { 'Content-Type': 'application/json' },
-				});
-			}
 			return new Response(JSON.stringify({ ok: true, result: {} }), {
 				status: 200,
 				headers: { 'Content-Type': 'application/json' },
@@ -291,19 +277,14 @@ describe('Worker fetch whitelist gatekeeping', () => {
 						from: { id: 55555, first_name: 'Bob' },
 						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
 						date: Math.floor(Date.now() / 1000),
-						text: '/help',
+						text: '/status',
 					},
 				}),
 			});
 
 			const res = await worker.fetch(req, testEnv, mockCtx);
 			expect(res.status).toBe(200);
-
-			// First tried PM, then replied in group guiding user to PM
-			expect(sentMessages.length).toBe(2);
-			expect(sentMessages[0]).toContain('chat_id=55555');
-			expect(sentMessages[1]).toContain(`chat_id=${groupId}`);
-			expect(decodeURIComponent(sentMessages[1])).toContain('为避免群内长消息刷屏');
+			expect(sentMessages.length).toBe(0);
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
@@ -340,7 +321,6 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			const res = await worker.fetch(req, testEnv, mockCtx);
 			expect(res.status).toBe(200);
 
-			// Direct reply in private chat with full guide
 			expect(sentMessages.length).toBe(1);
 			expect(sentMessages[0]).toContain('chat_id=55555');
 			expect(decodeURIComponent(sentMessages[0]).replace(/\+/g, ' ')).toContain('ChatGist 群聊助手使用指南');
@@ -349,7 +329,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 		}
 	});
 
-	it('should send concise welcome greeting when /start is used in group chat', async () => {
+	it('should silently ignore /start when triggered in group chat', async () => {
 		const groupId = '-100888888';
 		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
 
@@ -382,12 +362,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 
 			const res = await worker.fetch(req, testEnv, mockCtx);
 			expect(res.status).toBe(200);
-
-			expect(sentMessages.length).toBe(1);
-			const decoded = decodeURIComponent(sentMessages[0]).replace(/\+/g, ' ');
-			expect(decoded).toContain('我是 ChatGist 群聊智能总结助手');
-			expect(decoded).not.toContain('【超级管理员使用指南】');
-			expect(decoded).not.toContain('【ChatGist 群聊助手使用指南】');
+			expect(sentMessages.length).toBe(0);
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
@@ -433,7 +408,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 		}
 	});
 
-	it('should respond to /quota command with usage information', async () => {
+	it('should respond to /status in private chat with quota and status information', async () => {
 		const sentMessages: any[] = [];
 		const originalFetch = globalThis.fetch;
 		globalThis.fetch = (async (input: any, init?: any) => {
@@ -456,7 +431,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 						from: { id: 66666, first_name: 'Charlie' },
 						chat: { id: 66666, type: 'private' },
 						date: Math.floor(Date.now() / 1000),
-						text: '/quota',
+						text: '/status',
 					},
 				}),
 			});
@@ -920,6 +895,154 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			.bind(groupId)
 			.first<number>('cnt');
 		expect(countAfter).toBe(0);
+	});
+
+	it('should support pagination and replyMarkup in /query for > 6 messages', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		// Insert 8 matching messages
+		for (let i = 1; i <= 8; i++) {
+			await testEnv.DB.prepare(
+				'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)'
+			)
+				.bind(`query-msg-${i}`, groupId, Date.now() - i * 1000, `User${i}`, `发布版本更新测试记录 ${i}`, i, 'Authorized Group')
+				.run();
+		}
+
+		let sentPayload: any = null;
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/sendRichMessage') || url.includes('/sendMessage')) {
+				if (init?.body) {
+					try { sentPayload = JSON.parse(init.body); } catch (_) {}
+				}
+			}
+			return new Response(JSON.stringify({ ok: true, result: { message_id: 1111 } }), { status: 200 });
+		}) as any;
+
+		try {
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 201,
+					message: {
+						message_id: 501,
+						from: { id: 88888, first_name: 'Alice' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/query 版本更新',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnv, mockCtx);
+			expect(res.status).toBe(200);
+			expect(sentPayload).toBeDefined();
+			expect(sentPayload.reply_markup?.inline_keyboard).toBeDefined();
+			expect(sentPayload.reply_markup.inline_keyboard[0].map((b: any) => b.text)).toEqual(['【1】', '2']);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should handle callback_query pagination and edit message in-place', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		// Insert matching messages
+		for (let i = 1; i <= 8; i++) {
+			await testEnv.DB.prepare(
+				'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)'
+			)
+				.bind(`cq-msg-${i}`, groupId, Date.now() - i * 1000, `User${i}`, `发布版本更新测试记录 ${i}`, i, 'Authorized Group')
+				.run();
+		}
+
+		let answeredCqId = '';
+		let editPayload: any = null;
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/answerCallbackQuery')) {
+				const body = JSON.parse(init?.body || '{}');
+				answeredCqId = body.callback_query_id;
+			}
+			if (url.includes('/editMessageText')) {
+				editPayload = JSON.parse(init?.body || '{}');
+			}
+			return new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 });
+		}) as any;
+
+		try {
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 202,
+					callback_query: {
+						id: 'cq-12345',
+						from: { id: 88888, first_name: 'Alice' },
+						message: {
+							message_id: 1111,
+							chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						},
+						data: 'qp:2:版本更新',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnv, mockCtx);
+			expect(res.status).toBe(200);
+			expect(answeredCqId).toBe('cq-12345');
+			expect(editPayload).toBeDefined();
+			expect(editPayload.message_id).toBe(1111);
+			expect(editPayload.reply_markup?.inline_keyboard[0].map((b: any) => b.text)).toEqual(['1', '【2】']);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should register commands with separate scopes on /setcommands', async () => {
+		const commandsCalls: any[] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/setMyCommands')) {
+				commandsCalls.push(JSON.parse(init?.body || '{}'));
+			}
+			return new Response(JSON.stringify({ ok: true }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvAdmin: Env = {
+				...testEnv,
+				ADMIN_USER_IDS: '10001,10002',
+			};
+
+			const req = new Request('https://chatgist.example.com/setcommands', { method: 'GET' });
+			const res = await worker.fetch(req, testEnvAdmin, mockCtx);
+			expect(res.status).toBe(200);
+
+			expect(commandsCalls.length).toBe(5);
+
+			const groupCall = commandsCalls.find((c) => c.scope?.type === 'all_group_chats');
+			expect(groupCall).toBeDefined();
+			expect(groupCall.commands.map((c: any) => c.command)).toEqual(['summary', 'ask', 'query']);
+
+			const privateCall = commandsCalls.find((c) => c.scope?.type === 'all_private_chats');
+			expect(privateCall).toBeDefined();
+			expect(privateCall.commands.map((c: any) => c.command)).toEqual(['status', 'help']);
+
+			const adminCall = commandsCalls.find((c) => c.scope?.type === 'chat' && c.scope?.chat_id === '10001');
+			expect(adminCall).toBeDefined();
+			expect(adminCall.commands.some((c: any) => c.command === 'addgroup')).toBe(true);
+			expect(adminCall.commands.some((c: any) => c.command === 'clearmessages')).toBe(true);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
 	});
 });
 

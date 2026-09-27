@@ -192,6 +192,34 @@ describe('richFormat tests', () => {
 		expect(linkCell.text[0].url).toBe('https://t.me/c/123456789/42');
 	});
 
+	it('generates dual-row pagination keyboard correctly for query results', async () => {
+		const { generateQueryPaginationKeyboard } = await import('../src/richFormat');
+
+		// 1. Single page -> no keyboard
+		expect(generateQueryPaginationKeyboard('test', 1, 1)).toBeUndefined();
+
+		// 2. 3 pages, on page 1
+		const kb3 = generateQueryPaginationKeyboard('test', 1, 3);
+		expect(kb3).toBeDefined();
+		expect(kb3!.inline_keyboard.length).toBe(2);
+		expect(kb3!.inline_keyboard[0].map((b) => b.text)).toEqual(['【1】', '2', '3']);
+		expect(kb3!.inline_keyboard[0][0].callback_data).toBe('noop');
+		expect(kb3!.inline_keyboard[0][1].callback_data).toBe('qp:2:test');
+		expect(kb3!.inline_keyboard[1][0].text).toBe('⬅️ 上一页');
+		expect(kb3!.inline_keyboard[1][0].callback_data).toBe('noop'); // disabled on page 1
+		expect(kb3!.inline_keyboard[1][1].text).toBe('下一页 ➡️');
+		expect(kb3!.inline_keyboard[1][1].callback_data).toBe('qp:2:test');
+
+		// 3. 10 pages, on page 2 (matches user reference image: 1 【2】 3 4 ... 10)
+		const kb10 = generateQueryPaginationKeyboard('deploy', 2, 10);
+		expect(kb10).toBeDefined();
+		expect(kb10!.inline_keyboard[0].map((b) => b.text)).toEqual(['1', '【2】', '3', '4', '...', '10']);
+		expect(kb10!.inline_keyboard[0][1].callback_data).toBe('noop');
+		expect(kb10!.inline_keyboard[0][4].callback_data).toBe('noop'); // ellipsis
+		expect(kb10!.inline_keyboard[1][0].callback_data).toBe('qp:1:deploy');
+		expect(kb10!.inline_keyboard[1][1].callback_data).toBe('qp:3:deploy');
+	});
+
 	it('sends Telegram Rich Message and handles graceful fallback', async () => {
 		const { sendTelegramRichMessage } = await import('../src/richFormat');
 

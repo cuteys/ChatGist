@@ -1139,38 +1139,38 @@ export function buildAdminsRichBlocks(
 export function buildQueryRichBlocks(
 	keyword: string,
 	totalCount: number,
-	results: any[],
-	maxDisplay = 15
+	pageResults: any[],
+	page = 1,
+	pageSize = 6
 ): RichBlock[] {
-	const displayList = results.slice(0, maxDisplay);
-
 	const tableRows: RichTableCell[][] = [
 		[
 			{ text: '#', is_header: true, align: 'center', valign: 'middle' },
 			{ text: '👤 发言人', is_header: true, align: 'left', valign: 'middle' },
-			{ text: '💬 消息内容（点击直达原文）', is_header: true, align: 'left', valign: 'middle' },
+			{ text: '💬 消息内容', is_header: true, align: 'left', valign: 'middle' },
 		],
 	];
 
-	displayList.forEach((r, idx) => {
-		const rawContent = r.content || '';
-		const preview = rawContent.length > 50 ? rawContent.slice(0, 50) + '...' : rawContent;
+	pageResults.forEach((r, idx) => {
+		const globalIdx = (page - 1) * pageSize + idx + 1;
+		const rawContent = (r.content || '').replace(/\s+/g, ' ').trim();
+		const preview = rawContent.length > 24 ? rawContent.slice(0, 24) + '...' : (rawContent || '-');
 		const link = r.messageId ? getMessageLink(r) : '';
 
 		tableRows.push([
-			{ text: `${idx + 1}`, align: 'center', valign: 'middle' },
+			{ text: `${globalIdx}`, align: 'center', valign: 'middle' },
 			{ text: { type: 'bold', text: r.userName || '匿名' }, align: 'left', valign: 'middle' },
 			{
 				text: link
-					? [{ type: 'url', text: preview || '查看原文', url: link }]
-					: preview || '-',
+					? [{ type: 'url', text: preview, url: link }]
+					: preview,
 				align: 'left',
 				valign: 'middle',
 			},
 		]);
 	});
 
-	const blocks: RichBlock[] = [
+	return [
 		{
 			type: 'blockquote',
 			blocks: [
@@ -1185,29 +1185,81 @@ export function buildQueryRichBlocks(
 			],
 		},
 		{
-			type: 'heading',
-			size: 2,
-			text: `📋 历史消息检索结果`,
-		},
-		{
 			type: 'table',
 			is_bordered: true,
 			is_striped: true,
 			cells: tableRows,
 		},
 	];
+}
 
-	if (totalCount > maxDisplay) {
-		blocks.push({
-			type: 'paragraph',
-			text: `ℹ️ 结果较多，当前展示最近 ${maxDisplay} 条记录。点击表格中的消息内容可直接定位原消息。`,
-		});
+export function generateQueryPaginationKeyboard(
+	keyword: string,
+	currentPage: number,
+	totalPages: number
+): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } | undefined {
+	if (totalPages <= 1) return undefined;
+
+	const safeKeyword = keyword.slice(0, 15);
+	const row1: Array<{ text: string; callback_data: string }> = [];
+
+	if (totalPages <= 5) {
+		for (let i = 1; i <= totalPages; i++) {
+			row1.push({
+				text: i === currentPage ? `【${i}】` : `${i}`,
+				callback_data: i === currentPage ? 'noop' : `qp:${i}:${safeKeyword}`,
+			});
+		}
 	} else {
-		blocks.push({
-			type: 'paragraph',
-			text: '💡 点击表格中的消息内容可直接在群聊中跳转至具体消息位置。',
+		row1.push({
+			text: currentPage === 1 ? `【1】` : '1',
+			callback_data: currentPage === 1 ? 'noop' : `qp:1:${safeKeyword}`,
+		});
+
+		let start = Math.max(2, currentPage - 1);
+		let end = Math.min(totalPages - 1, currentPage + 1);
+
+		if (currentPage <= 3) {
+			start = 2;
+			end = 4;
+		} else if (currentPage >= totalPages - 2) {
+			start = totalPages - 3;
+			end = totalPages - 1;
+		}
+
+		if (start > 2) {
+			row1.push({ text: '...', callback_data: 'noop' });
+		}
+
+		for (let i = start; i <= end; i++) {
+			row1.push({
+				text: i === currentPage ? `【${i}】` : `${i}`,
+				callback_data: i === currentPage ? 'noop' : `qp:${i}:${safeKeyword}`,
+			});
+		}
+
+		if (end < totalPages - 1) {
+			row1.push({ text: '...', callback_data: 'noop' });
+		}
+
+		row1.push({
+			text: currentPage === totalPages ? `【${totalPages}】` : `${totalPages}`,
+			callback_data: currentPage === totalPages ? 'noop' : `qp:${totalPages}:${safeKeyword}`,
 		});
 	}
 
-	return blocks;
+	const row2: Array<{ text: string; callback_data: string }> = [
+		{
+			text: '⬅️ 上一页',
+			callback_data: currentPage > 1 ? `qp:${currentPage - 1}:${safeKeyword}` : 'noop',
+		},
+		{
+			text: '下一页 ➡️',
+			callback_data: currentPage < totalPages ? `qp:${currentPage + 1}:${safeKeyword}` : 'noop',
+		},
+	];
+
+	return {
+		inline_keyboard: [row1, row2],
+	};
 }
