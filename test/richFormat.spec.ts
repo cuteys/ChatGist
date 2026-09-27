@@ -397,4 +397,69 @@ describe('richFormat tests', () => {
 		expect(parsedLinkBold.text.text).toBe('方案B');
 		expect(parsedLinkBold.url).toBe('https://t.me/c/1/3');
 	});
+
+	it('edits Telegram Rich Message and handles graceful fallback', async () => {
+		const { editTelegramRichMessage } = await import('../src/richFormat');
+		const originalFetch = globalThis.fetch;
+		const calls: Array<{ url: string; body: any }> = [];
+
+		globalThis.fetch = (async (url: any, init?: any) => {
+			const body = JSON.parse(init?.body || '{}');
+			calls.push({ url: url.toString(), body });
+			return new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 });
+		}) as any;
+
+		try {
+			const res = await editTelegramRichMessage('test_token', '-100123', 999, [
+				{ type: 'paragraph', text: 'Edit rich message test' },
+			]);
+			expect(res.ok).toBe(true);
+			expect(calls.length).toBe(1);
+			expect(calls[0].url).toContain('/editMessageText');
+			expect(calls[0].body.rich_message).toBeDefined();
+			expect(calls[0].body.message_id).toBe(999);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('strips reply link prefix cleanly in buildQueryRichBlocks', async () => {
+		const { buildQueryRichBlocks } = await import('../src/richFormat');
+		const results = [
+			{
+				userName: 'UserA',
+				content: '回复 https://t.me/c/12345678/100: 这是实际回复的消息内容',
+				messageId: 201,
+				groupId: '-10012345678',
+			},
+			{
+				userName: 'UserB',
+				content: '回复 https://t.me/c/12345678/101: ',
+				messageId: 202,
+				groupId: '-10012345678',
+			},
+			{
+				userName: 'UserC',
+				content: '普通无需处理的消息',
+				messageId: 203,
+				groupId: '-10012345678',
+			},
+		];
+
+		const blocks = buildQueryRichBlocks('关键词', 3, results, 1, 6);
+		const table = blocks.find((b) => b.type === 'table') as any;
+		expect(table).toBeDefined();
+
+		// Check row 1 (stripped)
+		const row1Cell = table.cells[1][2].text[0];
+		expect(row1Cell.text).toBe('这是实际回复的消息内容');
+
+		// Check row 2 (empty body after reply)
+		const row2Cell = table.cells[2][2].text[0];
+		expect(row2Cell.text).toBe('[回复消息]');
+
+		// Check row 3 (normal text)
+		const row3Cell = table.cells[3][2].text[0];
+		expect(row3Cell.text).toBe('普通无需处理的消息');
+	});
 });

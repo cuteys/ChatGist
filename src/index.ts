@@ -11,6 +11,7 @@ import {
 	processMarkdownLinks,
 	fixLink,
 	sendTelegramRichMessage,
+	editTelegramRichMessage,
 	parseRichMessageResponse,
 	buildWhitelistRichBlocks,
 	buildAdminsRichBlocks,
@@ -823,21 +824,8 @@ export default {
 							const pageResults = results.slice((clampedPage - 1) * PAGE_SIZE, clampedPage * PAGE_SIZE);
 
 							const blocks = buildQueryRichBlocks(keyword, results.length, pageResults, clampedPage, PAGE_SIZE);
-							const htmlText = richBlocksToHtml(blocks);
 							const replyMarkup = generateQueryPaginationKeyboard(keyword, clampedPage, totalPages);
-
-							await fetch(`https://api.telegram.org/bot${botToken}/editMessageText`, {
-								method: "POST",
-								headers: { "Content-Type": "application/json" },
-								body: JSON.stringify({
-									chat_id: cqChatId,
-									message_id: messageId,
-									text: htmlText,
-									parse_mode: "HTML",
-									disable_web_page_preview: true,
-									reply_markup: replyMarkup,
-								}),
-							});
+							await editTelegramRichMessage(botToken, cqChatId, messageId, blocks, { replyMarkup });
 						}
 					}
 				}

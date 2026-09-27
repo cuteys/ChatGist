@@ -935,6 +935,79 @@ export async function sendTelegramRichMessage(
 	return { ok: allOk };
 }
 
+export async function editTelegramRichMessage(
+	token: string,
+	chatId: string | number,
+	messageId: number,
+	blocks: RichBlock[],
+	options: {
+		replyMarkup?: any;
+	} = {}
+): Promise<{ ok: boolean; status?: number; error?: string }> {
+	if (!token) {
+		console.warn('editTelegramRichMessage: TELEGRAM_BOT_TOKEN is not set.');
+		return { ok: false, error: 'No token' };
+	}
+
+	const basePayload: any = {
+		chat_id: chatId.toString(),
+		message_id: messageId,
+		rich_message: {
+			blocks,
+		},
+	};
+	if (options.replyMarkup) {
+		basePayload.reply_markup = options.replyMarkup;
+	}
+
+	try {
+		const res = await fetch(`https://api.telegram.org/bot${token}/editMessageText`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(basePayload),
+		});
+		if (res.ok) {
+			return { ok: true, status: res.status };
+		}
+	} catch (e) {
+		console.warn('editMessageText (rich_message) network exception:', e);
+	}
+
+	try {
+		const res = await fetch(`https://api.telegram.org/bot${token}/editRichMessage`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(basePayload),
+		});
+		if (res.ok) {
+			return { ok: true, status: res.status };
+		}
+	} catch {}
+
+	try {
+		const htmlText = richBlocksToHtml(blocks);
+		const res = await fetch(`https://api.telegram.org/bot${token}/editMessageText`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				chat_id: chatId.toString(),
+				message_id: messageId,
+				text: htmlText,
+				parse_mode: 'HTML',
+				disable_web_page_preview: true,
+				reply_markup: options.replyMarkup,
+			}),
+		});
+		if (res.ok) {
+			return { ok: true };
+		}
+	} catch (err) {
+		console.warn('editMessageText HTML exception:', err);
+	}
+
+	return { ok: false };
+}
+
 // ==========================================
 // 5. 业务表格生成器（白名单、管理员、检索）
 // ==========================================
@@ -1153,7 +1226,9 @@ export function buildQueryRichBlocks(
 
 	pageResults.forEach((r, idx) => {
 		const globalIdx = (page - 1) * pageSize + idx + 1;
-		const rawContent = (r.content || '').replace(/\s+/g, ' ').trim();
+		let rawContent = (r.content || '').replace(/\s+/g, ' ').trim();
+		const strippedContent = rawContent.replace(/^回复\s*https?:\/\/\S+?(?::\s*|\s+|$)/, '').trim();
+		rawContent = strippedContent || (rawContent.startsWith('回复 ') ? '[回复消息]' : rawContent);
 		const preview = rawContent.length > 24 ? rawContent.slice(0, 24) + '...' : (rawContent || '-');
 		const link = r.messageId ? getMessageLink(r) : '';
 

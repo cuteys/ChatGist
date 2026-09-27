@@ -1077,6 +1077,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			expect(answeredCqId).toBe('cq-12345');
 			expect(editPayload).toBeDefined();
 			expect(editPayload.message_id).toBe(1111);
+			expect(editPayload.rich_message?.blocks).toBeDefined();
 			expect(editPayload.reply_markup?.inline_keyboard[0].map((b: any) => b.text)).toEqual(['1', '【2】']);
 		} finally {
 			globalThis.fetch = originalFetch;
