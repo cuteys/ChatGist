@@ -1534,6 +1534,324 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			globalThis.fetch = originalFetch;
 		}
 	});
+
+	it('should parse and store document message with metadata, caption, and forward context', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () => new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 })) as any;
+
+		try {
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 401,
+					message: {
+						message_id: 1101,
+						from: { id: 88888, first_name: 'DevUser' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						forward_sender_name: 'OriginalAuthor',
+						caption: '这是更新包',
+						document: {
+							file_name: 'test-app.zip',
+							file_size: 10485760,
+						},
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnv, mockCtx);
+			expect(res.status).toBe(200);
+
+			const record = await testEnv.DB.prepare('SELECT * FROM Messages WHERE messageId = 1101').first<any>();
+			expect(record).toBeDefined();
+			expect(record.content).toBe('转发自 OriginalAuthor: [文件: test-app.zip (10.00 MB)] 这是更新包');
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should parse and store audio message with title, performer, file size, and caption', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () => new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 })) as any;
+
+		try {
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 402,
+					message: {
+						message_id: 1102,
+						from: { id: 88888, first_name: 'DevUser' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						caption: '好听的纯音乐',
+						audio: {
+							title: 'Melody',
+							performer: 'Composer',
+							file_size: 5242880,
+						},
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnv, mockCtx);
+			expect(res.status).toBe(200);
+
+			const record = await testEnv.DB.prepare('SELECT * FROM Messages WHERE messageId = 1102').first<any>();
+			expect(record).toBeDefined();
+			expect(record.content).toBe('[音频: Melody - Composer (5.00 MB)] 好听的纯音乐');
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should transcribe voice message within duration and size limits using whisper and preserve reply context', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		let whisperCalled = false;
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/getFile')) {
+				return new Response(JSON.stringify({ ok: true, result: { file_path: 'voice/sample.ogg' } }), {
+					status: 200,
+					headers: { 'Content-Type': 'application/json' },
+				});
+			}
+			if (url.includes('sample.ogg')) {
+				return new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 });
+			}
+			if (url.includes('/audio/transcriptions')) {
+				whisperCalled = true;
+				return new Response(JSON.stringify({ text: '语音转录文字成功' }), {
+					status: 200,
+					headers: { 'Content-Type': 'application/json' },
+				});
+			}
+			return new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvWithModel: Env = {
+				...testEnv,
+				AI_MODEL: 'gpt-4o-mini',
+				AI_API_KEY: 'test-key',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 403,
+					message: {
+						message_id: 1103,
+						from: { id: 88888, first_name: 'DevUser' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						caption: '请听一下',
+						reply_to_message: {
+							message_id: 888,
+							from: { id: 77777, first_name: 'Alice' },
+							text: '原提问消息',
+						},
+						voice: {
+							file_id: 'voice_mock_1',
+							duration: 10,
+							file_size: 30000,
+						},
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
+			expect(res.status).toBe(200);
+			expect(whisperCalled).toBe(true);
+
+			const record = await testEnv.DB.prepare('SELECT * FROM Messages WHERE messageId = 1103').first<any>();
+			expect(record).toBeDefined();
+			expect(record.content).toBe('回复 https://t.me/c/888888/888: [语音 10s]: "语音转录文字成功" 请听一下');
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should gracefully fallback to duration metadata when voice transcription fails or throws', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/getFile') || url.includes('/audio/transcriptions')) {
+				return new Response('Internal Server Error', { status: 500 });
+			}
+			return new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvWithModel: Env = {
+				...testEnv,
+				AI_MODEL: 'gpt-4o-mini',
+				AI_API_KEY: 'test-key',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 404,
+					message: {
+						message_id: 1104,
+						from: { id: 88888, first_name: 'DevUser' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						caption: '测试失败语音',
+						voice: {
+							file_id: 'voice_err',
+							duration: 25,
+							file_size: 20000,
+						},
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
+			expect(res.status).toBe(200);
+
+			const record = await testEnv.DB.prepare('SELECT * FROM Messages WHERE messageId = 1104').first<any>();
+			expect(record).toBeDefined();
+			expect(record.content).toBe('[语音: 时长 25 秒] 测试失败语音');
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should skip whisper transcription when voice duration exceeds 120 seconds', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		let whisperAttempted = false;
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/audio/transcriptions')) {
+				whisperAttempted = true;
+			}
+			return new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvWithModel: Env = {
+				...testEnv,
+				AI_MODEL: 'gpt-4o-mini',
+				AI_API_KEY: 'test-key',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 405,
+					message: {
+						message_id: 1105,
+						from: { id: 88888, first_name: 'DevUser' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						voice: {
+							file_id: 'voice_long',
+							duration: 150,
+							file_size: 40000,
+						},
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
+			expect(res.status).toBe(200);
+			expect(whisperAttempted).toBe(false);
+
+			const record = await testEnv.DB.prepare('SELECT * FROM Messages WHERE messageId = 1105').first<any>();
+			expect(record).toBeDefined();
+			expect(record.content).toBe('[语音: 时长 150 秒]');
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should include group information and questioner profile in /ask prompt', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		// Seed a message in DB so results is not empty
+		await testEnv.DB.prepare(
+			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+		)
+			.bind('msg-ask-ctx', groupId, Date.now(), 'DevUser', '测试历史消息', 1201, 'Authorized Group', '2026-09-28 14:00:00')
+			.run();
+
+		let capturedMessages: any[] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/chat/completions')) {
+				const body = JSON.parse(init.body);
+				capturedMessages = body.messages;
+				return new Response(
+					JSON.stringify({ choices: [{ index: 0, message: { role: 'assistant', content: '测试回答' } }] }),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
+			return new Response(JSON.stringify({ ok: true, result: { message_id: 999 } }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvWithModel: Env = {
+				...testEnv,
+				AI_MODEL: 'gpt-4o-mini',
+				AI_API_KEY: 'test-key',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 501,
+					message: {
+						message_id: 1202,
+						from: { id: 88888, first_name: 'Alice', username: 'alice_dev' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: 1790578000,
+						text: '/ask 我刚才说了什么？',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
+			expect(res.status).toBe(200);
+
+			// Verify system prompt contains context guidance rule
+			expect(capturedMessages[0].content).toContain('【当前提问上下文】');
+
+			// Verify user prompt contains structured group and user context
+			const userQuestionPrompt = capturedMessages[2].content;
+			expect(userQuestionPrompt).toContain('【当前提问上下文】');
+			expect(userQuestionPrompt).toContain('• 所在群组: Authorized Group (ID: -100888888)');
+			expect(userQuestionPrompt).toContain('• 提问者: Alice (@alice_dev, ID: 88888)');
+			expect(userQuestionPrompt).toContain('• 提问时间: ');
+			expect(userQuestionPrompt).toContain('问题：我刚才说了什么？');
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
 });
 
 

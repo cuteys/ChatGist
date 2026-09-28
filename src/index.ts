@@ -289,7 +289,8 @@ const SYSTEM_PROMPTS = {
 1. 结合群聊实际发言，给出清晰、准确、条理分明的回答，并适当使用友好的 Emoji（如 💡 📌 🔍 🛠️ ✅ 等）；
 2. 凡是引用群友发言或作为回答依据的内容，将对应原消息的“相应链接”直接自然地嵌入到关键词或短语中（例如：群友 [Alice 提到](相应链接)...，或者参考 [该方案配置](相应链接)），无需单独在句末追加“[💬 原文]”；
 3. 链接必须 100% 来源于输入中的真实“相应链接”，严禁杜撰；
-4. 若群聊中未提及相关信息，请明确说明未找到相关记录。`
+4. 若群聊中未提及相关信息，请明确说明未找到相关记录；
+5. 输入中包含【当前提问上下文】（所在群组、提问者身份与提问时间）。若用户在提问中提及“我”、“我们群”、“本群”等主语，请结合提问者与群组信息在群聊记录中进行精准匹配与解答。`
 };
 
 function getSystemPrompt(env: Env, type: 'summary' | 'ask'): string {
@@ -379,6 +380,17 @@ function getUserName(msg: any): string {
 	return msg?.from?.username || "anonymous";
 }
 
+function getQuestionerInfo(msg: any): string {
+	const name = getUserName(msg);
+	if (msg?.sender_chat?.title) {
+		return `${name} (频道/匿名身份, ID: ${msg.sender_chat.id})`;
+	}
+	const tag = msg?.from?.username ? `@${msg.from.username}` : "";
+	const id = msg?.from?.id ? `ID: ${msg.from.id}` : "";
+	const details = [tag, id].filter(Boolean).join(", ");
+	return details ? `${name} (${details})` : name;
+}
+
 function getForwardSender(msg: any): string {
 	const origin = msg?.forward_origin;
 	if (origin) {
@@ -403,6 +415,53 @@ function getForwardSender(msg: any): string {
 		return msg.forward_from_chat.title;
 	}
 	return "";
+}
+
+function attachMessageContext(content: string, msg: any, groupId: string): string {
+	const replyTo = msg.reply_to_message?.message_id;
+	const fwdSender = getForwardSender(msg);
+	let result = content;
+	if (fwdSender) {
+		result = `转发自 ${fwdSender}: ${result}`;
+	}
+	if (replyTo) {
+		result = `回复 ${getMessageLink({ groupId, messageId: replyTo })}: ${result}`;
+	}
+	return result;
+}
+
+async function transcribeVoice(
+	env: Env,
+	bot: any,
+	voice: { file_id: string; duration?: number; file_size?: number }
+): Promise<string | null> {
+	const MAX_VOICE_BYTES = 5 * 1024 * 1024;
+	const MAX_VOICE_DURATION = 120;
+
+	if (voice.file_size && voice.file_size > MAX_VOICE_BYTES) return null;
+	if (voice.duration && voice.duration > MAX_VOICE_DURATION) return null;
+
+	const apiKey = getApiKey(env);
+	if (!apiKey) return null;
+
+	try {
+		const buf = await bot.getFile(voice.file_id).then((res: any) => res.arrayBuffer());
+		if (!buf || buf.byteLength > MAX_VOICE_BYTES) return null;
+
+		const audioFile = new File([buf], 'voice.ogg', { type: 'audio/ogg' });
+		const client = getGenModel(env);
+
+		const response = await client.audio.transcriptions.create({
+			file: audioFile,
+			model: 'whisper-1',
+		});
+
+		const text = response?.text?.trim();
+		return text || null;
+	} catch (e) {
+		console.warn('Voice transcription failed or unsupported:', e);
+		return null;
+	}
 }
 
 function formatChatHistoryForAi(results: any[], quotedMessageId?: number) {
@@ -1271,7 +1330,7 @@ export default {
 
 					const timeLabel = repliedTime ? ` [${repliedTime}]` : "";
 					if (repliedContent) {
-						replyPromptContext = `\n【用户重点追问的引用消息】\n• 来源消息直达链接: ${repliedLink}\n• 发言人: ${repliedUser}${timeLabel}\n• 引用内容: ${repliedContent}\n`;
+						replyPromptContext = `【用户重点追问的引用消息】\n• 来源消息直达链接: ${repliedLink}\n• 发言人: ${repliedUser}${timeLabel}\n• 引用内容: ${repliedContent}\n`;
 					}
 				}
 
@@ -1283,12 +1342,26 @@ export default {
 					"⏳ 收到提问，正在分析近期群聊并解答，请稍候...",
 					async () => {
 						let result;
+						const groupName = msg.chat.title || "未知群组";
+						const currentTime = formatBeijingTime(msg.date ? msg.date * 1000 : Date.now());
+						const questionerInfo = getQuestionerInfo(msg);
+
+						const contextPrompt =
+							`【当前提问上下文】\n` +
+							`• 所在群组: ${groupName} (ID: ${groupId})\n` +
+							`• 提问者: ${questionerInfo}\n` +
+							`• 提问时间: ${currentTime}\n`;
+
+						const promptHeader = replyPromptContext
+							? `${contextPrompt}\n${replyPromptContext}\n`
+							: `${contextPrompt}\n`;
+
 						const userQuestionContent = quotedImageContent
 							? [
 									{ type: "image_url" as const, image_url: { url: quotedImageContent } },
-									{ type: "text" as const, text: `${replyPromptContext}问题：${question}\n（请重点结合上面引用的目标图片与来源链接进行解答）` }
+									{ type: "text" as const, text: `${promptHeader}问题：${question}\n（请重点结合上面引用的目标图片与来源链接进行解答）` }
 							  ]
-							: `${replyPromptContext}问题：${question}`;
+							: `${promptHeader}问题：${question}`;
 
 						try {
 							result = await getGenModel(env)
@@ -1491,34 +1564,6 @@ export default {
 				}
 
 				switch (bot.update_type) {
-					case 'message': {
-						const groupId = msg.chat.id.toString();
-						if (!(await isGroupWhitelisted(env, groupId))) {
-							return new Response('ok');
-						}
-						let content = msg.text || "";
-						if (content.startsWith('/')) {
-							return new Response('ok');
-						}
-						const replyTo = msg.reply_to_message?.message_id;
-						const fwdSender = getForwardSender(msg);
-						if (fwdSender) {
-							content = `转发自 ${fwdSender}: ${content}`;
-						}
-						if (replyTo) {
-							content = `回复 ${getMessageLink({ groupId, messageId: replyTo })}: ${content}`;
-						}
-						if (content.startsWith("http") && !content.includes(" ")) {
-							content = await extractAllOGInfo(content);
-						}
-						const messageId = msg.message_id;
-						const groupName = msg.chat.title || "anonymous";
-						const userName = getUserName(msg);
-						const timeStamp = msg.date ? msg.date * 1000 : Date.now();
-						await saveMessage(env, { groupId, messageId, userName, content, groupName, timeStamp });
-						return new Response('ok');
-
-					}
 					case "photo": {
 						const groupId = msg.chat.id.toString();
 						if (!(await isGroupWhitelisted(env, groupId))) {
@@ -1571,8 +1616,63 @@ export default {
 						await saveMessage(env, { groupId, messageId, userName, content, groupName, timeStamp });
 						return new Response('ok');
 					}
-					default:
+					default: {
+						const groupId = msg.chat.id.toString();
+						if (!(await isGroupWhitelisted(env, groupId))) {
+							return new Response('ok');
+						}
+
+						const message = msg as any;
+						let rawContent = '';
+
+						if (message.document) {
+							const doc = message.document;
+							const fileName = doc.file_name || '未命名文件';
+							const sizeStr = doc.file_size ? ` (${formatBytes(doc.file_size)})` : '';
+							const caption = (message.caption || '').trim();
+							rawContent = `[文件: ${fileName}${sizeStr}]`;
+							if (caption) rawContent = `${rawContent} ${caption}`;
+						} else if (message.audio) {
+							const audio = message.audio;
+							const title = [audio.title, audio.performer].filter(Boolean).join(' - ') || audio.file_name || '未命名音频';
+							const sizeStr = audio.file_size ? ` (${formatBytes(audio.file_size)})` : '';
+							const caption = (message.caption || '').trim();
+							rawContent = `[音频: ${title}${sizeStr}]`;
+							if (caption) rawContent = `${rawContent} ${caption}`;
+						} else if (message.voice) {
+							const voice = message.voice;
+							const duration = voice.duration || 0;
+							const caption = (message.caption || '').trim();
+							const transcribed = await transcribeVoice(env, bot, voice);
+							rawContent = transcribed
+								? `[语音 ${duration}s]: "${transcribed}"`
+								: `[语音: 时长 ${duration} 秒]`;
+							if (caption) rawContent = `${rawContent} ${caption}`;
+						} else if (message.text) {
+							let text = message.text;
+							if (text.startsWith('/')) {
+								return new Response('ok');
+							}
+							if (text.startsWith('http') && !text.includes(' ')) {
+								text = await extractAllOGInfo(text);
+							}
+							rawContent = text;
+						} else {
+							return new Response('ok');
+						}
+
+						if (!rawContent) {
+							return new Response('ok');
+						}
+
+						const content = attachMessageContext(rawContent, msg, groupId);
+						const messageId = msg.message_id;
+						const groupName = msg.chat.title || 'anonymous';
+						const userName = getUserName(msg);
+						const timeStamp = msg.date ? msg.date * 1000 : Date.now();
+						await saveMessage(env, { groupId, messageId, userName, content, groupName, timeStamp });
 						return new Response('ok');
+					}
 				}
 			})
 			.handle(botRequest);
