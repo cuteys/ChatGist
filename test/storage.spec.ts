@@ -17,7 +17,8 @@ describe('Storage management tests', () => {
 				userName TEXT,
 				content TEXT,
 				messageId INTEGER,
-				groupName TEXT
+				groupName TEXT,
+				messageTime TEXT
 			)
 		`).run();
 		await env.DB.prepare('DELETE FROM Messages').run();

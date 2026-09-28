@@ -54,6 +54,12 @@ function escapeGlobPattern(pattern: string): string {
 	return pattern.replace(/([*?\[\]])/g, '[$1]');
 }
 
+export function formatBeijingTime(timestamp: number): string {
+	const d = new Date(timestamp + 8 * 3600 * 1000);
+	const p = (n: number) => String(n).padStart(2, '0');
+	return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
+
 async function sendChatAction(token: string, chatId: string | number, action = 'typing') {
 	try {
 		await fetch(`https://api.telegram.org/bot${token}/sendChatAction`, {
@@ -219,7 +225,7 @@ const SYSTEM_PROMPTS = {
 
 输入记录格式如下：
 ====================
-用户名:
+用户名 [北京时间]:
 发言内容
 相应链接
 ====================
@@ -274,7 +280,7 @@ const SYSTEM_PROMPTS = {
 
 群聊记录格式如下：
 ====================
-用户名:
+用户名 [北京时间]:
 发言内容
 相应链接
 ====================
@@ -399,13 +405,21 @@ function getForwardSender(msg: any): string {
 	return "";
 }
 
-function formatChatHistoryForAi(results: any[]) {
-	return results.flatMap((r: any) => [
-		dispatchContent(`====================`),
-		dispatchContent(`${r.userName}:`),
-		dispatchContent(r.content),
-		dispatchContent(getMessageLink(r)),
-	]);
+function formatChatHistoryForAi(results: any[], quotedMessageId?: number) {
+	return results.flatMap((r: any) => {
+		const timeStr = r.messageTime || (r.timeStamp ? formatBeijingTime(r.timeStamp) : "");
+		const sender = timeStr ? `${r.userName} [${timeStr}]:` : `${r.userName}:`;
+		let content = r.content;
+		if (quotedMessageId && typeof content === "string" && content.startsWith("data:image/")) {
+			content = r.messageId === quotedMessageId ? "[目标引用图片]" : "[历史图片]";
+		}
+		return [
+			dispatchContent(`====================`),
+			dispatchContent(sender),
+			dispatchContent(content),
+			dispatchContent(getMessageLink(r)),
+		];
+	});
 }
 
 async function saveMessage(env: Env, params: {
@@ -414,25 +428,46 @@ async function saveMessage(env: Env, params: {
 	userName: string;
 	content: string;
 	groupName: string;
+	timeStamp?: number;
 }) {
+	const timeStamp = params.timeStamp || Date.now();
+	const messageTime = formatBeijingTime(timeStamp);
+
 	const doInsert = () =>
 		env.DB.prepare(
-			`INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName) VALUES (?, ?, ?, ?, ?, ?, ?)`
+			`INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 		)
 			.bind(
 				getMessageLink({ groupId: params.groupId, messageId: params.messageId }),
 				params.groupId,
-				Date.now(),
+				timeStamp,
 				params.userName,
 				params.content,
 				params.messageId,
-				params.groupName
+				params.groupName,
+				messageTime
 			)
 			.run();
 
 	try {
 		await doInsert();
 	} catch (e: any) {
+		const isMissingColumn = e?.message && (
+			e.message.includes("no such column: messageTime") ||
+			e.message.includes("has no column named messageTime") ||
+			(e?.cause?.message && (e.cause.message.includes("no such column: messageTime") || e.cause.message.includes("has no column named messageTime")))
+		);
+
+		if (isMissingColumn) {
+			try {
+				await env.DB.prepare("ALTER TABLE Messages ADD COLUMN messageTime TEXT").run();
+				await doInsert();
+				return;
+			} catch (alterErr) {
+				console.error("Auto-migrate messageTime column failed:", alterErr);
+			}
+		}
+
 		console.error("Failed to save message:", e);
 		if (e?.message && /storage|full|limit/i.test(e.message)) {
 			try {
@@ -1151,7 +1186,7 @@ export default {
 						SELECT * FROM Messages
 						WHERE groupId=?
 						ORDER BY timeStamp DESC
-						LIMIT 1500
+						LIMIT 1000
 					)
 					SELECT * FROM latest_pool
 					ORDER BY timeStamp ASC
@@ -1171,12 +1206,72 @@ export default {
 				}
 
 				let replyPromptContext = "";
+				let quotedImageContent: string | null = null;
 				const replyMsg = msg.reply_to_message;
 				if (replyMsg) {
 					const repliedUser = getUserName(replyMsg);
-					const repliedContent = replyMsg.text || (replyMsg.photo ? '[图片]' : '');
+					const repliedMsgId = replyMsg.message_id;
+					const repliedLink = getMessageLink({ groupId, messageId: repliedMsgId });
+
+					let repliedContent = replyMsg.text || "";
+					let repliedTime = replyMsg.date ? formatBeijingTime(replyMsg.date * 1000) : "";
+
+					try {
+						const dbMsg = await env.DB.prepare(
+							"SELECT * FROM Messages WHERE groupId = ? AND messageId = ?"
+						).bind(groupId, repliedMsgId).first<any>();
+
+						if (dbMsg) {
+							if (dbMsg.messageTime) repliedTime = dbMsg.messageTime;
+							else if (dbMsg.timeStamp) repliedTime = formatBeijingTime(dbMsg.timeStamp);
+
+							if (typeof dbMsg.content === "string" && dbMsg.content.startsWith("data:image/")) {
+								quotedImageContent = dbMsg.content;
+							} else if (!repliedContent && dbMsg.content) {
+								repliedContent = dbMsg.content;
+							}
+						}
+					} catch (dbErr) {
+						console.error("Failed to query quoted message from DB:", dbErr);
+					}
+
+					if (!quotedImageContent && replyMsg.photo && replyMsg.photo.length > 0) {
+						try {
+							const MAX_PHOTO_BYTES = 512 * 1024;
+							const candidatePhotos = [...replyMsg.photo].reverse();
+							let file: ArrayBuffer | null = null;
+							for (const p of candidatePhotos) {
+								if (p.file_size && p.file_size > MAX_PHOTO_BYTES) continue;
+								const buf = await ctx.getFile(p.file_id).then((res: any) => res.arrayBuffer());
+								if (buf.byteLength <= MAX_PHOTO_BYTES) {
+									file = buf;
+									break;
+								}
+							}
+							if (!file && replyMsg.photo[0]) {
+								file = await ctx.getFile(replyMsg.photo[0].file_id).then((res: any) => res.arrayBuffer());
+							}
+							if (file) {
+								const mime = detectImageMimeType(file);
+								if (mime) {
+									quotedImageContent = `data:${mime};base64,` + Buffer.from(file).toString("base64");
+								}
+							}
+						} catch (downloadErr) {
+							console.error("Failed to download quoted photo on demand:", downloadErr);
+						}
+					}
+
+					if (!repliedContent) {
+						repliedContent = quotedImageContent || replyMsg.photo ? "[图片]" : "";
+					}
+					if (replyMsg.caption) {
+						repliedContent = repliedContent ? `${repliedContent} ${replyMsg.caption}` : replyMsg.caption;
+					}
+
+					const timeLabel = repliedTime ? ` [${repliedTime}]` : "";
 					if (repliedContent) {
-						replyPromptContext = `\n【用户重点追问的引用消息】\n${repliedUser}: ${repliedContent}\n`;
+						replyPromptContext = `\n【用户重点追问的引用消息】\n• 来源消息直达链接: ${repliedLink}\n• 发言人: ${repliedUser}${timeLabel}\n• 引用内容: ${repliedContent}\n`;
 					}
 				}
 
@@ -1188,6 +1283,13 @@ export default {
 					"⏳ 收到提问，正在分析近期群聊并解答，请稍候...",
 					async () => {
 						let result;
+						const userQuestionContent = quotedImageContent
+							? [
+									{ type: "image_url" as const, image_url: { url: quotedImageContent } },
+									{ type: "text" as const, text: `${replyPromptContext}问题：${question}\n（请重点结合上面引用的目标图片与来源链接进行解答）` }
+							  ]
+							: `${replyPromptContext}问题：${question}`;
+
 						try {
 							result = await getGenModel(env)
 								.chat.completions.create({
@@ -1199,11 +1301,11 @@ export default {
 										},
 										{
 											role: "user",
-											content: formatChatHistoryForAi(results)
+											content: formatChatHistoryForAi(results, quotedImageContent && replyMsg ? replyMsg.message_id : undefined)
 										},
 										{
 											role: "user",
-											content: `${replyPromptContext}问题：${question}`
+											content: userQuestionContent as any
 										}
 									],
 									...getCompletionOptions(model, false),
@@ -1412,7 +1514,8 @@ export default {
 						const messageId = msg.message_id;
 						const groupName = msg.chat.title || "anonymous";
 						const userName = getUserName(msg);
-						await saveMessage(env, { groupId, messageId, userName, content, groupName });
+						const timeStamp = msg.date ? msg.date * 1000 : Date.now();
+						await saveMessage(env, { groupId, messageId, userName, content, groupName, timeStamp });
 						return new Response('ok');
 
 					}
@@ -1464,7 +1567,8 @@ export default {
 						}
 
 						const content = `data:${mimeType};base64,` + Buffer.from(file).toString("base64");
-						await saveMessage(env, { groupId, messageId, userName, content, groupName });
+						const timeStamp = msg.date ? msg.date * 1000 : Date.now();
+						await saveMessage(env, { groupId, messageId, userName, content, groupName, timeStamp });
 						return new Response('ok');
 					}
 					default:

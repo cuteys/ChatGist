@@ -108,7 +108,8 @@ describe('Worker fetch whitelist gatekeeping', () => {
 				userName TEXT,
 				content TEXT,
 				messageId INTEGER,
-				groupName TEXT
+				groupName TEXT,
+				messageTime TEXT
 			)
 		`).run();
 		await initWhitelistTables(testEnv);
@@ -1283,7 +1284,9 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			const userPrompt = aiMessages.find((m) => m.role === 'user' && typeof m.content === 'string' && m.content.includes('怎么修改？'));
 			expect(userPrompt).toBeDefined();
 			expect(userPrompt.content).toContain('用户重点追问的引用消息');
-			expect(userPrompt.content).toContain('Charlie: 配置文件中的 port 设置成了 8080');
+			expect(userPrompt.content).toContain('Charlie');
+			expect(userPrompt.content).toContain('配置文件中的 port 设置成了 8080');
+			expect(userPrompt.content).toContain('https://t.me/c/888888/701');
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
@@ -1331,6 +1334,202 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			expect(text).toContain('系统连通性诊断');
 			expect(text).toContain('D1 数据库延迟');
 			expect(text).toContain('AI 接口状态');
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should isolate quoted photo in user prompt and mask historical photos', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		// 1. Insert an older photo message (650)
+		await testEnv.DB.prepare(
+			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+		)
+			.bind('msg-old-photo', groupId, Date.now() - 5000, 'UserOld', 'data:image/jpeg;base64,OLDIMAGE', 650, 'Authorized Group', '2026-09-28 12:00:00')
+			.run();
+
+		// 2. Insert the target quoted photo message (701)
+		await testEnv.DB.prepare(
+			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+		)
+			.bind('msg-target-photo', groupId, Date.now() - 1000, 'Alice', 'data:image/jpeg;base64,TARGETIMAGE', 701, 'Authorized Group', '2026-09-28 12:05:00')
+			.run();
+
+		let aiMessages: any[] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/chat/completions')) {
+				const body = JSON.parse(init.body);
+				aiMessages = body.messages;
+				return new Response(
+					JSON.stringify({
+						choices: [{ index: 0, message: { role: 'assistant', content: '这是目标图片的内容' } }],
+					}),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
+			return new Response(JSON.stringify({ ok: true, result: { message_id: 999 } }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvWithModel: Env = {
+				...testEnv,
+				AI_MODEL: 'gpt-4o-mini',
+				AI_API_KEY: 'test-key',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 304,
+					message: {
+						message_id: 702,
+						from: { id: 88888, first_name: 'Bob' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/ask 这张图讲了什么？',
+						reply_to_message: {
+							message_id: 701,
+							from: { id: 77777, first_name: 'Alice' },
+							photo: [{ file_id: 'photo_701', file_size: 100 }],
+						},
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
+			expect(res.status).toBe(200);
+
+			// History turn (messages[1]): older photo (650) must be masked as [历史图片], not image_url
+			const historyTurn = aiMessages[1];
+			expect(historyTurn.role).toBe('user');
+			const oldImageTurn = historyTurn.content.find((item: any) => item.text && item.text.includes('OLDIMAGE'));
+			expect(oldImageTurn).toBeUndefined();
+			const maskedTurn = historyTurn.content.find((item: any) => item.text === '[历史图片]');
+			expect(maskedTurn).toBeDefined();
+
+			// Question turn (messages[2]): must be an array containing the target image
+			const questionTurn = aiMessages[2];
+			expect(questionTurn.role).toBe('user');
+			expect(Array.isArray(questionTurn.content)).toBe(true);
+			const targetImageItem = questionTurn.content.find((item: any) => item.type === 'image_url' && item.image_url?.url === 'data:image/jpeg;base64,TARGETIMAGE');
+			expect(targetImageItem).toBeDefined();
+
+			const textItem = questionTurn.content.find((item: any) => item.type === 'text');
+			expect(textItem.text).toContain('https://t.me/c/888888/701');
+			expect(textItem.text).toContain('这张图讲了什么？');
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should automatically migrate table and add messageTime when column does not exist', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		// Recreate Messages table WITHOUT messageTime column to simulate legacy table
+		await testEnv.DB.prepare('DROP TABLE IF EXISTS Messages').run();
+		await testEnv.DB.prepare(`
+			CREATE TABLE Messages (
+				id TEXT PRIMARY KEY,
+				groupId TEXT,
+				timeStamp INTEGER NOT NULL,
+				userName TEXT,
+				content TEXT,
+				messageId INTEGER,
+				groupName TEXT
+			)
+		`).run();
+
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () => new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 })) as any;
+
+		try {
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 305,
+					message: {
+						message_id: 901,
+						from: { id: 88888, first_name: 'Alice' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						text: '这是一条旧表升级测试消息',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnv, mockCtx);
+			expect(res.status).toBe(200);
+
+			// Verify that the column was added and message was saved
+			const record = await testEnv.DB.prepare('SELECT * FROM Messages WHERE messageId = 901').first<any>();
+			expect(record).toBeDefined();
+			expect(record.content).toBe('这是一条旧表升级测试消息');
+			expect(record.messageTime).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should format legacy records without messageTime using timeStamp fallback', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		// Insert legacy message where messageTime is NULL
+		const fixedTime = Date.UTC(2024, 2, 28, 16, 0, 0); // 2024-03-28 16:00:00 UTC -> 2024-03-29 00:00:00 Beijing
+		await testEnv.DB.prepare(
+			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)'
+		)
+			.bind('msg-legacy', groupId, fixedTime, 'OldAlice', '旧消息内容', 902, 'Authorized Group')
+			.run();
+
+		let aiMessages: any[] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/chat/completions')) {
+				const body = JSON.parse(init.body);
+				aiMessages = body.messages;
+				return new Response(JSON.stringify({ choices: [{ index: 0, message: { role: 'assistant', content: 'ok' } }] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+			}
+			return new Response(JSON.stringify({ ok: true, result: { message_id: 999 } }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvWithModel: Env = {
+				...testEnv,
+				AI_MODEL: 'gpt-4o-mini',
+				AI_API_KEY: 'test-key',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 306,
+					message: {
+						message_id: 903,
+						from: { id: 88888, first_name: 'Bob' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/ask 测试旧消息？',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
+			expect(res.status).toBe(200);
+
+			const historyTurn = aiMessages[1];
+			const senderItem = historyTurn.content.find((item: any) => item.text && item.text.includes('OldAlice'));
+			expect(senderItem).toBeDefined();
+			expect(senderItem.text).toContain('2024-03-29 00:00:00');
 		} finally {
 			globalThis.fetch = originalFetch;
 		}

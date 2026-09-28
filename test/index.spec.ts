@@ -79,6 +79,7 @@ describe("JPEG validation", () => {
 });
 
 import { extractAllOGInfo } from "../src/og";
+import { formatBeijingTime } from "../src/index";
 
 describe("OG info security", () => {
 	it("should reject private and local hosts without fetching", async () => {
@@ -86,6 +87,16 @@ describe("OG info security", () => {
 		expect(await extractAllOGInfo("http://127.0.0.1/admin")).toBe("http://127.0.0.1/admin");
 		expect(await extractAllOGInfo("http://192.168.1.1/router")).toBe("http://192.168.1.1/router");
 		expect(await extractAllOGInfo("ftp://example.com/file")).toBe("ftp://example.com/file");
+	});
+});
+
+describe("formatBeijingTime", () => {
+	it("should format timestamps into UTC+8 YYYY-MM-DD HH:mm:ss", () => {
+		const ts = Date.UTC(2026, 8, 28, 0, 0, 0);
+		expect(formatBeijingTime(ts)).toBe("2026-09-28 08:00:00");
+
+		const tsCross = Date.UTC(2026, 8, 28, 16, 30, 15);
+		expect(formatBeijingTime(tsCross)).toBe("2026-09-29 00:30:15");
 	});
 });
 
