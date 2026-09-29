@@ -462,4 +462,119 @@ describe('richFormat tests', () => {
 		const row3Cell = table.cells[3][2].text[0];
 		expect(row3Cell.text).toBe('普通无需处理的消息');
 	});
+
+	it('extracts trailing conclusion from inside <details> to independent top-level block and unwraps blockquote', async () => {
+		const { aggregateMarkdownToRichBlocks, richBlocksToHtml } = await import('../src/richFormat');
+
+		const markdown = `
+<details>
+<summary>议题一：系统架构分析</summary>
+
+讨论了多项系统优化方案与实现细节。
+
+📌 一句话总结:
+> 架构设计整体合理，但需要注意极端情况下的容灾能力。
+</details>
+`;
+
+		const blocks = aggregateMarkdownToRichBlocks(markdown);
+		const detailsBlocks = blocks.filter((b) => b.type === 'details');
+		expect(detailsBlocks.length).toBe(1);
+
+		// Inside details: should only contain the analysis, not the conclusion
+		const innerText = JSON.stringify(detailsBlocks[0]);
+		expect(innerText).toContain('讨论了多项系统优化方案');
+		expect(innerText).not.toContain('一句话总结');
+
+		// Outside details: conclusion should be extracted as top-level paragraph without blockquote
+		const trailingBlocks = blocks.slice(blocks.indexOf(detailsBlocks[0]) + 1);
+		expect(trailingBlocks.length).toBeGreaterThanOrEqual(1);
+		expect(trailingBlocks.some((b) => b.type === 'blockquote')).toBe(false);
+
+		const html = richBlocksToHtml(blocks);
+		expect(html).toContain('<blockquote expandable>');
+		expect(html).toContain('一句话总结');
+		// The conclusion text must not be wrapped in a second inner <blockquote>
+		expect(html).not.toMatch(/<blockquote>[^<]*一句话总结/);
+		expect(html).not.toMatch(/<blockquote>[^<]*架构设计整体合理/);
+	});
+
+	it('does not wrap heading conclusion in <details> and unwraps quote syntax', async () => {
+		const { aggregateMarkdownToRichBlocks } = await import('../src/richFormat');
+
+		const markdown = `
+总览概述。
+
+### 模块一：认证与鉴权
+具体分析了身份认证的流程。
+
+### 📌 一句话总结
+> 整体认证体系完备。
+`;
+
+		const blocks = aggregateMarkdownToRichBlocks(markdown);
+		const detailsBlocks = blocks.filter((b) => b.type === 'details');
+		expect(detailsBlocks.length).toBe(1);
+		expect(detailsBlocks[0].summary).toBe('模块一：认证与鉴权');
+
+		const conclusionBlock = blocks.find((b) => b.type === 'paragraph' && JSON.stringify(b).includes('整体认证体系完备'));
+		expect(conclusionBlock).toBeDefined();
+		expect(blocks.some((b) => b.type === 'blockquote')).toBe(false);
+	});
+
+	it('auto-promotes structured bullet sections into <details> drawers and keeps conclusion standalone', async () => {
+		const { aggregateMarkdownToRichBlocks, richBlocksToHtml } = await import('../src/richFormat');
+
+		const markdown = `
+前言介绍段落：
+
+• 人形排雷小白鼠 🐁
+
+主打一个活着全靠命硬。内核只要发版，管它改了多少破坏性语法，脑子都不带转一下就全自动升级。
+
+• 局域网战神与赛博资本家 💰
+
+在群里疯狂晒各种服务器和内网配置，坐拥大把内网计算资源。
+
+📌 一句话总结:
+> 天天躺平瘫软的人形挂件。
+`;
+
+		const blocks = aggregateMarkdownToRichBlocks(markdown);
+		const detailsBlocks = blocks.filter((b) => b.type === 'details');
+		expect(detailsBlocks.length).toBe(2);
+		expect(detailsBlocks[0].summary).toBe('人形排雷小白鼠 🐁');
+		expect(detailsBlocks[1].summary).toBe('局域网战神与赛博资本家 💰');
+
+		// Preamble should be preserved
+		expect(blocks[0].type).toBe('paragraph');
+
+		// Trailing conclusion should be outside details and not wrapped in blockquote
+		const conclusionBlock = blocks.find((b) => JSON.stringify(b).includes('天天躺平瘫软的人形挂件'));
+		expect(conclusionBlock).toBeDefined();
+		expect(conclusionBlock?.type).toBe('paragraph');
+
+		const html = richBlocksToHtml(blocks);
+		expect(html).toContain('【人形排雷小白鼠 🐁】');
+		expect(html).toContain('【局域网战神与赛博资本家 💰】');
+		expect(html).not.toMatch(/<blockquote>[^<]*天天躺平瘫软/);
+	});
+
+	it('preserves simple bullet list without converting to <details>', async () => {
+		const { aggregateMarkdownToRichBlocks } = await import('../src/richFormat');
+
+		const markdown = `
+简单清单列表：
+- 修复了 401 报错
+- 增加了白名单功能
+- 优化了搜索速度
+`;
+
+		const blocks = aggregateMarkdownToRichBlocks(markdown);
+		const detailsBlocks = blocks.filter((b) => b.type === 'details');
+		expect(detailsBlocks.length).toBe(0);
+
+		const listBlock = blocks.find((b) => b.type === 'list');
+		expect(listBlock).toBeDefined();
+	});
 });

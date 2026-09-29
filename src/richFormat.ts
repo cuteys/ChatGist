@@ -517,6 +517,16 @@ export function parseMarkdownSectionBlocks(content: string): RichBlock[] {
 	return blocks;
 }
 
+const CONCLUSION_PATTERN = /(?:^|\n+)(?:#{1,6}\s+)?(?:[📌🎯💡⚡📝💬🎬🚀\s]*)?(?:一句话总结|总结|总评|结语|核心结论)[:：]?[\s\S]+$/i;
+
+function cleanConclusionText(text: string): string {
+	return text
+		.replace(/^>+\s?/gm, '')
+		.replace(/^```[a-z]*\s*/gim, '')
+		.replace(/\s*```$/gim, '')
+		.trim();
+}
+
 /**
  * 本地聚合器：将大模型生成的结构化 Markdown 转换为 Telegram 原生 AST
  * 兼容 <details><summary> 与标准 ## / ### 章节折叠
@@ -546,7 +556,15 @@ export function aggregateMarkdownToRichBlocks(content: string): RichBlock[] {
 			}
 
 			const summary = match[1].replace(/<[^>]+>/g, '').trim();
-			const innerContent = match[2].trim();
+			let innerContent = match[2].trim();
+			let extractedConclusion: string | null = null;
+
+			const cMatch = innerContent.match(CONCLUSION_PATTERN);
+			if (cMatch && cMatch.index !== undefined) {
+				extractedConclusion = cleanConclusionText(innerContent.slice(cMatch.index));
+				innerContent = innerContent.slice(0, cMatch.index).trim();
+			}
+
 			const innerBlocks = parseMarkdownSectionBlocks(innerContent);
 
 			blocks.push({
@@ -555,12 +573,17 @@ export function aggregateMarkdownToRichBlocks(content: string): RichBlock[] {
 				blocks: innerBlocks.length > 0 ? innerBlocks : [{ type: 'paragraph', text: '（无详细内容）' }],
 			});
 
+			if (extractedConclusion) {
+				blocks.push(...parseMarkdownSectionBlocks(extractedConclusion));
+			}
+
 			lastIndex = detailsRegex.lastIndex;
 		}
 
 		const after = raw.slice(lastIndex).trim();
 		if (after) {
-			blocks.push(...parseMarkdownSectionBlocks(after));
+			const cleanedAfter = CONCLUSION_PATTERN.test(after) ? cleanConclusionText(after) : after;
+			blocks.push(...parseMarkdownSectionBlocks(cleanedAfter));
 		}
 
 		return blocks;
@@ -586,11 +609,30 @@ export function aggregateMarkdownToRichBlocks(content: string): RichBlock[] {
 			blocks.push(...parseMarkdownSectionBlocks(preamble));
 		}
 
+		const detailsHeadings: typeof headingMatches = [];
+		let conclusionHeadingIdx = -1;
+
 		for (let s = 0; s < headingMatches.length; s++) {
-			const current = headingMatches[s];
+			if (/(?:一句话总结|总结|总评|结语|核心结论)/i.test(headingMatches[s].title)) {
+				conclusionHeadingIdx = s;
+				break;
+			}
+			detailsHeadings.push(headingMatches[s]);
+		}
+
+		for (let s = 0; s < detailsHeadings.length; s++) {
+			const current = detailsHeadings[s];
 			const startPos = current.index + current.length;
-			const endPos = s + 1 < headingMatches.length ? headingMatches[s + 1].index : raw.length;
-			const sectionBody = raw.slice(startPos, endPos).trim();
+			const nextHeading = s + 1 < headingMatches.length ? headingMatches[s + 1] : null;
+			const endPos = nextHeading ? nextHeading.index : raw.length;
+			let sectionBody = raw.slice(startPos, endPos).trim();
+			let trailingConclusion: string | null = null;
+
+			const cMatch = sectionBody.match(CONCLUSION_PATTERN);
+			if (cMatch && cMatch.index !== undefined) {
+				trailingConclusion = cleanConclusionText(sectionBody.slice(cMatch.index));
+				sectionBody = sectionBody.slice(0, cMatch.index).trim();
+			}
 
 			const innerBlocks = parseMarkdownSectionBlocks(sectionBody);
 			blocks.push({
@@ -598,12 +640,99 @@ export function aggregateMarkdownToRichBlocks(content: string): RichBlock[] {
 				summary: current.title,
 				blocks: innerBlocks.length > 0 ? innerBlocks : [{ type: 'paragraph', text: '（暂无更多详情）' }],
 			});
+
+			if (trailingConclusion) {
+				blocks.push(...parseMarkdownSectionBlocks(trailingConclusion));
+			}
+		}
+
+		if (conclusionHeadingIdx !== -1) {
+			const conclusionRaw = raw.slice(headingMatches[conclusionHeadingIdx].index).trim();
+			blocks.push(...parseMarkdownSectionBlocks(cleanConclusionText(conclusionRaw)));
 		}
 
 		return blocks;
 	}
 
-	// 3. 普通纯文本回退
+	// 3. 若未包含 <details> 与 ##/###，但包含多段结构化项目列表（如 • 标题 \n\n 详细内容...）
+	const bulletRegex = /^(?:[-*•]|\d+\.)\s+([^\n。；!]{2,60})\s*$/gm;
+	const bulletMatches: Array<{ index: number; title: string; length: number }> = [];
+	let bMatch: RegExpExecArray | null;
+
+	while ((bMatch = bulletRegex.exec(raw)) !== null) {
+		bulletMatches.push({
+			index: bMatch.index,
+			title: bMatch[1].replace(/^\*\*|\*\*$/g, '').trim(),
+			length: bMatch[0].length,
+		});
+	}
+
+	if (bulletMatches.length >= 2) {
+		let hasSubstantiveBody = false;
+		for (let s = 0; s < bulletMatches.length; s++) {
+			const startPos = bulletMatches[s].index + bulletMatches[s].length;
+			const endPos = s + 1 < bulletMatches.length ? bulletMatches[s + 1].index : raw.length;
+			const body = raw.slice(startPos, endPos).trim();
+			if (body.length >= 15) {
+				hasSubstantiveBody = true;
+				break;
+			}
+		}
+
+		if (hasSubstantiveBody) {
+			const blocks: RichBlock[] = [];
+			const preamble = raw.slice(0, bulletMatches[0].index).trim();
+			if (preamble) {
+				blocks.push(...parseMarkdownSectionBlocks(preamble));
+			}
+
+			const detailsBullets: typeof bulletMatches = [];
+			let conclusionBulletIdx = -1;
+
+			for (let s = 0; s < bulletMatches.length; s++) {
+				if (/(?:一句话总结|总结|总评|结语|核心结论)/i.test(bulletMatches[s].title)) {
+					conclusionBulletIdx = s;
+					break;
+				}
+				detailsBullets.push(bulletMatches[s]);
+			}
+
+			for (let s = 0; s < detailsBullets.length; s++) {
+				const current = detailsBullets[s];
+				const startPos = current.index + current.length;
+				const nextBullet = s + 1 < bulletMatches.length ? bulletMatches[s + 1] : null;
+				const endPos = nextBullet ? nextBullet.index : raw.length;
+				let sectionBody = raw.slice(startPos, endPos).trim();
+				let trailingConclusion: string | null = null;
+
+				const cMatch = sectionBody.match(CONCLUSION_PATTERN);
+				if (cMatch && cMatch.index !== undefined) {
+					trailingConclusion = cleanConclusionText(sectionBody.slice(cMatch.index));
+					sectionBody = sectionBody.slice(0, cMatch.index).trim();
+				}
+
+				const innerBlocks = parseMarkdownSectionBlocks(sectionBody);
+				blocks.push({
+					type: 'details',
+					summary: current.title,
+					blocks: innerBlocks.length > 0 ? innerBlocks : [{ type: 'paragraph', text: '（暂无更多详情）' }],
+				});
+
+				if (trailingConclusion) {
+					blocks.push(...parseMarkdownSectionBlocks(trailingConclusion));
+				}
+			}
+
+			if (conclusionBulletIdx !== -1) {
+				const conclusionRaw = raw.slice(bulletMatches[conclusionBulletIdx].index).trim();
+				blocks.push(...parseMarkdownSectionBlocks(cleanConclusionText(conclusionRaw)));
+			}
+
+			return blocks;
+		}
+	}
+
+	// 4. 普通纯文本回退
 	return parseMarkdownSectionBlocks(raw);
 }
 
