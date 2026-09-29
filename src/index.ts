@@ -341,13 +341,96 @@ async function withTemporaryStatus<T>(
 	}
 }
 
+export function isSafetyBlockError(errOrResult: any): boolean {
+	if (!errOrResult) return false;
+	if (errOrResult.isSafetyBlock) return true;
+
+	const choice = errOrResult?.choices?.[0];
+	if (choice?.finish_reason === 'content_filter' || choice?.finish_reason === 'safety') {
+		return true;
+	}
+
+	if (errOrResult?.promptFeedback?.blockReason === 'SAFETY') {
+		return true;
+	}
+
+	if (Array.isArray(errOrResult?.choices) && errOrResult.choices.length === 0) {
+		return true;
+	}
+
+	const rawError = errOrResult?.rawResult;
+	if (rawError && isSafetyBlockError(rawError)) {
+		return true;
+	}
+
+	const msg = String(errOrResult?.message || errOrResult?.error?.message || errOrResult || '');
+	if (/safety|content_filter|blocked|moderation|policy|inappropriate/i.test(msg)) {
+		return true;
+	}
+
+	return false;
+}
+
+export async function callChatModelWithRetry(
+	env: Env,
+	params: { model: string; messages: any[] },
+	options: { maxAttempts?: number } = {}
+): Promise<{ content: string; rawResult: any }> {
+	const maxAttempts = options.maxAttempts ?? 2;
+	let lastError: any = null;
+
+	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+		try {
+			const result: any = await getGenModel(env).chat.completions.create({
+				model: params.model,
+				messages: params.messages,
+				...getCompletionOptions(params.model, false),
+			});
+
+			if (!result || !Array.isArray(result.choices) || result.choices.length === 0) {
+				const isSafety = isSafetyBlockError(result);
+				const err: any = new Error(isSafety ? 'CONTENT_FILTER_TRIGGERED' : 'EMPTY_CHOICES_RETURNED');
+				err.isSafetyBlock = isSafety;
+				err.rawResult = result;
+				throw err;
+			}
+
+			const choice = result.choices[0];
+			if (choice?.finish_reason === 'content_filter' || choice?.finish_reason === 'safety') {
+				const err: any = new Error('CONTENT_FILTER_TRIGGERED');
+				err.isSafetyBlock = true;
+				err.rawResult = result;
+				throw err;
+			}
+
+			const content = choice?.message?.content;
+			if (typeof content !== 'string') {
+				const err: any = new Error('INVALID_MESSAGE_CONTENT');
+				err.rawResult = result;
+				throw err;
+			}
+
+			return { content, rawResult: result };
+		} catch (err: any) {
+			lastError = err;
+			console.warn(`[AI] Attempt ${attempt}/${maxAttempts} failed:`, err?.message || err);
+
+			if (attempt < maxAttempts) {
+				await new Promise((r) => setTimeout(r, 1000));
+			}
+		}
+	}
+
+	throw lastError;
+}
+
 async function generateSummaryRichMessage(
 	env: Env,
 	results: any[],
 	model: string,
 	quoteNotice: string
 ): Promise<{ blocks: any[]; raw: string }> {
-	const result = await getGenModel(env).chat.completions.create({
+	const { content: raw } = await callChatModelWithRetry(env, {
 		model,
 		messages: [
 			{
@@ -359,10 +442,8 @@ async function generateSummaryRichMessage(
 				content: formatChatHistoryForAi(results),
 			},
 		],
-		...getCompletionOptions(model, false),
 	});
 
-	const raw = result.choices[0].message.content || "";
 	const richData = parseRichMessageResponse(raw);
 	richData.blocks.unshift({
 		type: "blockquote",
@@ -1373,33 +1454,35 @@ export default {
 							  ]
 							: `${promptHeader}问题：${question}`;
 
+						let raw = "";
 						try {
-							result = await getGenModel(env)
-								.chat.completions.create({
-									model,
-									messages: [
-										{
-											role: "system",
-											content: getSystemPrompt(env, 'ask'),
-										},
-										{
-											role: "user",
-											content: formatChatHistoryForAi(results, quotedImageContent && replyMsg ? replyMsg.message_id : undefined)
-										},
-										{
-											role: "user",
-											content: userQuestionContent as any
-										}
-									],
-									...getCompletionOptions(model, false),
-								});
-						} catch (e) {
+							const callRes = await callChatModelWithRetry(env, {
+								model,
+								messages: [
+									{
+										role: "system",
+										content: getSystemPrompt(env, 'ask'),
+									},
+									{
+										role: "user",
+										content: formatChatHistoryForAi(results, quotedImageContent && replyMsg ? replyMsg.message_id : undefined),
+									},
+									{
+										role: "user",
+										content: userQuestionContent as any,
+									},
+								],
+							});
+							raw = callRes.content;
+						} catch (e: any) {
 							logModelError(e, { command: 'ask', model }, [getApiKey(env), botToken]);
-							await ctx.reply('回答失败，AI 服务暂时无法完成请求，请稍后重试。');
+							if (isSafetyBlockError(e)) {
+								await ctx.reply('⚠️ 该提问或相关聊天内容触发了大模型的内容安全审查策略，暂时无法回答。');
+							} else {
+								await ctx.reply('回答失败，AI 服务暂时无法完成请求，请稍后重试。');
+							}
 							return;
 						}
-
-						const raw = result.choices[0].message.content || "";
 						const richData = parseRichMessageResponse(raw);
 						richData.blocks.unshift({
 							type: "blockquote",
@@ -1554,9 +1637,13 @@ export default {
 						try {
 							const { blocks, raw } = await generateSummaryRichMessage(env, results, model, quoteNotice);
 							await sendTelegramRichMessage(botToken, groupId, blocks, { rawMarkdown: raw });
-						} catch (e) {
+						} catch (e: any) {
 							logModelError(e, { command: 'summary', model }, [getApiKey(env), botToken]);
-							await bot.reply('概括失败，暂时无法完成请求，请稍后重试。');
+							if (isSafetyBlockError(e)) {
+								await bot.reply('⚠️ 本期群聊内容涉及敏感或限制级话题，触发了大模型的内容安全审查策略，未能完成总结。');
+							} else {
+								await bot.reply('概括失败，暂时无法完成请求，请稍后重试。');
+							}
 						}
 					}
 				);

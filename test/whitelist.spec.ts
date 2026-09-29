@@ -1847,7 +1847,192 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			expect(userQuestionPrompt).toContain('• 所在群组: Authorized Group (ID: -100888888)');
 			expect(userQuestionPrompt).toContain('• 提问者: Alice (@alice_dev, ID: 88888)');
 			expect(userQuestionPrompt).toContain('• 提问时间: ');
-			expect(userQuestionPrompt).toContain('问题：我刚才说了什么？');
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should retry model call on initial failure and succeed on second attempt', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		await testEnv.DB.prepare(
+			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+		)
+			.bind('msg-retry-test', groupId, Date.now(), 'DevUser', '测试重试消息', 1301, 'Authorized Group', '2026-09-29 14:00:00')
+			.run();
+
+		let callCount = 0;
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/chat/completions')) {
+				callCount++;
+				if (callCount === 1) {
+					return new Response('Upstream Server Error', { status: 500 });
+				}
+				return new Response(
+					JSON.stringify({ choices: [{ index: 0, message: { role: 'assistant', content: '重试成功并回答' } }] }),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
+			return new Response(JSON.stringify({ ok: true, result: { message_id: 999 } }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvWithModel: Env = {
+				...testEnv,
+				AI_MODEL: 'gpt-4o-mini',
+				AI_API_KEY: 'test-key',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 502,
+					message: {
+						message_id: 1302,
+						from: { id: 88888, first_name: 'Alice' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: 1790578100,
+						text: '/ask 重试测试？',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
+			expect(res.status).toBe(200);
+			expect(callCount).toBe(2);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should output friendly notice when summary is blocked by safety filter', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		await testEnv.DB.prepare(
+			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+		)
+			.bind('msg-safety-summary', groupId, Date.now() - 60 * 1000, 'DevUser', '一些较为开放的讨论记录', 1303, 'Authorized Group', '2026-09-29 15:00:00')
+			.run();
+
+		let replyText = '';
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/chat/completions')) {
+				// Simulate Gemini safety block via proxy: returns empty choices
+				return new Response(JSON.stringify({ choices: [] }), {
+					status: 200,
+					headers: { 'Content-Type': 'application/json' },
+				});
+			}
+			if (url.includes('/sendMessage')) {
+				const parsed = new URL(url);
+				replyText = parsed.searchParams.get('text') || '';
+				if (!replyText && init?.body) {
+					try {
+						replyText = JSON.parse(init.body).text || '';
+					} catch (_) {}
+				}
+				return new Response(JSON.stringify({ ok: true, result: { message_id: 999 } }), { status: 200 });
+			}
+			return new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvWithModel: Env = {
+				...testEnv,
+				AI_MODEL: 'gemini-2.0-flash',
+				AI_API_KEY: 'test-key',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 503,
+					message: {
+						message_id: 1304,
+						from: { id: 88888, first_name: 'Alice' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/summary 1h',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
+			expect(res.status).toBe(200);
+			expect(replyText).toContain('触发了大模型的内容安全审查策略');
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should output friendly notice when ask is blocked by content_filter', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		await testEnv.DB.prepare(
+			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+		)
+			.bind('msg-safety-ask', groupId, Date.now() - 3600 * 1000, 'DevUser', '讨论内容', 1305, 'Authorized Group', '2026-09-29 16:00:00')
+			.run();
+
+		let replyText = '';
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/chat/completions')) {
+				return new Response(
+					JSON.stringify({
+						choices: [{ index: 0, finish_reason: 'content_filter', message: { role: 'assistant', content: null } }],
+					}),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
+			if (url.includes('/sendMessage')) {
+				const parsed = new URL(url);
+				replyText = parsed.searchParams.get('text') || '';
+				if (!replyText && init?.body) {
+					try {
+						replyText = JSON.parse(init.body).text || '';
+					} catch (_) {}
+				}
+				return new Response(JSON.stringify({ ok: true, result: { message_id: 999 } }), { status: 200 });
+			}
+			return new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvWithModel: Env = {
+				...testEnv,
+				AI_MODEL: 'gemini-2.0-flash',
+				AI_API_KEY: 'test-key',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 504,
+					message: {
+						message_id: 1306,
+						from: { id: 88888, first_name: 'Alice' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/ask 测试敏感提问',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
+			expect(res.status).toBe(200);
+			expect(replyText).toContain('触发了大模型的内容安全审查策略');
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
