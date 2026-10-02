@@ -3,7 +3,7 @@ import OpenAI from "openai";
 import { Buffer } from 'node:buffer';
 import { detectImageMimeType } from './image';
 import { extractAllOGInfo } from "./og";
-import { logModelError } from './logModelError';
+import { logModelError, notifySuperAdminsError } from './logModelError';
 import {
 	deleteTelegramMessage,
 	getMessageLink,
@@ -217,6 +217,7 @@ function getGenModel(env: Env) {
 		apiKey: getApiKey(env),
 		...(baseURL ? { baseURL } : {}),
 		timeout: 60000,
+		maxRetries: 0,
 	});
 }
 
@@ -371,6 +372,45 @@ export function isSafetyBlockError(errOrResult: any): boolean {
 	return false;
 }
 
+export function isTimeoutError(error: any): boolean {
+	if (!error) return false;
+	const name = error.name || '';
+	const message = String(error.message || error || '');
+	const code = error.code || '';
+	return (
+		name === 'APIConnectionTimeoutError' ||
+		name === 'TimeoutError' ||
+		name === 'AbortError' ||
+		code === 'ETIMEDOUT' ||
+		/timed?\s*out/i.test(message)
+	);
+}
+
+export function formatChatHistoryForAi(
+	results: any[],
+	quotedMessageId?: number,
+	maskedImageIds?: Set<number>
+) {
+	return results.flatMap((r: any) => {
+		const timeStr = r.messageTime || (r.timeStamp ? formatBeijingTime(r.timeStamp) : "");
+		const sender = timeStr ? `${r.userName} [${timeStr}]:` : `${r.userName}:`;
+		let content = r.content;
+		if (typeof content === "string" && content.startsWith("data:image/")) {
+			if (quotedMessageId) {
+				content = Number(r.messageId) === Number(quotedMessageId) ? "[目标引用图片]" : "[历史图片]";
+			} else if (maskedImageIds && (maskedImageIds.has(r.messageId) || maskedImageIds.has(Number(r.messageId)))) {
+				content = `[历史图片: ${r.userName} ${timeStr}]`;
+			}
+		}
+		return [
+			dispatchContent(`====================`),
+			dispatchContent(sender),
+			dispatchContent(content),
+			dispatchContent(getMessageLink(r)),
+		];
+	});
+}
+
 export async function callChatModelWithRetry(
 	env: Env,
 	params: { model: string; messages: any[] },
@@ -424,24 +464,113 @@ export async function callChatModelWithRetry(
 	throw lastError;
 }
 
+export async function callChatModelWithAdaptiveImageRetry(
+	env: Env,
+	params: {
+		model: string;
+		systemPrompt: string;
+		results: any[];
+		quotedMessageId?: number;
+		userQuestionContent?: any;
+	}
+): Promise<{ content: string; rawResult: any }> {
+	const imageMessages = params.results.filter(
+		(r: any) =>
+			typeof r.content === "string" &&
+			r.content.startsWith("data:image/") &&
+			(!params.quotedMessageId || r.messageId !== params.quotedMessageId)
+	);
+	const totalImages = imageMessages.length;
+
+	let attempt = 0;
+	let cutRatio = 0;
+	let maskedImageIds: Set<number> | undefined = undefined;
+
+	while (attempt < 3) {
+		attempt++;
+		if (cutRatio > 0 && totalImages > 0) {
+			const cutCount = Math.min(totalImages, Math.max(1, Math.ceil(totalImages * cutRatio)));
+			maskedImageIds = new Set<number>(imageMessages.slice(0, cutCount).map((m: any) => Number(m.messageId)));
+		}
+
+		const historyContent = formatChatHistoryForAi(params.results, params.quotedMessageId, maskedImageIds);
+		const messages: any[] = [
+			{ role: "system", content: params.systemPrompt },
+			{ role: "user", content: historyContent },
+		];
+		if (params.userQuestionContent) {
+			messages.push({ role: "user", content: params.userQuestionContent });
+		}
+
+		try {
+			const result: any = await getGenModel(env).chat.completions.create({
+				model: params.model,
+				messages,
+				...getCompletionOptions(params.model, false),
+			});
+
+			if (!result || !Array.isArray(result.choices) || result.choices.length === 0) {
+				const isSafety = isSafetyBlockError(result);
+				const err: any = new Error(isSafety ? 'CONTENT_FILTER_TRIGGERED' : 'EMPTY_CHOICES_RETURNED');
+				err.isSafetyBlock = isSafety;
+				err.rawResult = result;
+				throw err;
+			}
+
+			const choice = result.choices[0];
+			if (choice?.finish_reason === 'content_filter' || choice?.finish_reason === 'safety') {
+				const err: any = new Error('CONTENT_FILTER_TRIGGERED');
+				err.isSafetyBlock = true;
+				err.rawResult = result;
+				throw err;
+			}
+
+			const content = choice?.message?.content;
+			if (typeof content !== 'string') {
+				const err: any = new Error('INVALID_MESSAGE_CONTENT');
+				err.rawResult = result;
+				throw err;
+			}
+
+			return { content, rawResult: result };
+		} catch (err: any) {
+			console.warn(`[AI] Attempt ${attempt}/3 failed:`, err?.message || err);
+
+			if (isSafetyBlockError(err)) {
+				throw err;
+			}
+
+			if (isTimeoutError(err)) {
+				if (attempt === 1 && totalImages > 0) {
+					cutRatio = 0.10;
+					continue;
+				}
+				if (attempt === 2 && totalImages > 0) {
+					cutRatio = 0.20;
+					continue;
+				}
+			} else if (attempt < 2) {
+				await new Promise((r) => setTimeout(r, 1000));
+				continue;
+			}
+
+			throw err;
+		}
+	}
+
+	throw new Error('AI_REQUEST_EXCEEDED_MAX_ATTEMPTS');
+}
+
 async function generateSummaryRichMessage(
 	env: Env,
 	results: any[],
 	model: string,
 	quoteNotice: string
 ): Promise<{ blocks: any[]; raw: string }> {
-	const { content: raw } = await callChatModelWithRetry(env, {
+	const { content: raw } = await callChatModelWithAdaptiveImageRetry(env, {
 		model,
-		messages: [
-			{
-				role: "system",
-				content: getSystemPrompt(env, 'summary'),
-			},
-			{
-				role: "user",
-				content: formatChatHistoryForAi(results),
-			},
-		],
+		systemPrompt: getSystemPrompt(env, 'summary'),
+		results,
 	});
 
 	const richData = parseRichMessageResponse(raw);
@@ -553,23 +682,6 @@ async function transcribeVoice(
 		console.warn('Voice transcription failed or unsupported:', e);
 		return null;
 	}
-}
-
-function formatChatHistoryForAi(results: any[], quotedMessageId?: number) {
-	return results.flatMap((r: any) => {
-		const timeStr = r.messageTime || (r.timeStamp ? formatBeijingTime(r.timeStamp) : "");
-		const sender = timeStr ? `${r.userName} [${timeStr}]:` : `${r.userName}:`;
-		let content = r.content;
-		if (quotedMessageId && typeof content === "string" && content.startsWith("data:image/")) {
-			content = r.messageId === quotedMessageId ? "[目标引用图片]" : "[历史图片]";
-		}
-		return [
-			dispatchContent(`====================`),
-			dispatchContent(sender),
-			dispatchContent(content),
-			dispatchContent(getMessageLink(r)),
-		];
-	});
 }
 
 async function saveMessage(env: Env, params: {
@@ -941,13 +1053,23 @@ export default {
 						await sendTelegramRichMessage(getTelegramToken(env), group.groupId, blocks, { rawMarkdown: raw });
 					} catch (err) {
 						console.error(`Error processing scheduled summary for group ${group.groupId}:`, err);
+						await notifySuperAdminsError(
+							getTelegramToken(env),
+							getSuperAdminIds(env),
+							{
+								scene: '每日定时总结 (00:00 Cron)',
+								groupId: group.groupId,
+								error: err,
+							},
+							[getApiKey(env), getTelegramToken(env)]
+						);
 					}
 				})
 			);
 		}
 		console.debug("Scheduled cron completed.");
 	},
-	fetch: async (request: Request, env: Env, ctx: ExecutionContext) => {
+	fetch: async (request: Request, env: Env, workerCtx: ExecutionContext) => {
 		const botToken = getTelegramToken(env);
 		if (request.method === "GET") {
 			const url = new URL(request.url);
@@ -1331,33 +1453,90 @@ export default {
 					return new Response('ok');
 				}
 
-				const { results } = await env.DB.prepare(`
-					WITH latest_pool AS (
-						SELECT * FROM Messages
-						WHERE groupId=?
-						ORDER BY timeStamp DESC
-						LIMIT 1000
-					)
-					SELECT * FROM latest_pool
-					ORDER BY timeStamp ASC
-					`)
-					.bind(groupId)
-					.all();
-
-				if (!results || results.length === 0) {
-					await ctx.reply('📋 本群暂无消息记录，无法回答。');
-					return new Response('ok');
-				}
-
 				const quota = await checkAndIncrementQuota(env, userId, 'ask');
 				if (!quota.allowed) {
 					await ctx.reply(`⚠️ 您今日的 /ask 提问次数已达上限（${quota.current}/${quota.limit} 次）。配额将在次日 00:00 自动刷新。`);
 					return new Response('ok');
 				}
 
+				let results: any[] = [];
+				const replyMsg = msg.reply_to_message;
+
+				if (replyMsg) {
+					const repliedMsgId = replyMsg.message_id;
+					let targetTime: number | null = null;
+					try {
+						const dbMsg = await env.DB.prepare(
+							"SELECT timeStamp FROM Messages WHERE groupId = ? AND messageId = ?"
+						).bind(groupId, repliedMsgId).first<any>();
+						if (dbMsg?.timeStamp) {
+							targetTime = Number(dbMsg.timeStamp);
+						}
+					} catch (e) {
+						console.error("Failed to query target message timestamp:", e);
+					}
+
+					if (!targetTime && replyMsg.date) {
+						targetTime = replyMsg.date * 1000;
+					}
+
+					if (targetTime) {
+						const beforePromise = env.DB.prepare(`
+							SELECT * FROM Messages
+							WHERE groupId = ? AND timeStamp < ?
+							ORDER BY timeStamp DESC
+							LIMIT 300
+						`).bind(groupId, targetTime).all<any>();
+
+						const targetPromise = env.DB.prepare(`
+							SELECT * FROM Messages WHERE groupId = ? AND messageId = ?
+						`).bind(groupId, repliedMsgId).all<any>();
+
+						const afterPromise = env.DB.prepare(`
+							SELECT * FROM Messages
+							WHERE groupId = ? AND timeStamp > ?
+							ORDER BY timeStamp ASC
+							LIMIT 200
+						`).bind(groupId, targetTime).all<any>();
+
+						const [beforeRes, targetRes, afterRes] = await Promise.all([beforePromise, targetPromise, afterPromise]);
+
+						const beforeRows = [...(beforeRes?.results || [])].reverse();
+						const targetRows = targetRes?.results || [];
+						const afterRows = afterRes?.results || [];
+
+						const messageMap = new Map<string, any>();
+						for (const r of beforeRows) messageMap.set(String(r.id), r);
+						for (const r of targetRows) messageMap.set(String(r.id), r);
+						for (const r of afterRows) messageMap.set(String(r.id), r);
+
+						results = Array.from(messageMap.values()).sort((a, b) => Number(a.timeStamp) - Number(b.timeStamp));
+					}
+				}
+
+				if (!results || results.length === 0) {
+					const defaultRes = await env.DB.prepare(`
+						WITH latest_pool AS (
+							SELECT * FROM Messages
+							WHERE groupId=?
+							ORDER BY timeStamp DESC
+							LIMIT 1000
+						)
+						SELECT * FROM latest_pool
+						ORDER BY timeStamp ASC
+					`)
+						.bind(groupId)
+						.all<any>();
+					results = defaultRes?.results || [];
+				}
+
+				if (!results || results.length === 0) {
+					await ctx.reply('📋 本群暂无消息记录，无法回答。');
+					return new Response('ok');
+				}
+
 				let replyPromptContext = "";
 				let quotedImageContent: string | null = null;
-				const replyMsg = msg.reply_to_message;
 				if (replyMsg) {
 					const repliedUser = getUserName(replyMsg);
 					const repliedMsgId = replyMsg.message_id;
@@ -1426,86 +1605,99 @@ export default {
 				}
 
 				const botToken = getTelegramToken(env);
-				await withTemporaryStatus(
-					(text) => ctx.reply(text),
-					botToken,
-					groupId,
-					"⏳ 收到提问，正在分析近期群聊并解答，请稍候...",
-					async () => {
-						let result;
-						const groupName = msg.chat.title || "未知群组";
-						const currentTime = formatBeijingTime(msg.date ? msg.date * 1000 : Date.now());
-						const questionerInfo = getQuestionerInfo(msg);
+				const executeAskTask = async () => {
+					await withTemporaryStatus(
+						(text) => ctx.reply(text),
+						botToken,
+						groupId,
+						"⏳ 收到提问，正在分析近期群聊并解答，请稍候...",
+						async () => {
+							const groupName = msg.chat.title || "未知群组";
+							const currentTime = formatBeijingTime(msg.date ? msg.date * 1000 : Date.now());
+							const questionerInfo = getQuestionerInfo(msg);
 
-						const contextPrompt =
-							`【当前提问上下文】\n` +
-							`• 所在群组: ${groupName} (ID: ${groupId})\n` +
-							`• 提问者: ${questionerInfo}\n` +
-							`• 提问时间: ${currentTime}\n`;
+							const contextPrompt =
+								`【当前提问上下文】\n` +
+								`• 所在群组: ${groupName} (ID: ${groupId})\n` +
+								`• 提问者: ${questionerInfo}\n` +
+								`• 提问时间: ${currentTime}\n`;
 
-						const promptHeader = replyPromptContext
-							? `${contextPrompt}\n${replyPromptContext}\n`
-							: `${contextPrompt}\n`;
+							const promptHeader = replyPromptContext
+								? `${contextPrompt}\n${replyPromptContext}\n`
+								: `${contextPrompt}\n`;
 
-						const userQuestionContent = quotedImageContent
-							? [
-									{ type: "image_url" as const, image_url: { url: quotedImageContent } },
-									{ type: "text" as const, text: `${promptHeader}问题：${question}\n（请重点结合上面引用的目标图片与来源链接进行解答）` }
-							  ]
-							: `${promptHeader}问题：${question}`;
+							const userQuestionContent = quotedImageContent
+								? [
+										{ type: "image_url" as const, image_url: { url: quotedImageContent } },
+										{ type: "text" as const, text: `${promptHeader}问题：${question}\n（请重点结合上面引用的目标图片与来源链接进行解答）` }
+								  ]
+								: `${promptHeader}问题：${question}`;
 
-						let raw = "";
-						try {
-							const callRes = await callChatModelWithRetry(env, {
-								model,
-								messages: [
+							let raw = "";
+							try {
+								const callRes = await callChatModelWithAdaptiveImageRetry(env, {
+									model,
+									systemPrompt: getSystemPrompt(env, 'ask'),
+									results,
+									quotedMessageId: quotedImageContent && replyMsg ? replyMsg.message_id : undefined,
+									userQuestionContent,
+								});
+								raw = callRes.content;
+							} catch (e: any) {
+								logModelError(e, { command: 'ask', model }, [getApiKey(env), botToken]);
+								await notifySuperAdminsError(
+									botToken,
+									getSuperAdminIds(env),
 									{
-										role: "system",
-										content: getSystemPrompt(env, 'ask'),
+										scene: '/ask 提问',
+										groupId,
+										groupTitle: msg.chat?.title,
+										userId,
+										userName: getUserName(msg),
+										messageId: msg.message_id,
+										error: e,
 									},
-									{
-										role: "user",
-										content: formatChatHistoryForAi(results, quotedImageContent && replyMsg ? replyMsg.message_id : undefined),
-									},
-									{
-										role: "user",
-										content: userQuestionContent as any,
-									},
-								],
+									[getApiKey(env), botToken]
+								);
+								if (isSafetyBlockError(e)) {
+									await ctx.reply('⚠️ 该提问或相关聊天内容触发了大模型的内容安全审查策略，暂时无法回答。');
+								} else if (isTimeoutError(e)) {
+									await ctx.reply('⚠️ 本次提问分析超时，可能因涉及图片较多或网络波动，请稍后重试或缩小提问范围。');
+								} else {
+									await ctx.reply('回答失败，AI 服务暂时无法完成请求，请稍后重试。');
+								}
+								return;
+							}
+							const richData = parseRichMessageResponse(raw);
+							richData.blocks.unshift({
+								type: "blockquote",
+								blocks: [
+									{ type: "paragraph", text: `💬 提问：${question}` }
+								]
 							});
-							raw = callRes.content;
-						} catch (e: any) {
-							logModelError(e, { command: 'ask', model }, [getApiKey(env), botToken]);
-							if (isSafetyBlockError(e)) {
-								await ctx.reply('⚠️ 该提问或相关聊天内容触发了大模型的内容安全审查策略，暂时无法回答。');
-							} else {
-								await ctx.reply('回答失败，AI 服务暂时无法完成请求，请稍后重试。');
-							}
-							return;
+							richData.blocks.push(
+								{ type: "divider" },
+								{
+									type: "heading",
+									size: 6,
+									text: { type: "code", text: model }
+								}
+							);
+							await sendTelegramRichMessage(botToken, groupId, richData.blocks, {
+								rawMarkdown: raw,
+								replyToMessageId: msg.message_id,
+							});
 						}
-						const richData = parseRichMessageResponse(raw);
-						richData.blocks.unshift({
-							type: "blockquote",
-							blocks: [
-								{ type: "paragraph", text: `💬 提问：${question}` }
-							]
-						});
-						richData.blocks.push(
-							{ type: "divider" },
-							{
-								type: "heading",
-								size: 6,
-								text: { type: "code", text: model }
-							}
-						);
-						await sendTelegramRichMessage(botToken, groupId, richData.blocks, {
-							rawMarkdown: raw,
-							replyToMessageId: msg.message_id,
-						});
-					}
-				);
+					);
+				};
 
-				return new Response('ok');
+				if (workerCtx?.waitUntil && !(workerCtx as any).blockForTest) {
+					workerCtx.waitUntil(executeAskTask());
+					return new Response('ok');
+				} else {
+					await executeAskTask();
+					return new Response('ok');
+				}
 			})
 			.on("summary", async (bot) => {
 				if (!(await requireGroupChat(bot, 'summary'))) return new Response('ok');
@@ -1570,85 +1762,109 @@ export default {
 					? `⏳ 已按普通用户上限调整${noticeNote}，正在生成总结，请稍候...`
 					: "⏳ 正在读取群聊记录并生成总结，请稍候...";
 
-				await withTemporaryStatus(
-					(text) => bot.reply(text),
-					botToken,
-					groupId,
-					statusPrompt,
-					async () => {
-						let results: Record<string, unknown>[];
-						if (hours !== undefined) {
-							results = (await env.DB.prepare(`
-								SELECT *
-								FROM Messages
-								WHERE groupId=? AND timeStamp >= ?
-								ORDER BY timeStamp ASC
-								LIMIT ?
-								`)
-								.bind(groupId, Date.now() - hours * 60 * 60 * 1000, isNormalUser ? 3000 : 4000)
-								.all()).results;
-						} else {
-							if (isNormalUser) {
+				const executeSummaryTask = async () => {
+					await withTemporaryStatus(
+						(text) => bot.reply(text),
+						botToken,
+						groupId,
+						statusPrompt,
+						async () => {
+							let results: Record<string, unknown>[];
+							if (hours !== undefined) {
 								results = (await env.DB.prepare(`
-									WITH latest_n AS (
-										SELECT * FROM Messages
-										WHERE groupId=? AND timeStamp >= ?
-										ORDER BY timeStamp DESC
-										LIMIT ?
-									)
-									SELECT * FROM latest_n
+									SELECT *
+									FROM Messages
+									WHERE groupId=? AND timeStamp >= ?
 									ORDER BY timeStamp ASC
+									LIMIT ?
 									`)
-									.bind(groupId, Date.now() - 48 * 60 * 60 * 1000, limitCount)
+									.bind(groupId, Date.now() - hours * 60 * 60 * 1000, isNormalUser ? 3000 : 4000)
 									.all()).results;
 							} else {
-								results = (await env.DB.prepare(`
-									WITH latest_n AS (
-										SELECT * FROM Messages
-										WHERE groupId=?
-										ORDER BY timeStamp DESC
-										LIMIT ?
-									)
-									SELECT * FROM latest_n
-									ORDER BY timeStamp ASC
-									`)
-									.bind(groupId, limitCount)
-									.all()).results;
+								if (isNormalUser) {
+									results = (await env.DB.prepare(`
+										WITH latest_n AS (
+											SELECT * FROM Messages
+											WHERE groupId=? AND timeStamp >= ?
+											ORDER BY timeStamp DESC
+											LIMIT ?
+										)
+										SELECT * FROM latest_n
+										ORDER BY timeStamp ASC
+										`)
+										.bind(groupId, Date.now() - 48 * 60 * 60 * 1000, limitCount)
+										.all()).results;
+								} else {
+									results = (await env.DB.prepare(`
+										WITH latest_n AS (
+											SELECT * FROM Messages
+											WHERE groupId=?
+											ORDER BY timeStamp DESC
+											LIMIT ?
+										)
+										SELECT * FROM latest_n
+										ORDER BY timeStamp ASC
+										`)
+										.bind(groupId, limitCount)
+										.all()).results;
+								}
+							}
+
+							if (!results || results.length === 0) {
+								await bot.reply('📋 在指定范围暂无群聊消息记录，无需总结。');
+								return;
+							}
+
+							const model = getModelName(env);
+							if (!model) {
+								await bot.reply('未配置 AI_MODEL 环境变量，无法处理请求。');
+								return;
+							}
+
+							const countDesc = hours !== undefined ? `最近 ${hours} 小时` : `近期 ${limitCount} 条`;
+							const groupTitle = msg.chat?.title ? `「${msg.chat.title}」` : "";
+							const quoteNotice = isDefault
+								? `💡 未指定参数，默认总结群聊${groupTitle}近期 50 条消息`
+								: `总结群聊${groupTitle}${countDesc}聊天记录${noticeNote}`;
+
+							try {
+								const { blocks, raw } = await generateSummaryRichMessage(env, results, model, quoteNotice);
+								await sendTelegramRichMessage(botToken, groupId, blocks, { rawMarkdown: raw });
+							} catch (e: any) {
+								logModelError(e, { command: 'summary', model }, [getApiKey(env), botToken]);
+								await notifySuperAdminsError(
+									botToken,
+									getSuperAdminIds(env),
+									{
+										scene: '/summary 群聊概括',
+										groupId,
+										groupTitle: msg.chat?.title,
+										userId,
+										userName: getUserName(msg),
+										messageId: msg.message_id,
+										error: e,
+									},
+									[getApiKey(env), botToken]
+								);
+								if (isSafetyBlockError(e)) {
+									await bot.reply('⚠️ 本期群聊内容涉及敏感或限制级话题，触发了大模型的内容安全审查策略，未能完成总结。');
+								} else if (isTimeoutError(e)) {
+									await bot.reply('⚠️ 群聊记录较多或网络波动导致总结超时，请稍后重试或尝试指定较短时间（如 /summary 2h）。');
+								} else {
+									await bot.reply('概括失败，暂时无法完成请求，请稍后重试。');
+								}
 							}
 						}
+					);
+				};
 
-						if (!results || results.length === 0) {
-							await bot.reply('📋 在指定范围暂无群聊消息记录，无需总结。');
-							return;
-						}
-
-						const model = getModelName(env);
-						if (!model) {
-							await bot.reply('未配置 AI_MODEL 环境变量，无法处理请求。');
-							return;
-						}
-
-						const countDesc = hours !== undefined ? `最近 ${hours} 小时` : `近期 ${limitCount} 条`;
-						const groupTitle = msg.chat?.title ? `「${msg.chat.title}」` : "";
-						const quoteNotice = isDefault
-							? `💡 未指定参数，默认总结群聊${groupTitle}近期 50 条消息`
-							: `总结群聊${groupTitle}${countDesc}聊天记录${noticeNote}`;
-
-						try {
-							const { blocks, raw } = await generateSummaryRichMessage(env, results, model, quoteNotice);
-							await sendTelegramRichMessage(botToken, groupId, blocks, { rawMarkdown: raw });
-						} catch (e: any) {
-							logModelError(e, { command: 'summary', model }, [getApiKey(env), botToken]);
-							if (isSafetyBlockError(e)) {
-								await bot.reply('⚠️ 本期群聊内容涉及敏感或限制级话题，触发了大模型的内容安全审查策略，未能完成总结。');
-							} else {
-								await bot.reply('概括失败，暂时无法完成请求，请稍后重试。');
-							}
-						}
-					}
-				);
-
-				return new Response('ok');
+				if (workerCtx?.waitUntil && !(workerCtx as any).blockForTest) {
+					workerCtx.waitUntil(executeSummaryTask());
+					return new Response('ok');
+				} else {
+					await executeSummaryTask();
+					return new Response('ok');
+				}
 			})
 			.on(':message', async (bot) => {
 				const msg = bot.update?.message;

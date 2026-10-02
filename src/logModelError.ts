@@ -1,4 +1,5 @@
 import OpenAI from 'openai';
+import { getMessageLink } from './richFormat';
 
 // Providers sometimes include credentials or echoed request bodies in errors.
 function sanitize(value: unknown, secrets: string[], depth = 0, budget = { left: 6000 }): unknown {
@@ -68,4 +69,74 @@ export function logModelError(
 		serialized = serialized.split(escapedSecret).join('[REDACTED]');
 	}
 	console.error(serialized);
+}
+
+export interface AdminAlertDetails {
+	scene: string;
+	groupId?: string;
+	groupTitle?: string;
+	userId?: string;
+	userName?: string;
+	messageId?: number;
+	error: unknown;
+}
+
+function formatBeijingTime(timestamp: number): string {
+	const d = new Date(timestamp + 8 * 3600 * 1000);
+	const p = (n: number) => String(n).padStart(2, '0');
+	return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
+
+export async function notifySuperAdminsError(
+	botToken: string,
+	adminUserIds: string[],
+	details: AdminAlertDetails,
+	secrets: string[] = []
+): Promise<void> {
+	if (!botToken || !adminUserIds || adminUserIds.length === 0) return;
+
+	const errName = details.error instanceof Error ? details.error.name : 'UnknownError';
+	const errMessage = details.error instanceof Error ? details.error.message : String(details.error);
+	let errStack = details.error instanceof Error && details.error.stack ? details.error.stack : errMessage;
+
+	for (const secret of secrets.filter(Boolean)) {
+		errStack = errStack.split(secret).join('[REDACTED]');
+	}
+	errStack = errStack.replace(/data:image\/[^\s"']+/gi, '[IMAGE REDACTED]');
+	if (errStack.length > 1500) {
+		errStack = errStack.slice(0, 1500) + '...[TRUNCATED]';
+	}
+
+	const directLink = details.groupId && details.messageId
+		? getMessageLink({ groupId: details.groupId, messageId: details.messageId })
+		: '';
+
+	const timeStr = formatBeijingTime(Date.now());
+	const text = `🚨 【ChatGist 系统异常告警】\n` +
+		`• 触发场景: ${details.scene}\n` +
+		(details.groupTitle ? `• 发生群组: ${details.groupTitle} (ID: ${details.groupId || '未知'})\n` : (details.groupId ? `• 发生群组: ID ${details.groupId}\n` : '')) +
+		(details.userName ? `• 触发用户: ${details.userName} (ID: ${details.userId || '未知'})\n` : (details.userId ? `• 触发用户: ID ${details.userId}\n` : '')) +
+		(directLink ? `• 目标对话: ${directLink}\n` : '') +
+		`• 发生时间: ${timeStr} (北京时间)\n` +
+		`• 异常类型: ${errName}\n\n` +
+		`📋 错误信息与堆栈:\n` +
+		`\`\`\`\n${errStack}\n\`\`\``;
+
+	for (const adminId of adminUserIds) {
+		const targetId = adminId.trim();
+		if (!targetId) continue;
+		try {
+			await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					chat_id: targetId,
+					text,
+					disable_web_page_preview: true,
+				}),
+			});
+		} catch (sendErr) {
+			console.error(`Failed to send alert to admin ${targetId}:`, sendErr);
+		}
+	}
 }

@@ -89,6 +89,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 	const mockCtx = {
 		waitUntil: () => {},
 		passThroughOnException: () => {},
+		blockForTest: true,
 	} as any;
 
 	const testEnv: Env = {
@@ -2037,7 +2038,337 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			globalThis.fetch = originalFetch;
 		}
 	});
+
+	it('should use anchor context (300 before + target + 200 after) when user replies to an older message', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		// Insert target message at timestamp 2,000,000
+		const targetTime = 2000000;
+		const targetMsgId = 1500;
+		await testEnv.DB.prepare(
+			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+		)
+			.bind('msg-anchor-target', groupId, targetTime, 'TargetUser', '被引用的核心讨论', targetMsgId, 'Authorized Group', '2026-09-29 10:00:00')
+			.run();
+
+		// Insert 350 messages before target
+		const beforeStatements: any[] = [];
+		for (let i = 1; i <= 350; i++) {
+			beforeStatements.push(
+				testEnv.DB.prepare(
+					'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+				).bind(`msg-before-${i}`, groupId, targetTime - (360 - i) * 1000, `UserBefore${i}`, `前置消息 ${i}`, 1000 + i, 'Authorized Group', '2026-09-29 09:00:00')
+			);
+		}
+		for (let i = 0; i < beforeStatements.length; i += 100) {
+			await testEnv.DB.batch(beforeStatements.slice(i, i + 100));
+		}
+
+		// Insert 250 messages after target
+		const afterStatements: any[] = [];
+		for (let i = 1; i <= 250; i++) {
+			afterStatements.push(
+				testEnv.DB.prepare(
+					'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+				).bind(`msg-after-${i}`, groupId, targetTime + i * 1000, `UserAfter${i}`, `后置消息 ${i}`, 2000 + i, 'Authorized Group', '2026-09-29 11:00:00')
+			);
+		}
+		for (let i = 0; i < afterStatements.length; i += 100) {
+			await testEnv.DB.batch(afterStatements.slice(i, i + 100));
+		}
+
+		let capturedAiMessages: any[] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/chat/completions')) {
+				const body = JSON.parse(init.body);
+				capturedAiMessages = body.messages;
+				return new Response(
+					JSON.stringify({ choices: [{ index: 0, message: { role: 'assistant', content: '回答完毕' } }] }),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
+			return new Response(JSON.stringify({ ok: true, result: { message_id: 999 } }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvWithModel: Env = {
+				...testEnv,
+				AI_MODEL: 'gpt-4o-mini',
+				AI_API_KEY: 'test-key',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 601,
+					message: {
+						message_id: 3001,
+						from: { id: 88888, first_name: 'Bob' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/ask 当时大家讨论了什么？',
+						reply_to_message: {
+							message_id: targetMsgId,
+							from: { id: 77777, first_name: 'TargetUser' },
+							text: '被引用的核心讨论',
+							date: Math.floor(targetTime / 1000),
+						},
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
+			expect(res.status).toBe(200);
+
+			const historyTurn = capturedAiMessages[1];
+			expect(historyTurn.role).toBe('user');
+			const textItems = historyTurn.content.filter((c: any) => c.type === 'text');
+
+			// Target message itself must be present
+			expect(textItems.some((item: any) => item.text === '被引用的核心讨论')).toBe(true);
+
+			// Out-of-window messages: oldest before msg 1-50 should NOT be present (only 51-350 = 300 items)
+			expect(textItems.some((item: any) => item.text === '前置消息 1')).toBe(false);
+			expect(textItems.some((item: any) => item.text === '前置消息 50')).toBe(false);
+			expect(textItems.some((item: any) => item.text === '前置消息 51')).toBe(true);
+			expect(textItems.some((item: any) => item.text === '前置消息 350')).toBe(true);
+
+			// Out-of-window messages: newest after msg 201-250 should NOT be present (only 1-200 = 200 items)
+			expect(textItems.some((item: any) => item.text === '后置消息 200')).toBe(true);
+			expect(textItems.some((item: any) => item.text === '后置消息 201')).toBe(false);
+			expect(textItems.some((item: any) => item.text === '后置消息 250')).toBe(false);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should adaptively reduce images (10% on first timeout) and succeed on retry', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		// Insert 10 image messages
+		const imageStatements: any[] = [];
+		for (let i = 1; i <= 10; i++) {
+			imageStatements.push(
+				testEnv.DB.prepare(
+					'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+				).bind(`msg-img-${i}`, groupId, Date.now() - (20 - i) * 1000, `User${i}`, `data:image/jpeg;base64,IMAGE_DATA_${i}`, 2100 + i, 'Authorized Group', '2026-09-29 12:00:00')
+			);
+		}
+		await testEnv.DB.batch(imageStatements);
+
+		let modelCallCount = 0;
+		let lastCallMessages: any[] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/chat/completions')) {
+				modelCallCount++;
+				const body = JSON.parse(init.body);
+				lastCallMessages = body.messages;
+
+				if (modelCallCount === 1) {
+					// First attempt: simulate 60s timeout
+					const timeoutErr = new Error('Request timed out.');
+					timeoutErr.name = 'APIConnectionTimeoutError';
+					return new Response(JSON.stringify({ error: { message: 'Request timed out.' } }), {
+						status: 408,
+						headers: { 'Content-Type': 'application/json' },
+					});
+				}
+
+				return new Response(
+					JSON.stringify({ choices: [{ index: 0, message: { role: 'assistant', content: '重试成功已解答' } }] }),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
+			return new Response(JSON.stringify({ ok: true, result: { message_id: 999 } }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvWithModel: Env = {
+				...testEnv,
+				AI_MODEL: 'gpt-4o-mini',
+				AI_API_KEY: 'test-key',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 602,
+					message: {
+						message_id: 3002,
+						from: { id: 88888, first_name: 'Alice' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/ask 请分析以上图片',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
+			expect(res.status).toBe(200);
+			expect(modelCallCount).toBe(2);
+
+			// On attempt 2, earliest 10% (1 image out of 10) was reduced to [历史图片]
+			const historyTurn = lastCallMessages[1];
+			const maskedItem = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User1'));
+			expect(maskedItem).toBeDefined();
+
+			// Remaining 9 images are still image_url objects
+			const imageUrlItems = historyTurn.content.filter((item: any) => item.type === 'image_url');
+			expect(imageUrlItems.length).toBe(9);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should output friendly timeout notice and alert super admin when all retries time out', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		await testEnv.DB.prepare(
+			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+		)
+			.bind('msg-timeout-test', groupId, Date.now() - 1000, 'DevUser', '消息内容', 3101, 'Authorized Group', '2026-09-29 13:00:00')
+			.run();
+
+		let groupReplyText = '';
+		let adminAlertText = '';
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/chat/completions')) {
+				return new Response(JSON.stringify({ error: { message: 'Request timed out.' } }), {
+					status: 408,
+					headers: { 'Content-Type': 'application/json' },
+				});
+			}
+			if (url.includes('/sendMessage')) {
+				const parsed = new URL(url);
+				let text = parsed.searchParams.get('text') || '';
+				let chatId = parsed.searchParams.get('chat_id') || '';
+				if (!text && init?.body) {
+					try {
+						const body = JSON.parse(init.body);
+						text = body.text || '';
+						chatId = body.chat_id || '';
+					} catch (_) {}
+				}
+				if (chatId === '10001') {
+					adminAlertText = text;
+				} else {
+					groupReplyText = text;
+				}
+				return new Response(JSON.stringify({ ok: true, result: { message_id: 999 } }), { status: 200 });
+			}
+			return new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvWithModel: Env = {
+				...testEnv,
+				AI_MODEL: 'gpt-4o-mini',
+				AI_API_KEY: 'test-key',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 603,
+					message: {
+						message_id: 3003,
+						from: { id: 88888, first_name: 'Alice' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/ask 测试全部超时',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
+			expect(res.status).toBe(200);
+
+			// Friendly notice to group
+			expect(groupReplyText).toContain('本次提问分析超时');
+
+			// Detailed alert to super admin
+			expect(adminAlertText).toContain('🚨 【ChatGist 系统异常告警】');
+			expect(adminAlertText).toContain('/ask 提问');
+			expect(adminAlertText).toContain('https://t.me/c/888888/3003');
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should use ctx.waitUntil when blockForTest is not set', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		await testEnv.DB.prepare(
+			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+		)
+			.bind('msg-async-test', groupId, Date.now() - 1000, 'DevUser', '异步消息', 3201, 'Authorized Group', '2026-09-29 14:00:00')
+			.run();
+
+		let waitUntilPromise: Promise<any> | null = null;
+		const asyncCtx = {
+			waitUntil: (p: Promise<any>) => {
+				waitUntilPromise = p;
+			},
+			passThroughOnException: () => {},
+		} as any;
+
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/chat/completions')) {
+				return new Response(
+					JSON.stringify({ choices: [{ index: 0, message: { role: 'assistant', content: '异步解答' } }] }),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
+			return new Response(JSON.stringify({ ok: true, result: { message_id: 999 } }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvWithModel: Env = {
+				...testEnv,
+				AI_MODEL: 'gpt-4o-mini',
+				AI_API_KEY: 'test-key',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 604,
+					message: {
+						message_id: 3004,
+						from: { id: 88888, first_name: 'Alice' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/ask 测试异步',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithModel, asyncCtx);
+			expect(res.status).toBe(200);
+			expect(waitUntilPromise).not.toBeNull();
+			await waitUntilPromise;
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
 });
+
 
 
 
