@@ -251,7 +251,7 @@ function getGenModel(env: Env) {
 	return new OpenAI({
 		apiKey: getApiKey(env),
 		...(baseURL ? { baseURL } : {}),
-		timeout: 150000,
+		timeout: 55000,
 		maxRetries: 0,
 	});
 }
@@ -346,6 +346,32 @@ function getSystemPrompt(env: Env, type: 'summary' | 'ask'): string {
 	return env.SYSTEM_PROMPT_ASK?.trim() || SYSTEM_PROMPTS.answerQuestion;
 }
 
+async function sendTelegramDirectMessage(
+	botToken: string,
+	chatId: string | number,
+	text: string,
+	options: { replyToMessageId?: number } = {}
+): Promise<Response | null> {
+	if (!botToken || !chatId) return null;
+	try {
+		const payload: any = {
+			chat_id: chatId.toString(),
+			text,
+		};
+		if (options.replyToMessageId) {
+			payload.reply_parameters = { message_id: options.replyToMessageId };
+		}
+		return await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(payload),
+		});
+	} catch (e) {
+		console.error('Failed to send telegram direct message:', e);
+		return null;
+	}
+}
+
 async function withTemporaryStatus<T>(
 	replyFn: (text: string) => Promise<any>,
 	botToken: string,
@@ -412,12 +438,20 @@ export function isTimeoutError(error: any): boolean {
 	const name = error.name || '';
 	const message = String(error.message || error || '');
 	const code = error.code || '';
+	const status = error.status || error.statusCode || 0;
 	return (
+		status === 408 ||
+		status === 504 ||
+		status === 524 ||
 		name === 'APIConnectionTimeoutError' ||
 		name === 'TimeoutError' ||
 		name === 'AbortError' ||
 		code === 'ETIMEDOUT' ||
-		/timed?\s*out/i.test(message)
+		code === 'ECONNABORTED' ||
+		/time-?out/i.test(message) ||
+		/timed\s*out/i.test(message) ||
+		/deadline\s*exceeded/i.test(message) ||
+		/client\.timeout/i.test(message)
 	);
 }
 
@@ -426,16 +460,31 @@ export function formatChatHistoryForAi(
 	quotedMessageId?: number,
 	maskedImageIds?: Set<number>
 ) {
+	let lastDate: string | null = null;
 	return results.flatMap((r: any) => {
-		const timeStr = r.messageTime || (r.timeStamp ? formatBeijingTime(r.timeStamp) : "");
-		const sender = timeStr ? `${r.userName} [${timeStr}]:` : `${r.userName}:`;
+		const rawTimeStr = r.messageTime || (r.timeStamp ? formatBeijingTime(r.timeStamp) : "");
+		let displayTime = rawTimeStr;
+		if (rawTimeStr) {
+			const m = rawTimeStr.match(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})(?::\d{2})?$/);
+			if (m) {
+				const msgDate = m[1];
+				const msgTime = m[2];
+				if (msgDate !== lastDate) {
+					lastDate = msgDate;
+					displayTime = `${msgDate} ${msgTime}`;
+				} else {
+					displayTime = msgTime;
+				}
+			}
+		}
+		const sender = displayTime ? `${r.userName} [${displayTime}]:` : `${r.userName}:`;
 		let content = r.content;
 		if (typeof content === "string" && content.startsWith("data:image/")) {
 			if (quotedMessageId) {
 				content = Number(r.messageId) === Number(quotedMessageId) ? "[目标引用图片]" : "[历史图片]";
 			} else if (maskedImageIds && (maskedImageIds.has(r.messageId) || maskedImageIds.has(Number(r.messageId)))) {
 				const desc = r.imageDescription ? ` - ${r.imageDescription}` : "";
-				content = `[历史图片: ${r.userName} ${timeStr}${desc}]`;
+				content = `[历史图片: ${r.userName} ${displayTime}${desc}]`;
 			}
 		}
 		return [
@@ -500,7 +549,7 @@ export async function callChatModelWithRetry(
 	throw lastError;
 }
 
-export const MAX_PROMPT_IMAGES = 50;
+export const MAX_PROMPT_IMAGES = 25;
 
 export async function callChatModelWithAdaptiveImageRetry(
 	env: Env,
@@ -593,6 +642,10 @@ export async function callChatModelWithAdaptiveImageRetry(
 				}
 				if (attempt === 2 && activeImagesCount > 0) {
 					cutRatio = 0.30;
+					continue;
+				}
+				if (attempt < 3) {
+					await new Promise((r) => setTimeout(r, 1000));
 					continue;
 				}
 			} else if (attempt < 2) {
@@ -1471,7 +1524,7 @@ export default {
 
 				const botToken = getTelegramToken(env);
 				await withTemporaryStatus(
-					(text) => ctx.reply(text),
+					(text) => sendTelegramDirectMessage(botToken, groupId, text, { replyToMessageId: msg.message_id }),
 					botToken,
 					groupId,
 					`🔍 正在检索关键词【${keyword}】，请稍候...`,
@@ -1688,7 +1741,7 @@ export default {
 				const botToken = getTelegramToken(env);
 				const executeAskTask = async () => {
 					await withTemporaryStatus(
-						(text) => ctx.reply(text),
+						(text) => sendTelegramDirectMessage(botToken, groupId, text, { replyToMessageId: msg.message_id }),
 						botToken,
 						groupId,
 						"⏳ 收到提问，正在分析近期群聊并解答，请稍候...",
@@ -1741,11 +1794,11 @@ export default {
 									[getApiKey(env), botToken]
 								);
 								if (isSafetyBlockError(e)) {
-									await ctx.reply('⚠️ 该提问或相关聊天内容触发了大模型的内容安全审查策略，暂时无法回答。');
+									await sendTelegramDirectMessage(botToken, groupId, '⚠️ 该提问或相关聊天内容触发了大模型的内容安全审查策略，暂时无法回答。', { replyToMessageId: msg.message_id });
 								} else if (isTimeoutError(e)) {
-									await ctx.reply('⚠️ 本次提问分析超时，可能因涉及图片较多或网络波动，请稍后重试或缩小提问范围。');
+									await sendTelegramDirectMessage(botToken, groupId, '⚠️ 本次提问分析超时，可能因涉及图片较多或网络波动，请稍后重试或缩小提问范围。', { replyToMessageId: msg.message_id });
 								} else {
-									await ctx.reply('回答失败，AI 服务暂时无法完成请求，请稍后重试。');
+									await sendTelegramDirectMessage(botToken, groupId, '回答失败，AI 服务暂时无法完成请求，请稍后重试。', { replyToMessageId: msg.message_id });
 								}
 								return;
 							}
@@ -1772,8 +1825,13 @@ export default {
 					);
 				};
 
-				await executeAskTask();
-				return new Response('ok');
+				if (workerCtx?.waitUntil && !(workerCtx as any).blockForTest) {
+					workerCtx.waitUntil(executeAskTask());
+					return new Response('ok');
+				} else {
+					await executeAskTask();
+					return new Response('ok');
+				}
 			})
 			.on("summary", async (bot) => {
 				if (!(await requireGroupChat(bot, 'summary'))) return new Response('ok');
@@ -1840,7 +1898,7 @@ export default {
 
 				const executeSummaryTask = async () => {
 					await withTemporaryStatus(
-						(text) => bot.reply(text),
+						(text) => sendTelegramDirectMessage(botToken, groupId, text, { replyToMessageId: msg.message_id }),
 						botToken,
 						groupId,
 						statusPrompt,
@@ -1887,13 +1945,13 @@ export default {
 							}
 
 							if (!results || results.length === 0) {
-								await bot.reply('📋 在指定范围暂无群聊消息记录，无需总结。');
+								await sendTelegramDirectMessage(botToken, groupId, '📋 在指定范围暂无群聊消息记录，无需总结。', { replyToMessageId: msg.message_id });
 								return;
 							}
 
 							const model = getModelName(env);
 							if (!model) {
-								await bot.reply('未配置 AI_MODEL 环境变量，无法处理请求。');
+								await sendTelegramDirectMessage(botToken, groupId, '未配置 AI_MODEL 环境变量，无法处理请求。', { replyToMessageId: msg.message_id });
 								return;
 							}
 
@@ -1923,19 +1981,24 @@ export default {
 									[getApiKey(env), botToken]
 								);
 								if (isSafetyBlockError(e)) {
-									await bot.reply('⚠️ 本期群聊内容涉及敏感或限制级话题，触发了大模型的内容安全审查策略，未能完成总结。');
+									await sendTelegramDirectMessage(botToken, groupId, '⚠️ 本期群聊内容涉及敏感或限制级话题，触发了大模型的内容安全审查策略，未能完成总结。', { replyToMessageId: msg.message_id });
 								} else if (isTimeoutError(e)) {
-									await bot.reply('⚠️ 群聊记录较多或网络波动导致总结超时，请稍后重试或尝试指定较短时间（如 /summary 2h）。');
+									await sendTelegramDirectMessage(botToken, groupId, '⚠️ 群聊记录较多或网络波动导致总结超时，请稍后重试或尝试指定较短时间（如 /summary 2h）。', { replyToMessageId: msg.message_id });
 								} else {
-									await bot.reply('概括失败，暂时无法完成请求，请稍后重试。');
+									await sendTelegramDirectMessage(botToken, groupId, '概括失败，暂时无法完成请求，请稍后重试。', { replyToMessageId: msg.message_id });
 								}
 							}
 						}
 					);
 				};
 
-				await executeSummaryTask();
-				return new Response('ok');
+				if (workerCtx?.waitUntil && !(workerCtx as any).blockForTest) {
+					workerCtx.waitUntil(executeSummaryTask());
+					return new Response('ok');
+				} else {
+					await executeSummaryTask();
+					return new Response('ok');
+				}
 			})
 			.on(':message', async (bot) => {
 				const msg = bot.update?.message;

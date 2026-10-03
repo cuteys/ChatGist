@@ -87,6 +87,7 @@ import worker, { clearProcessingUpdatesForTest } from '../src/index';
 
 describe('Worker fetch whitelist gatekeeping', () => {
 	const mockCtx = {
+		blockForTest: true,
 		waitUntil: () => {},
 		passThroughOnException: () => {},
 	} as any;
@@ -1537,7 +1538,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			const historyTurn = aiMessages[1];
 			const senderItem = historyTurn.content.find((item: any) => item.text && item.text.includes('OldAlice'));
 			expect(senderItem).toBeDefined();
-			expect(senderItem.text).toContain('2024-03-29 00:00:00');
+			expect(senderItem.text).toContain('2024-03-29 00:00');
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
@@ -2534,20 +2535,20 @@ describe('Worker fetch whitelist gatekeeping', () => {
 		}
 	});
 
-	it('should enforce MAX_PROMPT_IMAGES (50) cap and replace excess images with parsed description text', async () => {
+	it('should enforce MAX_PROMPT_IMAGES (25) cap and replace excess images with parsed description text', async () => {
 		const groupId = '-100888888';
 		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
 
-		// Insert 55 image messages
+		// Insert 35 image messages
 		const imageStatements: any[] = [];
-		for (let i = 1; i <= 55; i++) {
+		for (let i = 1; i <= 35; i++) {
 			imageStatements.push(
 				testEnv.DB.prepare(
 					'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime, imageDescription) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
 				).bind(
 					`msg-img-cap-${i}`,
 					groupId,
-					Date.now() - (60 - i) * 1000,
+					Date.now() - (40 - i) * 1000,
 					`User${i}`,
 					`data:image/jpeg;base64,DATA_${i}`,
 					5000 + i,
@@ -2602,15 +2603,85 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			expect(res.status).toBe(200);
 
 			const historyTurn = capturedAiMessages[1];
-			// 55 total images: earliest 5 must be converted to text with imageDescription
-			const maskedItem1 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User1 2026-09-29 12:00:00 - 图表内容解析 1]'));
-			const maskedItem5 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User5 2026-09-29 12:00:00 - 图表内容解析 5]'));
+			// 35 total images: earliest 10 must be converted to text with imageDescription
+			// User1 is the first message of the day (includes full date and time)
+			const maskedItem1 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User1 2026-09-29 12:00 - 图表内容解析 1]'));
+			// User5 is on the same day (deduplicated to HH:mm)
+			const maskedItem5 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User5 12:00 - 图表内容解析 5]'));
 			expect(maskedItem1).toBeDefined();
 			expect(maskedItem5).toBeDefined();
 
-			// Latest 50 images must remain image_url objects
+			// Latest 25 images must remain image_url objects
 			const imageUrlItems = historyTurn.content.filter((item: any) => item.type === 'image_url');
-			expect(imageUrlItems.length).toBe(50);
+			expect(imageUrlItems.length).toBe(25);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should execute in background using workerCtx.waitUntil when blockForTest is not set', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		await testEnv.DB.prepare(
+			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+		)
+			.bind('msg-async-test', groupId, Date.now() - 1000, 'DevUser', '异步消息', 3201, 'Authorized Group', '2026-09-29 14:00:00')
+			.run();
+
+		let backgroundPromise: Promise<any> | null = null;
+		const asyncWorkerCtx = {
+			waitUntil: (p: Promise<any>) => {
+				backgroundPromise = p;
+			},
+			passThroughOnException: () => {},
+		} as any;
+
+		let capturedAiMessages: any[] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/chat/completions')) {
+				const body = JSON.parse(init.body);
+				capturedAiMessages = body.messages;
+				return new Response(
+					JSON.stringify({ choices: [{ index: 0, message: { role: 'assistant', content: '异步后台总结完成' } }] }),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
+			return new Response(JSON.stringify({ ok: true, result: { message_id: 999 } }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvWithModel: Env = {
+				...testEnv,
+				AI_MODEL: 'gpt-4o-mini',
+				AI_API_KEY: 'test-key',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 703,
+					message: {
+						message_id: 4003,
+						from: { id: 88888, first_name: 'Alice' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/ask 测试后台异步执行',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithModel, asyncWorkerCtx);
+			// Responds immediately with 200 OK
+			expect(res.status).toBe(200);
+			expect(backgroundPromise).not.toBeNull();
+
+			// Await background execution to verify completion
+			await backgroundPromise;
+			expect(capturedAiMessages.length).toBeGreaterThan(0);
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
