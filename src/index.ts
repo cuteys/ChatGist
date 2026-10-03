@@ -251,7 +251,7 @@ function getGenModel(env: Env) {
 	return new OpenAI({
 		apiKey: getApiKey(env),
 		...(baseURL ? { baseURL } : {}),
-		timeout: 55000,
+		timeout: 52000,
 		maxRetries: 0,
 	});
 }
@@ -549,7 +549,7 @@ export async function callChatModelWithRetry(
 	throw lastError;
 }
 
-export const MAX_PROMPT_IMAGES = 25;
+export const MAX_PROMPT_IMAGES = 50;
 
 export async function callChatModelWithAdaptiveImageRetry(
 	env: Env,
@@ -1825,13 +1825,8 @@ export default {
 					);
 				};
 
-				if (workerCtx?.waitUntil && !(workerCtx as any).blockForTest) {
-					workerCtx.waitUntil(executeAskTask());
-					return new Response('ok');
-				} else {
-					await executeAskTask();
-					return new Response('ok');
-				}
+				await executeAskTask();
+				return new Response('ok');
 			})
 			.on("summary", async (bot) => {
 				if (!(await requireGroupChat(bot, 'summary'))) return new Response('ok');
@@ -1992,13 +1987,8 @@ export default {
 					);
 				};
 
-				if (workerCtx?.waitUntil && !(workerCtx as any).blockForTest) {
-					workerCtx.waitUntil(executeSummaryTask());
-					return new Response('ok');
-				} else {
-					await executeSummaryTask();
-					return new Response('ok');
-				}
+				await executeSummaryTask();
+				return new Response('ok');
 			})
 			.on(':message', async (bot) => {
 				const msg = bot.update?.message;
