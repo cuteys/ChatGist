@@ -89,7 +89,6 @@ describe('Worker fetch whitelist gatekeeping', () => {
 	const mockCtx = {
 		waitUntil: () => {},
 		passThroughOnException: () => {},
-		blockForTest: true,
 	} as any;
 
 	const testEnv: Env = {
@@ -113,10 +112,17 @@ describe('Worker fetch whitelist gatekeeping', () => {
 				messageTime TEXT
 			)
 		`).run();
+		await testEnv.DB.prepare(`
+			CREATE TABLE IF NOT EXISTS ProcessedUpdates (
+				updateId INTEGER PRIMARY KEY,
+				createdAt INTEGER NOT NULL
+			)
+		`).run();
 		await initWhitelistTables(testEnv);
 		await testEnv.DB.prepare('DELETE FROM WhitelistGroups').run();
 		await testEnv.DB.prepare('DELETE FROM Admins').run();
 		await testEnv.DB.prepare('DELETE FROM Messages').run();
+		await testEnv.DB.prepare('DELETE FROM ProcessedUpdates').run();
 	});
 
 	it('should silently ignore messages from non-whitelisted groups', async () => {
@@ -2389,34 +2395,31 @@ describe('Worker fetch whitelist gatekeeping', () => {
 		}
 	});
 
-	it('should use ctx.waitUntil when blockForTest is not set', async () => {
+	it('should drop duplicate update_id across instances using D1 ProcessedUpdates and avoid duplicate replies', async () => {
 		const groupId = '-100888888';
 		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
 
 		await testEnv.DB.prepare(
 			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
 		)
-			.bind('msg-async-test', groupId, Date.now() - 1000, 'DevUser', '异步消息', 3201, 'Authorized Group', '2026-09-29 14:00:00')
+			.bind('msg-dedup-test', groupId, Date.now() - 1000, 'DevUser', '去重消息', 3301, 'Authorized Group', '2026-09-29 14:00:00')
 			.run();
 
-		let waitUntilPromise: Promise<any> | null = null;
-		const asyncCtx = {
-			waitUntil: (p: Promise<any>) => {
-				waitUntilPromise = p;
-			},
-			passThroughOnException: () => {},
-		} as any;
-
+		let sendMsgCallCount = 0;
 		const originalFetch = globalThis.fetch;
-		globalThis.fetch = (async (input: any) => {
+		globalThis.fetch = (async (input: any, init?: any) => {
 			const url = typeof input === 'string' ? input : input.url;
 			if (url.includes('/chat/completions')) {
 				return new Response(
-					JSON.stringify({ choices: [{ index: 0, message: { role: 'assistant', content: '异步解答' } }] }),
+					JSON.stringify({ choices: [{ index: 0, message: { role: 'assistant', content: '首次执行回答' } }] }),
 					{ status: 200, headers: { 'Content-Type': 'application/json' } }
 				);
 			}
-			return new Response(JSON.stringify({ ok: true, result: { message_id: 999 } }), { status: 200 });
+			if (url.includes('/sendMessage')) {
+				sendMsgCallCount++;
+				return new Response(JSON.stringify({ ok: true, result: { message_id: 999 } }), { status: 200 });
+			}
+			return new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 });
 		}) as any;
 
 		try {
@@ -2426,25 +2429,41 @@ describe('Worker fetch whitelist gatekeeping', () => {
 				AI_API_KEY: 'test-key',
 			};
 
-			const req = new Request('https://chatgist.example.com/', {
+			const reqBody = {
+				update_id: 605,
+				message: {
+					message_id: 3005,
+					from: { id: 88888, first_name: 'Alice' },
+					chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+					date: Math.floor(Date.now() / 1000),
+					text: '/ask 测试去重',
+				},
+			};
+
+			// First request: processed normally
+			const req1 = new Request('https://chatgist.example.com/', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({
-					update_id: 604,
-					message: {
-						message_id: 3004,
-						from: { id: 88888, first_name: 'Alice' },
-						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
-						date: Math.floor(Date.now() / 1000),
-						text: '/ask 测试异步',
-					},
-				}),
+				body: JSON.stringify(reqBody),
 			});
+			const res1 = await worker.fetch(req1, testEnvWithModel, mockCtx);
+			expect(res1.status).toBe(200);
+			expect(sendMsgCallCount).toBeGreaterThanOrEqual(1);
 
-			const res = await worker.fetch(req, testEnvWithModel, asyncCtx);
-			expect(res.status).toBe(200);
-			expect(waitUntilPromise).not.toBeNull();
-			await waitUntilPromise;
+			// Simulate another isolate: clear memory Map cache, but D1 persisted table has update_id
+			clearProcessingUpdatesForTest();
+			const beforeRetryCalls = sendMsgCallCount;
+
+			// Second request (simulating Telegram retry): should be dropped silently by D1 check
+			const req2 = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(reqBody),
+			});
+			const res2 = await worker.fetch(req2, testEnvWithModel, mockCtx);
+			expect(res2.status).toBe(200);
+			// No new messages should have been sent!
+			expect(sendMsgCallCount).toBe(beforeRetryCalls);
 		} finally {
 			globalThis.fetch = originalFetch;
 		}

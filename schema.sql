@@ -37,3 +37,11 @@ CREATE TABLE IF NOT EXISTS UserUsage (
 );
 CREATE INDEX IF NOT EXISTS idx_userusage_date
 	ON UserUsage(date);
+
+CREATE TABLE IF NOT EXISTS ProcessedUpdates (
+	updateId INTEGER PRIMARY KEY,
+	createdAt INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_processed_updates_created_at
+	ON ProcessedUpdates(createdAt);
+

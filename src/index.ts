@@ -73,16 +73,18 @@ async function sendChatAction(token: string, chatId: string | number, action = '
 }
 
 const processingUpdates = new Map<number, number>();
+let processedUpdatesTableReady = false;
 
 export function clearProcessingUpdatesForTest() {
 	processingUpdates.clear();
+	processedUpdatesTableReady = false;
 }
 
-function isDuplicateUpdate(updateId?: number): boolean {
+export async function isDuplicateUpdate(env: Env, updateId?: number): Promise<boolean> {
 	if (!updateId) return false;
 	const now = Date.now();
 	for (const [id, ts] of processingUpdates.entries()) {
-		if (now - ts > 5 * 60 * 1000) {
+		if (now - ts > 10 * 60 * 1000) {
 			processingUpdates.delete(id);
 		}
 	}
@@ -90,6 +92,39 @@ function isDuplicateUpdate(updateId?: number): boolean {
 		return true;
 	}
 	processingUpdates.set(updateId, now);
+
+	if (env.DB) {
+		try {
+			if (!processedUpdatesTableReady) {
+				await env.DB.prepare(`
+					CREATE TABLE IF NOT EXISTS ProcessedUpdates (
+						updateId INTEGER PRIMARY KEY,
+						createdAt INTEGER NOT NULL
+					)
+				`).run();
+				processedUpdatesTableReady = true;
+			}
+
+			const res = await env.DB.prepare(
+				'INSERT OR IGNORE INTO ProcessedUpdates (updateId, createdAt) VALUES (?, ?)'
+			).bind(updateId, now).run();
+
+			const changes = res?.meta?.changes ?? (res as any)?.changes ?? 1;
+			if (changes === 0) {
+				return true;
+			}
+
+			if (Math.random() < 0.05) {
+				await env.DB.prepare('DELETE FROM ProcessedUpdates WHERE createdAt < ?')
+					.bind(now - 10 * 60 * 1000)
+					.run()
+					.catch(() => {});
+			}
+		} catch (e) {
+			console.error('Failed to record update in ProcessedUpdates:', e);
+		}
+	}
+
 	return false;
 }
 
@@ -1103,7 +1138,7 @@ export default {
 				return new Response("bad request", { status: 400 });
 			}
 
-			if (isDuplicateUpdate(body?.update_id)) {
+			if (await isDuplicateUpdate(env, body?.update_id)) {
 				return new Response("ok");
 			}
 
@@ -1691,13 +1726,8 @@ export default {
 					);
 				};
 
-				if (workerCtx?.waitUntil && !(workerCtx as any).blockForTest) {
-					workerCtx.waitUntil(executeAskTask());
-					return new Response('ok');
-				} else {
-					await executeAskTask();
-					return new Response('ok');
-				}
+				await executeAskTask();
+				return new Response('ok');
 			})
 			.on("summary", async (bot) => {
 				if (!(await requireGroupChat(bot, 'summary'))) return new Response('ok');
@@ -1858,13 +1888,8 @@ export default {
 					);
 				};
 
-				if (workerCtx?.waitUntil && !(workerCtx as any).blockForTest) {
-					workerCtx.waitUntil(executeSummaryTask());
-					return new Response('ok');
-				} else {
-					await executeSummaryTask();
-					return new Response('ok');
-				}
+				await executeSummaryTask();
+				return new Response('ok');
 			})
 			.on(':message', async (bot) => {
 				const msg = bot.update?.message;
