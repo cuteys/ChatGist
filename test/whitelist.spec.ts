@@ -2471,10 +2471,11 @@ describe('Worker fetch whitelist gatekeeping', () => {
 		}
 	});
 
-	it('should automatically generate image description on photo receipt and store in D1', async () => {
+	it('should directly store photo in D1 on photo receipt without real-time visual recognition', async () => {
 		const groupId = '-100888888';
 		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
 
+		let aiCallCount = 0;
 		const originalFetch = globalThis.fetch;
 		globalThis.fetch = (async (input: any) => {
 			const url = typeof input === 'string' ? input : input.url;
@@ -2486,6 +2487,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 				return new Response(fakeJpeg, { status: 200, headers: { 'Content-Type': 'image/jpeg' } });
 			}
 			if (url.includes('/chat/completions')) {
+				aiCallCount++;
 				return new Response(
 					JSON.stringify({
 						choices: [{ index: 0, message: { role: 'assistant', content: '这是一个系统的网络拓扑架构图' } }],
@@ -2525,36 +2527,36 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
 			expect(res.status).toBe(200);
 
+			// AI chat/completions must NOT be called on photo ingestion
+			expect(aiCallCount).toBe(0);
+
 			const saved = await testEnv.DB.prepare('SELECT * FROM Messages WHERE messageId = 4001').first<any>();
 			expect(saved).toBeDefined();
 			expect(saved.content).toMatch(/^data:image\/jpeg;base64,/);
-			expect(saved.imageDescription).toContain('这是一个系统的网络拓扑架构图');
-			expect(saved.imageDescription).toContain('【附言】帮我看看架构');
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
 	});
 
-	it('should enforce MAX_PROMPT_IMAGES (50) cap and replace excess images with parsed description text', async () => {
+	it('should enforce MAX_PROMPT_IMAGES (100) cap and mask excess images in prompt', async () => {
 		const groupId = '-100888888';
 		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
 
-		// Insert 55 image messages
+		// Insert 105 image messages
 		const imageStatements: any[] = [];
-		for (let i = 1; i <= 55; i++) {
+		for (let i = 1; i <= 105; i++) {
 			imageStatements.push(
 				testEnv.DB.prepare(
-					'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime, imageDescription) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+					'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
 				).bind(
 					`msg-img-cap-${i}`,
 					groupId,
-					Date.now() - (60 - i) * 1000,
+					Date.now() - (110 - i) * 1000,
 					`User${i}`,
 					`data:image/jpeg;base64,DATA_${i}`,
 					5000 + i,
 					'Authorized Group',
-					'2026-09-29 12:00:00',
-					`图表内容解析 ${i}`
+					'2026-09-29 12:00:00'
 				)
 			);
 		}
@@ -2603,17 +2605,15 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			expect(res.status).toBe(200);
 
 			const historyTurn = capturedAiMessages[1];
-			// 55 total images: earliest 5 must be converted to text with imageDescription
-			// User1 is the first message of the day (includes full date and time)
-			const maskedItem1 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User1 2026-09-29 12:00 - 图表内容解析 1]'));
-			// User5 is on the same day (deduplicated to HH:mm)
-			const maskedItem5 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User5 12:00 - 图表内容解析 5]'));
+			// 105 total images: earliest 5 must be converted to [历史图片: ...]
+			const maskedItem1 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User1'));
+			const maskedItem5 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User5'));
 			expect(maskedItem1).toBeDefined();
 			expect(maskedItem5).toBeDefined();
 
-			// Latest 50 images must remain image_url objects
+			// Latest 100 images must remain image_url objects
 			const imageUrlItems = historyTurn.content.filter((item: any) => item.type === 'image_url');
-			expect(imageUrlItems.length).toBe(50);
+			expect(imageUrlItems.length).toBe(100);
 		} finally {
 			globalThis.fetch = originalFetch;
 		}

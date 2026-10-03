@@ -551,7 +551,7 @@ export async function callChatModelWithRetry(
 	throw lastError;
 }
 
-export const MAX_PROMPT_IMAGES = 50;
+export const MAX_PROMPT_IMAGES = 100;
 
 export async function callChatModelWithAdaptiveImageRetry(
 	env: Env,
@@ -783,40 +783,6 @@ async function transcribeVoice(
 		console.warn('Voice transcription failed or unsupported:', e);
 		return null;
 	}
-}
-
-export async function describeImage(env: Env, imageContent: string, caption?: string): Promise<string> {
-	const model = getModelName(env);
-	if (!model || !getApiKey(env)) {
-		return caption ? `【附言】${caption}` : "";
-	}
-	try {
-		const client = getGenModel(env);
-		const prompt = "请用简明精炼的1-2句话概括这张图片的关键视觉信息、文字（OCR）或图表走势（无需客套话）。";
-		const response: any = await client.chat.completions.create(
-			{
-				model,
-				messages: [
-					{
-						role: "user",
-						content: [
-							{ type: "image_url", image_url: { url: imageContent } },
-							{ type: "text", text: caption ? `${prompt}\n附带说明: ${caption}` : prompt },
-						],
-					},
-				],
-				max_tokens: 150,
-			},
-			{ timeout: 15000 }
-		);
-		const desc = response?.choices?.[0]?.message?.content?.trim();
-		if (desc) {
-			return caption ? `【附言】${caption} 【画面内容】${desc}` : desc;
-		}
-	} catch (err) {
-		console.warn("Image pre-parsing failed, fallback to caption:", err);
-	}
-	return caption ? `【附言】${caption}` : "";
 }
 
 async function saveMessage(env: Env, params: {
@@ -2052,16 +2018,7 @@ export default {
 
 						const content = `data:${mimeType};base64,` + Buffer.from(file).toString("base64");
 						const timeStamp = msg.date ? msg.date * 1000 : Date.now();
-						const imageDescription = await describeImage(env, content, msg.caption);
-						await saveMessage(env, {
-							groupId,
-							messageId,
-							userName,
-							content,
-							groupName,
-							timeStamp,
-							imageDescription,
-						});
+						await saveMessage(env, { groupId, messageId, userName, content, groupName, timeStamp });
 						return new Response('ok');
 					}
 					default: {
