@@ -9,8 +9,7 @@ CREATE TABLE IF NOT EXISTS Messages (
 	content TEXT,
 	messageId INTEGER,
 	groupName TEXT,
-	messageTime TEXT,
-	imageDescription TEXT
+	messageTime TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_groupid_timestamp
 	ON Messages(groupId, timeStamp DESC);

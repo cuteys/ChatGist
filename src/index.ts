@@ -485,8 +485,7 @@ export function formatChatHistoryForAi(
 			if (quotedMessageId) {
 				content = Number(r.messageId) === Number(quotedMessageId) ? "[目标引用图片]" : "[历史图片]";
 			} else if (maskedImageIds && (maskedImageIds.has(r.messageId) || maskedImageIds.has(Number(r.messageId)))) {
-				const desc = r.imageDescription ? ` - ${r.imageDescription}` : "";
-				content = `[历史图片: ${r.userName} ${displayTime}${desc}]`;
+				content = `[历史图片: ${r.userName} ${displayTime}]`;
 			}
 		}
 		return [
@@ -792,15 +791,13 @@ async function saveMessage(env: Env, params: {
 	content: string;
 	groupName: string;
 	timeStamp?: number;
-	imageDescription?: string;
 }) {
 	const timeStamp = params.timeStamp || Date.now();
 	const messageTime = formatBeijingTime(timeStamp);
-	const imageDescription = params.imageDescription || null;
 
 	const doInsert = () =>
 		env.DB.prepare(
-			`INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime, imageDescription) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			`INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 		)
 			.bind(
 				getMessageLink({ groupId: params.groupId, messageId: params.messageId }),
@@ -810,8 +807,7 @@ async function saveMessage(env: Env, params: {
 				params.content,
 				params.messageId,
 				params.groupName,
-				messageTime,
-				imageDescription
+				messageTime
 			)
 			.run();
 
@@ -824,7 +820,6 @@ async function saveMessage(env: Env, params: {
 		if (isMissingColumn) {
 			try {
 				await env.DB.prepare("ALTER TABLE Messages ADD COLUMN messageTime TEXT").run().catch(() => {});
-				await env.DB.prepare("ALTER TABLE Messages ADD COLUMN imageDescription TEXT").run().catch(() => {});
 				await doInsert();
 				return;
 			} catch (alterErr) {

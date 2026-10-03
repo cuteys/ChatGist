@@ -18,8 +18,7 @@ describe('Storage management tests', () => {
 				content TEXT,
 				messageId INTEGER,
 				groupName TEXT,
-				messageTime TEXT,
-				imageDescription TEXT
+				messageTime TEXT
 			)
 		`).run();
 		await env.DB.prepare('DELETE FROM Messages').run();

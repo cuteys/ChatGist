@@ -110,8 +110,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 				content TEXT,
 				messageId INTEGER,
 				groupName TEXT,
-				messageTime TEXT,
-				imageDescription TEXT
+				messageTime TEXT
 			)
 		`).run();
 		await testEnv.DB.prepare(`
