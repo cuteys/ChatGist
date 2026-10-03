@@ -109,7 +109,8 @@ describe('Worker fetch whitelist gatekeeping', () => {
 				content TEXT,
 				messageId INTEGER,
 				groupName TEXT,
-				messageTime TEXT
+				messageTime TEXT,
+				imageDescription TEXT
 			)
 		`).run();
 		await testEnv.DB.prepare(`
@@ -2464,6 +2465,152 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			expect(res2.status).toBe(200);
 			// No new messages should have been sent!
 			expect(sendMsgCallCount).toBe(beforeRetryCalls);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should automatically generate image description on photo receipt and store in D1', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/getFile')) {
+				return new Response(JSON.stringify({ ok: true, result: { file_path: 'photos/file_1.jpg' } }), { status: 200 });
+			}
+			if (url.includes('/file/bot') || url.endsWith('.jpg')) {
+				const fakeJpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0xff, 0xd9]);
+				return new Response(fakeJpeg, { status: 200, headers: { 'Content-Type': 'image/jpeg' } });
+			}
+			if (url.includes('/chat/completions')) {
+				return new Response(
+					JSON.stringify({
+						choices: [{ index: 0, message: { role: 'assistant', content: '这是一个系统的网络拓扑架构图' } }],
+					}),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
+			return new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvWithModel: Env = {
+				...testEnv,
+				AI_MODEL: 'gpt-4o-mini',
+				AI_API_KEY: 'test-key',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 701,
+					message: {
+						message_id: 4001,
+						from: { id: 88888, first_name: 'Bob' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						caption: '帮我看看架构',
+						photo: [
+							{ file_id: 'photo_small', file_size: 5000, width: 200, height: 200 },
+							{ file_id: 'photo_large', file_size: 15000, width: 800, height: 800 },
+						],
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
+			expect(res.status).toBe(200);
+
+			const saved = await testEnv.DB.prepare('SELECT * FROM Messages WHERE messageId = 4001').first<any>();
+			expect(saved).toBeDefined();
+			expect(saved.content).toMatch(/^data:image\/jpeg;base64,/);
+			expect(saved.imageDescription).toContain('这是一个系统的网络拓扑架构图');
+			expect(saved.imageDescription).toContain('【附言】帮我看看架构');
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should enforce MAX_PROMPT_IMAGES (50) cap and replace excess images with parsed description text', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		// Insert 55 image messages
+		const imageStatements: any[] = [];
+		for (let i = 1; i <= 55; i++) {
+			imageStatements.push(
+				testEnv.DB.prepare(
+					'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime, imageDescription) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+				).bind(
+					`msg-img-cap-${i}`,
+					groupId,
+					Date.now() - (60 - i) * 1000,
+					`User${i}`,
+					`data:image/jpeg;base64,DATA_${i}`,
+					5000 + i,
+					'Authorized Group',
+					'2026-09-29 12:00:00',
+					`图表内容解析 ${i}`
+				)
+			);
+		}
+		for (let i = 0; i < imageStatements.length; i += 20) {
+			await testEnv.DB.batch(imageStatements.slice(i, i + 20));
+		}
+
+		let capturedAiMessages: any[] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/chat/completions')) {
+				const body = JSON.parse(init.body);
+				capturedAiMessages = body.messages;
+				return new Response(
+					JSON.stringify({ choices: [{ index: 0, message: { role: 'assistant', content: '总结完成' } }] }),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
+			return new Response(JSON.stringify({ ok: true, result: { message_id: 999 } }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvWithModel: Env = {
+				...testEnv,
+				AI_MODEL: 'gpt-4o-mini',
+				AI_API_KEY: 'test-key',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 702,
+					message: {
+						message_id: 4002,
+						from: { id: 88888, first_name: 'Alice' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/ask 总结所有图片内容',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
+			expect(res.status).toBe(200);
+
+			const historyTurn = capturedAiMessages[1];
+			// 55 total images: earliest 5 must be converted to text with imageDescription
+			const maskedItem1 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User1 2026-09-29 12:00:00 - 图表内容解析 1]'));
+			const maskedItem5 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User5 2026-09-29 12:00:00 - 图表内容解析 5]'));
+			expect(maskedItem1).toBeDefined();
+			expect(maskedItem5).toBeDefined();
+
+			// Latest 50 images must remain image_url objects
+			const imageUrlItems = historyTurn.content.filter((item: any) => item.type === 'image_url');
+			expect(imageUrlItems.length).toBe(50);
 		} finally {
 			globalThis.fetch = originalFetch;
 		}

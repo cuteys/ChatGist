@@ -434,7 +434,8 @@ export function formatChatHistoryForAi(
 			if (quotedMessageId) {
 				content = Number(r.messageId) === Number(quotedMessageId) ? "[目标引用图片]" : "[历史图片]";
 			} else if (maskedImageIds && (maskedImageIds.has(r.messageId) || maskedImageIds.has(Number(r.messageId)))) {
-				content = `[历史图片: ${r.userName} ${timeStr}]`;
+				const desc = r.imageDescription ? ` - ${r.imageDescription}` : "";
+				content = `[历史图片: ${r.userName} ${timeStr}${desc}]`;
 			}
 		}
 		return [
@@ -499,6 +500,8 @@ export async function callChatModelWithRetry(
 	throw lastError;
 }
 
+export const MAX_PROMPT_IMAGES = 50;
+
 export async function callChatModelWithAdaptiveImageRetry(
 	env: Env,
 	params: {
@@ -513,9 +516,11 @@ export async function callChatModelWithAdaptiveImageRetry(
 		(r: any) =>
 			typeof r.content === "string" &&
 			r.content.startsWith("data:image/") &&
-			(!params.quotedMessageId || r.messageId !== params.quotedMessageId)
+			(!params.quotedMessageId || Number(r.messageId) !== Number(params.quotedMessageId))
 	);
 	const totalImages = imageMessages.length;
+	const baseCapCut = Math.max(0, totalImages - MAX_PROMPT_IMAGES);
+	const activeImagesCount = totalImages - baseCapCut;
 
 	let attempt = 0;
 	let cutRatio = 0;
@@ -523,9 +528,15 @@ export async function callChatModelWithAdaptiveImageRetry(
 
 	while (attempt < 3) {
 		attempt++;
-		if (cutRatio > 0 && totalImages > 0) {
-			const cutCount = Math.min(totalImages, Math.max(1, Math.ceil(totalImages * cutRatio)));
-			maskedImageIds = new Set<number>(imageMessages.slice(0, cutCount).map((m: any) => Number(m.messageId)));
+		if (totalImages > 0) {
+			let totalCut = baseCapCut;
+			if (cutRatio > 0 && activeImagesCount > 0) {
+				const additionalCut = Math.min(activeImagesCount, Math.max(1, Math.ceil(activeImagesCount * cutRatio)));
+				totalCut = baseCapCut + additionalCut;
+			}
+			if (totalCut > 0) {
+				maskedImageIds = new Set<number>(imageMessages.slice(0, totalCut).map((m: any) => Number(m.messageId)));
+			}
 		}
 
 		const historyContent = formatChatHistoryForAi(params.results, params.quotedMessageId, maskedImageIds);
@@ -576,11 +587,11 @@ export async function callChatModelWithAdaptiveImageRetry(
 			}
 
 			if (isTimeoutError(err)) {
-				if (attempt === 1 && totalImages > 0) {
+				if (attempt === 1 && activeImagesCount > 0) {
 					cutRatio = 0.15;
 					continue;
 				}
-				if (attempt === 2 && totalImages > 0) {
+				if (attempt === 2 && activeImagesCount > 0) {
 					cutRatio = 0.30;
 					continue;
 				}
@@ -719,6 +730,40 @@ async function transcribeVoice(
 	}
 }
 
+export async function describeImage(env: Env, imageContent: string, caption?: string): Promise<string> {
+	const model = getModelName(env);
+	if (!model || !getApiKey(env)) {
+		return caption ? `【附言】${caption}` : "";
+	}
+	try {
+		const client = getGenModel(env);
+		const prompt = "请用简明精炼的1-2句话概括这张图片的关键视觉信息、文字（OCR）或图表走势（无需客套话）。";
+		const response: any = await client.chat.completions.create(
+			{
+				model,
+				messages: [
+					{
+						role: "user",
+						content: [
+							{ type: "image_url", image_url: { url: imageContent } },
+							{ type: "text", text: caption ? `${prompt}\n附带说明: ${caption}` : prompt },
+						],
+					},
+				],
+				max_tokens: 150,
+			},
+			{ timeout: 15000 }
+		);
+		const desc = response?.choices?.[0]?.message?.content?.trim();
+		if (desc) {
+			return caption ? `【附言】${caption} 【画面内容】${desc}` : desc;
+		}
+	} catch (err) {
+		console.warn("Image pre-parsing failed, fallback to caption:", err);
+	}
+	return caption ? `【附言】${caption}` : "";
+}
+
 async function saveMessage(env: Env, params: {
 	groupId: string;
 	messageId: number;
@@ -726,13 +771,15 @@ async function saveMessage(env: Env, params: {
 	content: string;
 	groupName: string;
 	timeStamp?: number;
+	imageDescription?: string;
 }) {
 	const timeStamp = params.timeStamp || Date.now();
 	const messageTime = formatBeijingTime(timeStamp);
+	const imageDescription = params.imageDescription || null;
 
 	const doInsert = () =>
 		env.DB.prepare(
-			`INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+			`INSERT OR REPLACE INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime, imageDescription) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
 		)
 			.bind(
 				getMessageLink({ groupId: params.groupId, messageId: params.messageId }),
@@ -742,26 +789,25 @@ async function saveMessage(env: Env, params: {
 				params.content,
 				params.messageId,
 				params.groupName,
-				messageTime
+				messageTime,
+				imageDescription
 			)
 			.run();
 
 	try {
 		await doInsert();
 	} catch (e: any) {
-		const isMissingColumn = e?.message && (
-			e.message.includes("no such column: messageTime") ||
-			e.message.includes("has no column named messageTime") ||
-			(e?.cause?.message && (e.cause.message.includes("no such column: messageTime") || e.cause.message.includes("has no column named messageTime")))
-		);
+		const errMsg = `${e?.message || ""} ${e?.cause?.message || ""}`;
+		const isMissingColumn = errMsg.includes("no such column") || errMsg.includes("has no column named");
 
 		if (isMissingColumn) {
 			try {
-				await env.DB.prepare("ALTER TABLE Messages ADD COLUMN messageTime TEXT").run();
+				await env.DB.prepare("ALTER TABLE Messages ADD COLUMN messageTime TEXT").run().catch(() => {});
+				await env.DB.prepare("ALTER TABLE Messages ADD COLUMN imageDescription TEXT").run().catch(() => {});
 				await doInsert();
 				return;
 			} catch (alterErr) {
-				console.error("Auto-migrate messageTime column failed:", alterErr);
+				console.error("Auto-migrate columns failed:", alterErr);
 			}
 		}
 
@@ -1951,7 +1997,16 @@ export default {
 
 						const content = `data:${mimeType};base64,` + Buffer.from(file).toString("base64");
 						const timeStamp = msg.date ? msg.date * 1000 : Date.now();
-						await saveMessage(env, { groupId, messageId, userName, content, groupName, timeStamp });
+						const imageDescription = await describeImage(env, content, msg.caption);
+						await saveMessage(env, {
+							groupId,
+							messageId,
+							userName,
+							content,
+							groupName,
+							timeStamp,
+							imageDescription,
+						});
 						return new Response('ok');
 					}
 					default: {
