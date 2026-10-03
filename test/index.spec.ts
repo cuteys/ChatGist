@@ -79,7 +79,7 @@ describe("JPEG validation", () => {
 });
 
 import { extractAllOGInfo } from "../src/og";
-import { formatBeijingTime } from "../src/index";
+import { formatBeijingTime, getCompletionOptions } from "../src/index";
 
 describe("OG info security", () => {
 	it("should reject private and local hosts without fetching", async () => {
@@ -99,5 +99,30 @@ describe("formatBeijingTime", () => {
 		expect(formatBeijingTime(tsCross)).toBe("2026-09-29 00:30:15");
 	});
 });
+
+describe("getCompletionOptions", () => {
+	it("should default reasoning_effort to medium", () => {
+		const options = getCompletionOptions("gemini-2.5-flash");
+		expect(options.reasoning_effort).toBe("medium");
+		expect(options.max_tokens).toBe(4096);
+	});
+
+	it("should respect REASONING_EFFORT environment variable", () => {
+		const options = getCompletionOptions("gemini-2.5-flash", false, { REASONING_EFFORT: "high" } as any);
+		expect(options.reasoning_effort).toBe("high");
+		expect(options.max_completion_tokens).toBe(4096);
+	});
+
+	it("should set max_completion_tokens for o1/o3/thinking/r1 models", () => {
+		const o3Options = getCompletionOptions("o3-mini");
+		expect(o3Options.reasoning_effort).toBe("medium");
+		expect(o3Options.max_completion_tokens).toBe(4096);
+
+		const thinkingOptions = getCompletionOptions("gemini-2.0-flash-thinking-exp");
+		expect(thinkingOptions.reasoning_effort).toBe("medium");
+		expect(thinkingOptions.max_completion_tokens).toBe(4096);
+	});
+});
+
 
 

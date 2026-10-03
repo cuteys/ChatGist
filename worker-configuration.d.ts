@@ -22,5 +22,6 @@ interface Env {
 	GROUP_MESSAGE_LIMIT?: string;
 	LIMIT_GROUP_IMAGES?: string;
 	GROUP_IMAGE_LIMIT?: string;
+	REASONING_EFFORT?: string;
 	DB: D1Database;
 }

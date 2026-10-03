@@ -238,10 +238,12 @@ function getBaseUrl(env: Env): string | undefined {
 	return env.AI_BASE_URL || env.BASE_URL || undefined;
 }
 
-function getCompletionOptions(model: string, jsonMode = false) {
-	const isReasoning = model.startsWith("o1") || model.startsWith("o3");
+export function getCompletionOptions(model: string, jsonMode = false, env?: Env) {
+	const isReasoning = model.startsWith("o1") || model.startsWith("o3") || model.includes("thinking") || model.includes("r1") || Boolean(env?.REASONING_EFFORT);
+	const reasoningEffort = (env?.REASONING_EFFORT || "medium") as "low" | "medium" | "high";
 	return {
 		...(isReasoning ? { max_completion_tokens: 4096 } : { max_tokens: 4096 }),
+		reasoning_effort: reasoningEffort,
 		...(jsonMode ? { response_format: { type: "json_object" as const } } : {}),
 	};
 }
@@ -509,7 +511,7 @@ export async function callChatModelWithRetry(
 			const result: any = await getGenModel(env).chat.completions.create({
 				model: params.model,
 				messages: params.messages,
-				...getCompletionOptions(params.model, false),
+				...getCompletionOptions(params.model, false, env),
 			});
 
 			if (!result || !Array.isArray(result.choices) || result.choices.length === 0) {
@@ -601,7 +603,7 @@ export async function callChatModelWithAdaptiveImageRetry(
 			const result: any = await getGenModel(env).chat.completions.create({
 				model: params.model,
 				messages,
-				...getCompletionOptions(params.model, false),
+				...getCompletionOptions(params.model, false, env),
 			});
 
 			if (!result || !Array.isArray(result.choices) || result.choices.length === 0) {
