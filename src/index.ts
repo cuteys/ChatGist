@@ -216,7 +216,7 @@ function getGenModel(env: Env) {
 	return new OpenAI({
 		apiKey: getApiKey(env),
 		...(baseURL ? { baseURL } : {}),
-		timeout: 60000,
+		timeout: 150000,
 		maxRetries: 0,
 	});
 }
@@ -542,11 +542,11 @@ export async function callChatModelWithAdaptiveImageRetry(
 
 			if (isTimeoutError(err)) {
 				if (attempt === 1 && totalImages > 0) {
-					cutRatio = 0.10;
+					cutRatio = 0.15;
 					continue;
 				}
 				if (attempt === 2 && totalImages > 0) {
-					cutRatio = 0.20;
+					cutRatio = 0.30;
 					continue;
 				}
 			} else if (attempt < 2) {

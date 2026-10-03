@@ -2146,7 +2146,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 		}
 	});
 
-	it('should adaptively reduce images (10% on first timeout) and succeed on retry', async () => {
+	it('should adaptively reduce images (15% on first timeout) and succeed on retry', async () => {
 		const groupId = '-100888888';
 		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
 
@@ -2172,9 +2172,6 @@ describe('Worker fetch whitelist gatekeeping', () => {
 				lastCallMessages = body.messages;
 
 				if (modelCallCount === 1) {
-					// First attempt: simulate 60s timeout
-					const timeoutErr = new Error('Request timed out.');
-					timeoutErr.name = 'APIConnectionTimeoutError';
 					return new Response(JSON.stringify({ error: { message: 'Request timed out.' } }), {
 						status: 408,
 						headers: { 'Content-Type': 'application/json' },
@@ -2215,14 +2212,99 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			expect(res.status).toBe(200);
 			expect(modelCallCount).toBe(2);
 
-			// On attempt 2, earliest 10% (1 image out of 10) was reduced to [历史图片]
+			// On attempt 2, earliest 15% (ceil(10 * 0.15) = 2 images) was reduced to [历史图片]
 			const historyTurn = lastCallMessages[1];
-			const maskedItem = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User1'));
-			expect(maskedItem).toBeDefined();
+			const maskedItem1 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User1'));
+			const maskedItem2 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User2'));
+			expect(maskedItem1).toBeDefined();
+			expect(maskedItem2).toBeDefined();
 
-			// Remaining 9 images are still image_url objects
+			// Remaining 8 images are still image_url objects
 			const imageUrlItems = historyTurn.content.filter((item: any) => item.type === 'image_url');
-			expect(imageUrlItems.length).toBe(9);
+			expect(imageUrlItems.length).toBe(8);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should adaptively reduce images (30% on second timeout) and succeed on attempt 3', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		// Insert 10 image messages
+		const imageStatements: any[] = [];
+		for (let i = 1; i <= 10; i++) {
+			imageStatements.push(
+				testEnv.DB.prepare(
+					'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+				).bind(`msg-img-30-${i}`, groupId, Date.now() - (20 - i) * 1000, `User${i}`, `data:image/jpeg;base64,IMAGE_DATA_${i}`, 2300 + i, 'Authorized Group', '2026-09-29 12:00:00')
+			);
+		}
+		await testEnv.DB.batch(imageStatements);
+
+		let modelCallCount = 0;
+		let lastCallMessages: any[] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/chat/completions')) {
+				modelCallCount++;
+				const body = JSON.parse(init.body);
+				lastCallMessages = body.messages;
+
+				if (modelCallCount <= 2) {
+					return new Response(JSON.stringify({ error: { message: 'Request timed out.' } }), {
+						status: 408,
+						headers: { 'Content-Type': 'application/json' },
+					});
+				}
+
+				return new Response(
+					JSON.stringify({ choices: [{ index: 0, message: { role: 'assistant', content: '第3次重试成功已解答' } }] }),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
+			return new Response(JSON.stringify({ ok: true, result: { message_id: 999 } }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvWithModel: Env = {
+				...testEnv,
+				AI_MODEL: 'gpt-4o-mini',
+				AI_API_KEY: 'test-key',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 6022,
+					message: {
+						message_id: 3022,
+						from: { id: 88888, first_name: 'Alice' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/ask 请分析以上图片',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
+			expect(res.status).toBe(200);
+			expect(modelCallCount).toBe(3);
+
+			// On attempt 3, earliest 30% (ceil(10 * 0.30) = 3 images) was reduced to [历史图片]
+			const historyTurn = lastCallMessages[1];
+			const maskedItem1 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User1'));
+			const maskedItem2 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User2'));
+			const maskedItem3 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User3'));
+			expect(maskedItem1).toBeDefined();
+			expect(maskedItem2).toBeDefined();
+			expect(maskedItem3).toBeDefined();
+
+			// Remaining 7 images are still image_url objects
+			const imageUrlItems = historyTurn.content.filter((item: any) => item.type === 'image_url');
+			expect(imageUrlItems.length).toBe(7);
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
