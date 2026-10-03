@@ -238,12 +238,40 @@ function getBaseUrl(env: Env): string | undefined {
 	return env.AI_BASE_URL || env.BASE_URL || undefined;
 }
 
-export function getCompletionOptions(model: string, jsonMode = false, env?: Env) {
-	const isReasoning = model.startsWith("o1") || model.startsWith("o3") || model.includes("thinking") || model.includes("r1") || Boolean(env?.REASONING_EFFORT);
-	const reasoningEffort = (env?.REASONING_EFFORT || "medium") as "low" | "medium" | "high";
+export type ReasoningEffortLevel = "high" | "medium" | "low" | "none";
+
+export function getReasoningEffortLadder(initialEffort?: string): ReasoningEffortLevel[] {
+	const normalized = (initialEffort || "medium").toLowerCase().trim();
+	if (normalized === "high") {
+		return ["high", "medium", "low", "none"];
+	}
+	if (normalized === "medium") {
+		return ["medium", "low", "none"];
+	}
+	if (normalized === "low") {
+		return ["low", "none"];
+	}
+	return ["none", "none"];
+}
+
+export function getCompletionOptions(
+	model: string,
+	effort: ReasoningEffortLevel = "medium",
+	jsonMode = false
+) {
+	const isReasoning =
+		effort !== "none" &&
+		(model.startsWith("o1") ||
+			model.startsWith("o3") ||
+			model.includes("thinking") ||
+			model.includes("r1") ||
+			effort === "low" ||
+			effort === "medium" ||
+			effort === "high");
+
 	return {
 		...(isReasoning ? { max_completion_tokens: 4096 } : { max_tokens: 4096 }),
-		reasoning_effort: reasoningEffort,
+		...(effort !== "none" ? { reasoning_effort: effort } : {}),
 		...(jsonMode ? { response_format: { type: "json_object" as const } } : {}),
 	};
 }
@@ -459,8 +487,7 @@ export function isTimeoutError(error: any): boolean {
 
 export function formatChatHistoryForAi(
 	results: any[],
-	quotedMessageId?: number,
-	maskedImageIds?: Set<number>
+	quotedMessageId?: number
 ) {
 	let lastDate: string | null = null;
 	return results.flatMap((r: any) => {
@@ -484,8 +511,6 @@ export function formatChatHistoryForAi(
 		if (typeof content === "string" && content.startsWith("data:image/")) {
 			if (quotedMessageId) {
 				content = Number(r.messageId) === Number(quotedMessageId) ? "[目标引用图片]" : "[历史图片]";
-			} else if (maskedImageIds && (maskedImageIds.has(r.messageId) || maskedImageIds.has(Number(r.messageId)))) {
-				content = `[历史图片: ${r.userName} ${displayTime}]`;
 			}
 		}
 		return [
@@ -497,20 +522,36 @@ export function formatChatHistoryForAi(
 	});
 }
 
-export async function callChatModelWithRetry(
+export async function callChatModelWithReasoningRetry(
 	env: Env,
-	params: { model: string; messages: any[] },
-	options: { maxAttempts?: number } = {}
+	params: {
+		model: string;
+		systemPrompt: string;
+		results: any[];
+		quotedMessageId?: number;
+		userQuestionContent?: any;
+	}
 ): Promise<{ content: string; rawResult: any }> {
-	const maxAttempts = options.maxAttempts ?? 2;
-	let lastError: any = null;
+	const initialEffort = (env.REASONING_EFFORT || "medium").trim();
+	const ladder = getReasoningEffortLadder(initialEffort);
+	const historyContent = formatChatHistoryForAi(params.results, params.quotedMessageId);
+	const messages: any[] = [
+		{ role: "system", content: params.systemPrompt },
+		{ role: "user", content: historyContent },
+	];
+	if (params.userQuestionContent) {
+		messages.push({ role: "user", content: params.userQuestionContent });
+	}
 
-	for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+	let lastError: any = null;
+	for (let i = 0; i < ladder.length; i++) {
+		const attempt = i + 1;
+		const effort = ladder[i];
 		try {
 			const result: any = await getGenModel(env).chat.completions.create({
 				model: params.model,
-				messages: params.messages,
-				...getCompletionOptions(params.model, false, env),
+				messages,
+				...getCompletionOptions(params.model, effort, false),
 			});
 
 			if (!result || !Array.isArray(result.choices) || result.choices.length === 0) {
@@ -539,117 +580,13 @@ export async function callChatModelWithRetry(
 			return { content, rawResult: result };
 		} catch (err: any) {
 			lastError = err;
-			console.warn(`[AI] Attempt ${attempt}/${maxAttempts} failed:`, err?.message || err);
-
-			if (attempt < maxAttempts) {
-				await new Promise((r) => setTimeout(r, 1000));
-			}
-		}
-	}
-
-	throw lastError;
-}
-
-export const MAX_PROMPT_IMAGES = 100;
-
-export async function callChatModelWithAdaptiveImageRetry(
-	env: Env,
-	params: {
-		model: string;
-		systemPrompt: string;
-		results: any[];
-		quotedMessageId?: number;
-		userQuestionContent?: any;
-	}
-): Promise<{ content: string; rawResult: any }> {
-	const imageMessages = params.results.filter(
-		(r: any) =>
-			typeof r.content === "string" &&
-			r.content.startsWith("data:image/") &&
-			(!params.quotedMessageId || Number(r.messageId) !== Number(params.quotedMessageId))
-	);
-	const totalImages = imageMessages.length;
-	const baseCapCut = Math.max(0, totalImages - MAX_PROMPT_IMAGES);
-	const activeImagesCount = totalImages - baseCapCut;
-
-	let attempt = 0;
-	let cutRatio = 0;
-	let maskedImageIds: Set<number> | undefined = undefined;
-
-	while (attempt < 3) {
-		attempt++;
-		if (totalImages > 0) {
-			let totalCut = baseCapCut;
-			if (cutRatio > 0 && activeImagesCount > 0) {
-				const additionalCut = Math.min(activeImagesCount, Math.max(1, Math.ceil(activeImagesCount * cutRatio)));
-				totalCut = baseCapCut + additionalCut;
-			}
-			if (totalCut > 0) {
-				maskedImageIds = new Set<number>(imageMessages.slice(0, totalCut).map((m: any) => Number(m.messageId)));
-			}
-		}
-
-		const historyContent = formatChatHistoryForAi(params.results, params.quotedMessageId, maskedImageIds);
-		const messages: any[] = [
-			{ role: "system", content: params.systemPrompt },
-			{ role: "user", content: historyContent },
-		];
-		if (params.userQuestionContent) {
-			messages.push({ role: "user", content: params.userQuestionContent });
-		}
-
-		try {
-			const result: any = await getGenModel(env).chat.completions.create({
-				model: params.model,
-				messages,
-				...getCompletionOptions(params.model, false, env),
-			});
-
-			if (!result || !Array.isArray(result.choices) || result.choices.length === 0) {
-				const isSafety = isSafetyBlockError(result);
-				const err: any = new Error(isSafety ? 'CONTENT_FILTER_TRIGGERED' : 'EMPTY_CHOICES_RETURNED');
-				err.isSafetyBlock = isSafety;
-				err.rawResult = result;
-				throw err;
-			}
-
-			const choice = result.choices[0];
-			if (choice?.finish_reason === 'content_filter' || choice?.finish_reason === 'safety') {
-				const err: any = new Error('CONTENT_FILTER_TRIGGERED');
-				err.isSafetyBlock = true;
-				err.rawResult = result;
-				throw err;
-			}
-
-			const content = choice?.message?.content;
-			if (typeof content !== 'string') {
-				const err: any = new Error('INVALID_MESSAGE_CONTENT');
-				err.rawResult = result;
-				throw err;
-			}
-
-			return { content, rawResult: result };
-		} catch (err: any) {
-			console.warn(`[AI] Attempt ${attempt}/3 failed:`, err?.message || err);
+			console.warn(`[AI] Attempt ${attempt}/${ladder.length} (effort: ${effort}) failed:`, err?.message || err);
 
 			if (isSafetyBlockError(err)) {
 				throw err;
 			}
 
-			if (isTimeoutError(err)) {
-				if (attempt === 1 && activeImagesCount > 0) {
-					cutRatio = 0.15;
-					continue;
-				}
-				if (attempt === 2 && activeImagesCount > 0) {
-					cutRatio = 0.30;
-					continue;
-				}
-				if (attempt < 3) {
-					await new Promise((r) => setTimeout(r, 1000));
-					continue;
-				}
-			} else if (attempt < 2) {
+			if (attempt < ladder.length) {
 				await new Promise((r) => setTimeout(r, 1000));
 				continue;
 			}
@@ -658,7 +595,7 @@ export async function callChatModelWithAdaptiveImageRetry(
 		}
 	}
 
-	throw new Error('AI_REQUEST_EXCEEDED_MAX_ATTEMPTS');
+	throw lastError || new Error('AI_REQUEST_EXCEEDED_MAX_ATTEMPTS');
 }
 
 async function generateSummaryRichMessage(
@@ -667,7 +604,7 @@ async function generateSummaryRichMessage(
 	model: string,
 	quoteNotice: string
 ): Promise<{ blocks: any[]; raw: string }> {
-	const { content: raw } = await callChatModelWithAdaptiveImageRetry(env, {
+	const { content: raw } = await callChatModelWithReasoningRetry(env, {
 		model,
 		systemPrompt: getSystemPrompt(env, 'summary'),
 		results,
@@ -1732,7 +1669,7 @@ export default {
 
 							let raw = "";
 							try {
-								const callRes = await callChatModelWithAdaptiveImageRetry(env, {
+								const callRes = await callChatModelWithReasoningRetry(env, {
 									model,
 									systemPrompt: getSystemPrompt(env, 'ask'),
 									results,

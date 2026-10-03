@@ -79,7 +79,7 @@ describe("JPEG validation", () => {
 });
 
 import { extractAllOGInfo } from "../src/og";
-import { formatBeijingTime, getCompletionOptions } from "../src/index";
+import { formatBeijingTime, getCompletionOptions, getReasoningEffortLadder } from "../src/index";
 
 describe("OG info security", () => {
 	it("should reject private and local hosts without fetching", async () => {
@@ -100,27 +100,53 @@ describe("formatBeijingTime", () => {
 	});
 });
 
+describe("getReasoningEffortLadder", () => {
+	it("should return ladder for medium: medium -> low -> none", () => {
+		expect(getReasoningEffortLadder("medium")).toEqual(["medium", "low", "none"]);
+		expect(getReasoningEffortLadder()).toEqual(["medium", "low", "none"]);
+	});
+
+	it("should return ladder for low: low -> none", () => {
+		expect(getReasoningEffortLadder("low")).toEqual(["low", "none"]);
+	});
+
+	it("should return ladder for high: high -> medium -> low -> none", () => {
+		expect(getReasoningEffortLadder("high")).toEqual(["high", "medium", "low", "none"]);
+	});
+
+	it("should return ladder for none or unknown: none -> none", () => {
+		expect(getReasoningEffortLadder("none")).toEqual(["none", "none"]);
+		expect(getReasoningEffortLadder("off")).toEqual(["none", "none"]);
+	});
+});
+
 describe("getCompletionOptions", () => {
 	it("should default reasoning_effort to medium", () => {
 		const options = getCompletionOptions("gemini-2.5-flash");
 		expect(options.reasoning_effort).toBe("medium");
-		expect(options.max_tokens).toBe(4096);
-	});
-
-	it("should respect REASONING_EFFORT environment variable", () => {
-		const options = getCompletionOptions("gemini-2.5-flash", false, { REASONING_EFFORT: "high" } as any);
-		expect(options.reasoning_effort).toBe("high");
 		expect(options.max_completion_tokens).toBe(4096);
 	});
 
-	it("should set max_completion_tokens for o1/o3/thinking/r1 models", () => {
-		const o3Options = getCompletionOptions("o3-mini");
-		expect(o3Options.reasoning_effort).toBe("medium");
-		expect(o3Options.max_completion_tokens).toBe(4096);
+	it("should omit reasoning_effort and use max_tokens when effort is none", () => {
+		const options = getCompletionOptions("gemini-2.5-flash", "none");
+		expect(options.reasoning_effort).toBeUndefined();
+		expect(options.max_tokens).toBe(4096);
+		expect(options.max_completion_tokens).toBeUndefined();
+	});
 
-		const thinkingOptions = getCompletionOptions("gemini-2.0-flash-thinking-exp");
-		expect(thinkingOptions.reasoning_effort).toBe("medium");
-		expect(thinkingOptions.max_completion_tokens).toBe(4096);
+	it("should respect low, medium, and high effort levels", () => {
+		const lowOptions = getCompletionOptions("gpt-4o", "low");
+		expect(lowOptions.reasoning_effort).toBe("low");
+		expect(lowOptions.max_completion_tokens).toBe(4096);
+
+		const highOptions = getCompletionOptions("gpt-4o", "high");
+		expect(highOptions.reasoning_effort).toBe("high");
+		expect(highOptions.max_completion_tokens).toBe(4096);
+	});
+
+	it("should support jsonMode", () => {
+		const options = getCompletionOptions("gpt-4o", "none", true);
+		expect(options.response_format).toEqual({ type: "json_object" });
 	});
 });
 

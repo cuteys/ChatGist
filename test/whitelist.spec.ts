@@ -2153,7 +2153,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 		}
 	});
 
-	it('should adaptively reduce images (15% on first timeout) and succeed on retry', async () => {
+	it('should downgrade reasoning effort (from medium to low) on first timeout and succeed on retry', async () => {
 		const groupId = '-100888888';
 		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
 
@@ -2169,6 +2169,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 		await testEnv.DB.batch(imageStatements);
 
 		let modelCallCount = 0;
+		const capturedEfforts: any[] = [];
 		let lastCallMessages: any[] = [];
 		const originalFetch = globalThis.fetch;
 		globalThis.fetch = (async (input: any, init?: any) => {
@@ -2176,6 +2177,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			if (url.includes('/chat/completions')) {
 				modelCallCount++;
 				const body = JSON.parse(init.body);
+				capturedEfforts.push(body.reasoning_effort);
 				lastCallMessages = body.messages;
 
 				if (modelCallCount === 1) {
@@ -2218,23 +2220,18 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
 			expect(res.status).toBe(200);
 			expect(modelCallCount).toBe(2);
+			expect(capturedEfforts).toEqual(['medium', 'low']);
 
-			// On attempt 2, earliest 15% (ceil(10 * 0.15) = 2 images) was reduced to [历史图片]
+			// All 10 images remain image_url objects without any reduction
 			const historyTurn = lastCallMessages[1];
-			const maskedItem1 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User1'));
-			const maskedItem2 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User2'));
-			expect(maskedItem1).toBeDefined();
-			expect(maskedItem2).toBeDefined();
-
-			// Remaining 8 images are still image_url objects
 			const imageUrlItems = historyTurn.content.filter((item: any) => item.type === 'image_url');
-			expect(imageUrlItems.length).toBe(8);
+			expect(imageUrlItems.length).toBe(10);
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
 	});
 
-	it('should adaptively reduce images (30% on second timeout) and succeed on attempt 3', async () => {
+	it('should downgrade reasoning effort (from low to none) on second timeout and succeed on attempt 3', async () => {
 		const groupId = '-100888888';
 		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
 
@@ -2250,6 +2247,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 		await testEnv.DB.batch(imageStatements);
 
 		let modelCallCount = 0;
+		const capturedEfforts: any[] = [];
 		let lastCallMessages: any[] = [];
 		const originalFetch = globalThis.fetch;
 		globalThis.fetch = (async (input: any, init?: any) => {
@@ -2257,6 +2255,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			if (url.includes('/chat/completions')) {
 				modelCallCount++;
 				const body = JSON.parse(init.body);
+				capturedEfforts.push(body.reasoning_effort);
 				lastCallMessages = body.messages;
 
 				if (modelCallCount <= 2) {
@@ -2299,19 +2298,73 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			const res = await worker.fetch(req, testEnvWithModel, mockCtx);
 			expect(res.status).toBe(200);
 			expect(modelCallCount).toBe(3);
+			// 1: medium, 2: low, 3: undefined (none / closed)
+			expect(capturedEfforts).toEqual(['medium', 'low', undefined]);
 
-			// On attempt 3, earliest 30% (ceil(10 * 0.30) = 3 images) was reduced to [历史图片]
+			// All 10 images remain image_url objects
 			const historyTurn = lastCallMessages[1];
-			const maskedItem1 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User1'));
-			const maskedItem2 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User2'));
-			const maskedItem3 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User3'));
-			expect(maskedItem1).toBeDefined();
-			expect(maskedItem2).toBeDefined();
-			expect(maskedItem3).toBeDefined();
-
-			// Remaining 7 images are still image_url objects
 			const imageUrlItems = historyTurn.content.filter((item: any) => item.type === 'image_url');
-			expect(imageUrlItems.length).toBe(7);
+			expect(imageUrlItems.length).toBe(10);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('should support initial low reasoning effort and downgrade to none then terminate on failure', async () => {
+		const groupId = '-100888888';
+		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
+
+		await testEnv.DB.prepare(
+			'INSERT INTO Messages(id, groupId, timeStamp, userName, content, messageId, groupName, messageTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+		)
+			.bind('msg-low-ladder-test', groupId, Date.now() - 1000, 'DevUser', '消息内容', 3199, 'Authorized Group', '2026-09-29 13:00:00')
+			.run();
+
+		let modelCallCount = 0;
+		const capturedEfforts: any[] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (input: any, init?: any) => {
+			const url = typeof input === 'string' ? input : input.url;
+			if (url.includes('/chat/completions')) {
+				modelCallCount++;
+				const body = JSON.parse(init.body);
+				capturedEfforts.push(body.reasoning_effort);
+				return new Response(JSON.stringify({ error: { message: 'Request timed out.' } }), {
+					status: 408,
+					headers: { 'Content-Type': 'application/json' },
+				});
+			}
+			return new Response(JSON.stringify({ ok: true, result: { message_id: 999 } }), { status: 200 });
+		}) as any;
+
+		try {
+			const testEnvWithLow: Env = {
+				...testEnv,
+				AI_MODEL: 'gpt-4o-mini',
+				AI_API_KEY: 'test-key',
+				REASONING_EFFORT: 'low',
+			};
+
+			const req = new Request('https://chatgist.example.com/', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					update_id: 6023,
+					message: {
+						message_id: 3023,
+						from: { id: 88888, first_name: 'Alice' },
+						chat: { id: parseInt(groupId), title: 'Authorized Group', type: 'supergroup' },
+						date: Math.floor(Date.now() / 1000),
+						text: '/ask 测试低推理阶梯',
+					},
+				}),
+			});
+
+			const res = await worker.fetch(req, testEnvWithLow, mockCtx);
+			expect(res.status).toBe(200);
+			// 2 attempts total: 1: low, 2: undefined (none / closed)
+			expect(modelCallCount).toBe(2);
+			expect(capturedEfforts).toEqual(['low', undefined]);
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
@@ -2537,7 +2590,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 		}
 	});
 
-	it('should enforce MAX_PROMPT_IMAGES (100) cap and mask excess images in prompt', async () => {
+	it('should pass all images to model without capping', async () => {
 		const groupId = '-100888888';
 		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
 
@@ -2604,15 +2657,12 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			expect(res.status).toBe(200);
 
 			const historyTurn = capturedAiMessages[1];
-			// 105 total images: earliest 5 must be converted to [历史图片: ...]
-			const maskedItem1 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User1'));
-			const maskedItem5 = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片: User5'));
-			expect(maskedItem1).toBeDefined();
-			expect(maskedItem5).toBeDefined();
-
-			// Latest 100 images must remain image_url objects
+			// All 105 images must remain image_url objects without any reduction
 			const imageUrlItems = historyTurn.content.filter((item: any) => item.type === 'image_url');
-			expect(imageUrlItems.length).toBe(100);
+			expect(imageUrlItems.length).toBe(105);
+			// No image should be converted to masked text placeholder
+			const hasMaskedPlaceholder = historyTurn.content.some((item: any) => item.text && item.text.includes('[历史图片:'));
+			expect(hasMaskedPlaceholder).toBe(false);
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
