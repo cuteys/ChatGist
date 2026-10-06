@@ -1,0 +1,10 @@
+.git
+.github
+data
+*.db
+*.db-*
+chatgist
+.env
+.env.*
+test
+*.md

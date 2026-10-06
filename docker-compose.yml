@@ -1,0 +1,33 @@
+services:
+    chatgist:
+        image: cuteys/chatgist:latest
+        container_name: chatgist
+        hostname: chatgist
+        environment:
+            - TZ=Asia/Shanghai
+            - MODE=polling
+            - DB_PATH=/app/data/sqlite.db
+            # Telegram Bot 凭据
+            - TELEGRAM_BOT_TOKEN=
+            # AI 模型与接口
+            - AI_API_KEY=
+            - AI_MODEL=gpt-4o-mini
+            - AI_BASE_URL=
+            - REASONING_EFFORT=medium
+            # 系统超级管理员 Telegram ID
+            - ADMIN_USER_IDS=
+            # 普通用户单日指令额度限制
+            - LIMIT_SUMMARY=5
+            - LIMIT_ASK=5
+            - LIMIT_QUERY=20
+            # 群组单群历史数据保留上限
+            - LIMIT_GROUP_MESSAGES=3000
+            - LIMIT_GROUP_IMAGES=100
+            # 每日定时总结
+            - CRON_ENABLED=true
+            - CRON_HOUR_BEIJING=0
+        network_mode: bridge
+        restart: always
+        user: "0:0"
+        volumes:
+            - ./data:/app/data
