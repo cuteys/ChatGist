@@ -353,6 +353,26 @@ func (b *Bot) handleQuery(msg *telegram.Message) {
 	_ = b.sendRichMessage(msg.Chat.ID, blocks, "", msg.MessageID, markup)
 }
 
+func formatBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	switch exp {
+	case 0:
+		return fmt.Sprintf("%.1f KB", float64(b)/float64(div))
+	case 1:
+		return fmt.Sprintf("%.2f MB", float64(b)/float64(div))
+	default:
+		return fmt.Sprintf("%.2f GB", float64(b)/float64(div))
+	}
+}
+
 func (b *Bot) handleStatus(msg *telegram.Message) {
 	if isGroupChat(msg.Chat) {
 		return
@@ -363,68 +383,76 @@ func (b *Bot) handleStatus(msg *telegram.Message) {
 	isAdmin := b.whitelist.IsAdmin(userID)
 
 	var sb strings.Builder
-	sb.WriteString("🤖 <b>ChatGist 运行状态</b>\n\n")
+	sb.WriteString("🤖 机器人运行状态正常\n")
 
 	if isSuper {
-		sb.WriteString("👑 <b>身份</b>：系统超级管理员\n")
-	} else if isAdmin {
-		sb.WriteString("🛡️ <b>身份</b>：数据库管理员\n")
-	} else {
-		sb.WriteString("👤 <b>身份</b>：普通用户\n")
-	}
+		sb.WriteString("👑 身份：系统超级管理员\n")
 
-	// 连通性测试
-	d1Latency, d1Err := b.storage.Ping()
-	d1LatencyText := fmt.Sprintf("%dms", d1Latency.Milliseconds())
-	if d1Err != nil {
-		d1LatencyText = "异常"
-	}
+		// 1. 数据库存储统计
+		stats, err := b.storage.GetDatabaseStorageStats()
+		if err == nil && stats != nil {
+			sb.WriteString("\n💾 数据库存储统计：\n")
+			sb.WriteString(fmt.Sprintf("• 数据库总大小：%s\n", formatBytes(stats.TotalBytes)))
+			sb.WriteString(fmt.Sprintf("• 数据库总消息：文本 %d 条 | 图片 %d 张\n", stats.TotalTextCount, stats.TotalImageCount))
+			sb.WriteString(fmt.Sprintf("• 统计群组总数：%d 个\n", len(stats.GroupStats)))
+			sb.WriteString(fmt.Sprintf("• 单群保留上限：文本 %d 条 | 图片 %d 张\n", b.cfg.LimitGroupMessages, b.cfg.LimitGroupImages))
 
-	aiLatencyText := "未配置"
-	if b.cfg.AIAPIKey != "" {
-		aiStart := time.Now()
-		req, _ := http.NewRequestWithContext(context.Background(), "GET", strings.TrimRight(b.cfg.AIBaseURL, "/")+"/models", nil)
-		req.Header.Set("Authorization", "Bearer "+b.cfg.AIAPIKey)
-		client := &http.Client{Timeout: 5 * time.Second}
-		res, err := client.Do(req)
-		aiLatency := time.Since(aiStart).Milliseconds()
-		if err == nil {
-			_ = res.Body.Close()
-			if res.StatusCode == http.StatusOK || res.StatusCode == http.StatusUnauthorized {
-				aiLatencyText = fmt.Sprintf("正常 (%dms)", aiLatency)
+			if len(stats.GroupStats) > 0 {
+				sb.WriteString("\n👥 各群组消息与空间明细：\n")
+				for idx, g := range stats.GroupStats {
+					textCount := g.TotalCount - g.ImageCount
+					if textCount < 0 {
+						textCount = 0
+					}
+					groupName := g.GroupName
+					if strings.TrimSpace(groupName) == "" {
+						groupName = g.GroupID
+					}
+					sb.WriteString(fmt.Sprintf("%d. 「%s」\n", idx+1, html.EscapeString(groupName)))
+					sb.WriteString(fmt.Sprintf("   • 文本消息：%d 条 | 图片：%d 张\n", textCount, g.ImageCount))
+					sb.WriteString(fmt.Sprintf("   • 占用空间：%s\n", formatBytes(g.EstimatedBytes)))
+				}
 			} else {
-				aiLatencyText = fmt.Sprintf("异常 (%d, %dms)", res.StatusCode, aiLatency)
+				sb.WriteString("\n👥 各群组明细：暂无群组消息记录\n")
 			}
-		} else {
-			aiLatencyText = "连接超时/异常"
 		}
-	}
 
-	sb.WriteString("\n⚡ <b>系统连通性诊断：</b>\n")
-	sb.WriteString(fmt.Sprintf("• SQLite 数据库延迟：%s\n", d1LatencyText))
-	sb.WriteString(fmt.Sprintf("• AI 接口状态：%s\n", aiLatencyText))
+		// 2. 系统连通性诊断
+		aiLatencyText := "未配置"
+		if b.cfg.AIAPIKey != "" {
+			aiStart := time.Now()
+			req, _ := http.NewRequestWithContext(context.Background(), "GET", strings.TrimRight(b.cfg.AIBaseURL, "/")+"/models", nil)
+			req.Header.Set("Authorization", "Bearer "+b.cfg.AIAPIKey)
+			client := &http.Client{Timeout: 5 * time.Second}
+			res, err := client.Do(req)
+			aiLatency := time.Since(aiStart).Milliseconds()
+			if err == nil {
+				_ = res.Body.Close()
+				if res.StatusCode == http.StatusOK || res.StatusCode == http.StatusUnauthorized {
+					aiLatencyText = fmt.Sprintf("正常 (%dms)", aiLatency)
+				} else {
+					aiLatencyText = fmt.Sprintf("异常 (%d, %dms)", res.StatusCode, aiLatency)
+				}
+			} else {
+				aiLatencyText = "连接超时/异常"
+			}
+		}
 
-	quotaStatus, _ := b.quota.GetUserQuotaStatus(userID)
-	if quotaStatus != nil {
-		if quotaStatus.IsPrivileged {
-			sb.WriteString("\n⚡ <b>指令配额</b>：无限制（特权用户）\n")
-		} else {
-			sb.WriteString(fmt.Sprintf("\n📊 <b>今日使用配额（次日 00:00 自动刷新）：</b>\n• 总结 (/summary): %d/%d 次\n• 问答 (/ask): %d/%d 次\n• 检索 (/query): %d/%d 次\n",
+		sb.WriteString("\n⚡ 系统连通性诊断：\n")
+		sb.WriteString(fmt.Sprintf("• AI 接口状态：%s\n", aiLatencyText))
+
+	} else if isAdmin {
+		sb.WriteString("🛡️ 身份：数据库管理员\n\n")
+		sb.WriteString("⚡ 指令配额：无限制（特权用户）\n")
+
+	} else {
+		sb.WriteString("👤 身份：普通用户\n\n")
+		quotaStatus, _ := b.quota.GetUserQuotaStatus(userID)
+		if quotaStatus != nil {
+			sb.WriteString(fmt.Sprintf("📊 今日使用配额（次日 00:00 自动刷新）：\n• 总结 (/summary): %d/%d 次\n• 问答 (/ask): %d/%d 次\n• 检索 (/query): %d/%d 次\n",
 				quotaStatus.Summary.Current, quotaStatus.Summary.Limit,
 				quotaStatus.Ask.Current, quotaStatus.Ask.Limit,
 				quotaStatus.Query.Current, quotaStatus.Query.Limit,
-			))
-		}
-	}
-
-	if isAdmin {
-		stats, err := b.storage.GetDatabaseStorageStats()
-		if err == nil && stats != nil {
-			percent := float64(stats.TotalBytes) / float64(stats.LimitBytes) * 100.0
-			sb.WriteString(fmt.Sprintf("\n💾 <b>存储状态</b>：\n• 占用: %.2f MB / 500 MB (%.1f%%)\n• 总消息: 文本 %d | 图片 %d\n• 白名单群组: %d 个\n",
-				float64(stats.TotalBytes)/(1024*1024), percent,
-				stats.TotalTextCount, stats.TotalImageCount,
-				len(stats.GroupStats),
 			))
 		}
 	}

@@ -161,7 +161,7 @@ func BuildAdminsRichBlocks(envAdmins []string, dbAdmins []*storage.Admin) []Rich
 			envCells = append(envCells, []RichTableCell{
 				{Text: fmt.Sprintf("%d", idx+1), Align: "center"},
 				{Text: map[string]interface{}{"type": "code", "text": id}, Align: "center"},
-				{Text: map[string]interface{}{"type": "marked", "text": "超级管理员 (SuperAdmin)"}, Align: "center"},
+				{Text: map[string]interface{}{"type": "marked", "text": "超级管理员"}, Align: "center"},
 			})
 		}
 		blocks = append(blocks, RichBlock{
@@ -246,7 +246,10 @@ func BuildQueryRichBlocks(keyword string, totalCount int, pageResults []*storage
 
 	for idx, r := range pageResults {
 		globalIdx := (page-1)*pageSize + idx + 1
-		rawContent := strings.TrimSpace(strings.ReplaceAll(r.Content, "\n", " "))
+		rawContent := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(r.Content, "\r", " "), "\n", " "))
+		for strings.Contains(rawContent, "  ") {
+			rawContent = strings.ReplaceAll(rawContent, "  ", " ")
+		}
 		if strings.HasPrefix(rawContent, "回复 ") {
 			parts := strings.SplitN(rawContent, ": ", 2)
 			if len(parts) > 1 {
@@ -259,25 +262,27 @@ func BuildQueryRichBlocks(keyword string, totalCount int, pageResults []*storage
 
 		runes := []rune(rawContent)
 		preview := rawContent
-		if len(runes) > 24 {
-			preview = string(runes[:24]) + "..."
+		if len(runes) > 12 {
+			preview = string(runes[:12])
 		}
 
 		var contentCell interface{} = preview
 		if r.MessageID > 0 && r.GroupID != "" {
 			link := fmt.Sprintf("https://t.me/c/%s/%d", cleanGroupID(r.GroupID), r.MessageID)
-			contentCell = []interface{}{
-				map[string]interface{}{
-					"type": "url",
-					"text": preview,
-					"url":  link,
-				},
+			contentCell = map[string]interface{}{
+				"type": "url",
+				"text": preview,
+				"url":  link,
 			}
 		}
 
 		userName := r.UserName
 		if strings.TrimSpace(userName) == "" {
 			userName = "匿名"
+		}
+		userRunes := []rune(userName)
+		if len(userRunes) > 8 {
+			userName = string(userRunes[:8])
 		}
 
 		tableRows = append(tableRows, []RichTableCell{
