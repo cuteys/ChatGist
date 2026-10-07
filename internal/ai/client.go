@@ -74,11 +74,21 @@ func (c *Client) BuildChatHistoryParts(messages []*storage.Message) []openai.Cha
 			Text: "====================\n" + sender,
 		})
 
-		if strings.HasPrefix(m.Content, "data:image/") {
+		if imgIdx := strings.Index(m.Content, "data:image/"); imgIdx != -1 {
+			// 分离文字说明与 Base64 图片，防止带配文或回复的消息将 Base64 作为纯文本泄露至上下文
+			textPart := strings.TrimSpace(m.Content[:imgIdx])
+			if textPart != "" {
+				parts = append(parts, openai.ChatMessagePart{
+					Type: openai.ChatMessagePartTypeText,
+					Text: textPart,
+				})
+			}
+
+			imgPart := strings.TrimSpace(m.Content[imgIdx:])
 			parts = append(parts, openai.ChatMessagePart{
 				Type: openai.ChatMessagePartTypeImageURL,
 				ImageURL: &openai.ChatMessageImageURL{
-					URL:    m.Content,
+					URL:    imgPart,
 					Detail: openai.ImageURLDetailAuto,
 				},
 			})
