@@ -2,7 +2,9 @@ package ai
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -124,6 +126,7 @@ func (c *Client) CallChatModelWithReasoningRetry(ctx context.Context, systemProm
 		req := openai.ChatCompletionRequest{
 			Model:    c.cfg.AIModel,
 			Messages: messages,
+			Stream:   true,
 		}
 
 		isReasoningModel := strings.HasPrefix(c.cfg.AIModel, "o1") ||
@@ -140,22 +143,57 @@ func (c *Client) CallChatModelWithReasoningRetry(ctx context.Context, systemProm
 			req.MaxTokens = 4096
 		}
 
-		resp, err := c.client.CreateChatCompletion(ctx, req)
-		if err == nil && len(resp.Choices) > 0 {
-			content := resp.Choices[0].Message.Content
-			if resp.Choices[0].FinishReason == openai.FinishReasonContentFilter {
-				return "", fmt.Errorf("CONTENT_FILTER_TRIGGERED: 内容触发安全过滤策略")
-			}
-			if content != "" {
-				return content, nil
-			}
-		}
-
-		lastErr = err
+		stream, err := c.client.CreateChatCompletionStream(ctx, req)
 		if err != nil {
+			lastErr = err
 			errStr := err.Error()
 			if strings.Contains(errStr, "content_filter") || strings.Contains(errStr, "safety") {
 				return "", fmt.Errorf("CONTENT_FILTER_TRIGGERED: %w", err)
+			}
+			if attempt < len(ladder)-1 {
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			break
+		}
+
+		var contentBuilder strings.Builder
+		var contentFilterTriggered bool
+		var streamErr error
+
+		for {
+			chunk, recvErr := stream.Recv()
+			if errors.Is(recvErr, io.EOF) {
+				break
+			}
+			if recvErr != nil {
+				streamErr = recvErr
+				break
+			}
+
+			if len(chunk.Choices) > 0 {
+				if chunk.Choices[0].FinishReason == openai.FinishReasonContentFilter {
+					contentFilterTriggered = true
+				}
+				contentBuilder.WriteString(chunk.Choices[0].Delta.Content)
+			}
+		}
+		stream.Close()
+
+		if contentFilterTriggered {
+			return "", fmt.Errorf("CONTENT_FILTER_TRIGGERED: 内容触发安全过滤策略")
+		}
+
+		content := contentBuilder.String()
+		if streamErr == nil && content != "" {
+			return content, nil
+		}
+
+		if streamErr != nil {
+			lastErr = streamErr
+			errStr := streamErr.Error()
+			if strings.Contains(errStr, "content_filter") || strings.Contains(errStr, "safety") {
+				return "", fmt.Errorf("CONTENT_FILTER_TRIGGERED: %w", streamErr)
 			}
 		}
 
