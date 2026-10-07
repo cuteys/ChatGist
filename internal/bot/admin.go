@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cuteys/ChatGist/internal/format"
 	"github.com/cuteys/ChatGist/internal/telegram"
 )
 
@@ -67,12 +68,8 @@ func (b *Bot) handleAdminCommands(msg *telegram.Message, cmd string) {
 			_, _ = b.tg.SendMessage(targetChatID, "📋 当前暂无已授权的白名单群组。", "", msg.MessageID, nil)
 			return
 		}
-		var sb strings.Builder
-		sb.WriteString("🛡️ <b>已授权白名单群组列表：</b>\n\n")
-		for i, g := range groups {
-			sb.WriteString(fmt.Sprintf("%d. 「<b>%s</b>」 (ID: <code>%s</code>)\n", i+1, html.EscapeString(g.GroupName), g.GroupID))
-		}
-		_, _ = b.tg.SendMessage(targetChatID, sb.String(), "HTML", msg.MessageID, nil)
+		blocks := format.BuildWhitelistRichBlocks(groups)
+		_ = b.sendRichMessage(targetChatID, blocks, "", msg.MessageID, nil)
 
 	case "addadmin":
 		if len(parts) < 2 {
@@ -107,23 +104,8 @@ func (b *Bot) handleAdminCommands(msg *telegram.Message, cmd string) {
 	case "admins":
 		superAdmins := b.whitelist.GetSuperAdminIDs()
 		dbAdmins, _ := b.whitelist.GetAdmins()
-
-		var sb strings.Builder
-		sb.WriteString("👑 <b>管理员列表：</b>\n\n")
-		sb.WriteString("<b>系统超级管理员 (环境变量)：</b>\n")
-		for _, sa := range superAdmins {
-			sb.WriteString(fmt.Sprintf("• <code>%s</code>\n", sa))
-		}
-
-		sb.WriteString("\n<b>数据库管理员：</b>\n")
-		if len(dbAdmins) == 0 {
-			sb.WriteString("• 暂无动态数据库管理员\n")
-		} else {
-			for _, da := range dbAdmins {
-				sb.WriteString(fmt.Sprintf("• <code>%s</code> (%s)\n", da.UserID, html.EscapeString(da.UserName)))
-			}
-		}
-		_, _ = b.tg.SendMessage(targetChatID, sb.String(), "HTML", msg.MessageID, nil)
+		blocks := format.BuildAdminsRichBlocks(superAdmins, dbAdmins)
+		_ = b.sendRichMessage(targetChatID, blocks, "", msg.MessageID, nil)
 
 	case "clearmessages":
 		targetGroupID := ""

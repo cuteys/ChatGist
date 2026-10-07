@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cuteys/ChatGist/internal/format"
 	"github.com/cuteys/ChatGist/internal/telegram"
 )
 
@@ -43,8 +44,17 @@ func (b *Bot) handleCallbackQuery(cq *telegram.CallbackQuery) {
 		}
 
 		totalPages := int(math.Ceil(float64(totalCount) / float64(pageSize)))
-		htmlText, markup := buildQueryPageHTML(groupID, keyword, results, totalCount, page, totalPages)
+		clampedPage := page
+		if clampedPage > totalPages {
+			clampedPage = totalPages
+		}
+		if clampedPage < 1 {
+			clampedPage = 1
+		}
 
-		_, _ = b.tg.EditMessageText(cq.Message.Chat.ID, cq.Message.MessageID, htmlText, "HTML", markup)
+		blocks := format.BuildQueryRichBlocks(keyword, totalCount, results, clampedPage, pageSize)
+		markup := telegram.GenerateQueryPaginationKeyboard(keyword, clampedPage, totalPages)
+
+		_ = b.editRichMessage(cq.Message.Chat.ID, cq.Message.MessageID, blocks, markup)
 	}
 }

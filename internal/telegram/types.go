@@ -97,3 +97,22 @@ type FileResponse struct {
 		FilePath string `json:"file_path"`
 	} `json:"result"`
 }
+
+type RichMessageContent struct {
+	Blocks   interface{} `json:"blocks,omitempty"`
+	Markdown string      `json:"markdown,omitempty"`
+}
+
+type SendRichMessagePayload struct {
+	ChatID          string                `json:"chat_id"`
+	RichMessage     *RichMessageContent   `json:"rich_message"`
+	ReplyParameters *ReplyParameters      `json:"reply_parameters,omitempty"`
+	ReplyMarkup     *InlineKeyboardMarkup `json:"reply_markup,omitempty"`
+}
+
+type EditRichMessagePayload struct {
+	ChatID      string                `json:"chat_id"`
+	MessageID   int64                 `json:"message_id"`
+	RichMessage *RichMessageContent   `json:"rich_message"`
+	ReplyMarkup *InlineKeyboardMarkup `json:"reply_markup,omitempty"`
+}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"html"
 	"math"
+	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
@@ -17,6 +18,24 @@ import (
 )
 
 var summaryArgRegex = regexp.MustCompile(`(?i)^(\d+)(h|小时|d|天|m|分|分钟)?$`)
+
+func isSafetyBlockError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "safety") || strings.Contains(msg, "blocked") ||
+		strings.Contains(msg, "content filter") || strings.Contains(msg, "violation")
+}
+
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded") ||
+		strings.Contains(msg, "context deadline exceeded") || strings.Contains(msg, "context canceled")
+}
 
 func (b *Bot) handleSummary(msg *telegram.Message) {
 	if !isGroupChat(msg.Chat) {
@@ -91,13 +110,13 @@ func (b *Bot) handleSummary(msg *telegram.Message) {
 	}
 	statusMsg, _ := b.tg.SendMessage(msg.Chat.ID, statusText, "", msg.MessageID, nil)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
-	defer cancel()
-
-	b.tg.StartTypingKeeper(ctx, msg.Chat.ID)
-
+	// 开启异步后台协程处理大模型耗时请求，Context 严格在协程内部管理生命周期
 	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 		defer cancel()
+
+		b.tg.StartTypingKeeper(ctx, msg.Chat.ID)
+
 		var messages []*storage.Message
 		var err error
 
@@ -116,12 +135,15 @@ func (b *Bot) handleSummary(msg *telegram.Message) {
 			return
 		}
 
-		var quoteNotice string
-		if hasHours {
-			quoteNotice = fmt.Sprintf("📊 正在总结最近 %.1f 小时内的群聊记录（共 %d 条）", hours, len(messages))
-		} else {
-			quoteNotice = fmt.Sprintf("📊 正在总结最近 %d 条群聊记录", len(messages))
+		groupTitle := ""
+		if msg.Chat != nil && msg.Chat.Title != "" {
+			groupTitle = fmt.Sprintf("「%s」", msg.Chat.Title)
 		}
+		countDesc := fmt.Sprintf("近期 %d 条", len(messages))
+		if hasHours {
+			countDesc = fmt.Sprintf("最近 %.1f 小时", hours)
+		}
+		quoteNotice := fmt.Sprintf("总结群聊%s%s聊天记录%s", groupTitle, countDesc, noticeNote)
 
 		raw, err := b.ai.SummarizeChat(ctx, messages, quoteNotice)
 		if statusMsg != nil {
@@ -129,8 +151,26 @@ func (b *Bot) handleSummary(msg *telegram.Message) {
 		}
 
 		if err != nil {
-			errText := fmt.Sprintf("❌ 总结生成失败: %v", err)
-			_, _ = b.tg.SendMessage(msg.Chat.ID, errText, "", msg.MessageID, nil)
+			// 脱敏并将详细堆栈仅推送到管理员私信
+			b.notifySuperAdminsError(AdminAlertDetails{
+				Scene:      "/summary 群聊概括",
+				GroupID:    groupID,
+				GroupTitle: msg.Chat.Title,
+				UserID:     userID,
+				UserName:   getUserDisplayName(msg.From),
+				MessageID:  msg.MessageID,
+				Error:      err,
+				Payload:    quoteNotice,
+			})
+
+			// 群聊内彻底脱敏，仅反馈安全友好的提示
+			if isSafetyBlockError(err) {
+				_, _ = b.tg.SendMessage(msg.Chat.ID, "⚠️ 本期群聊内容涉及敏感或限制级话题，触发了大模型的内容安全审查策略，未能完成总结。", "", msg.MessageID, nil)
+			} else if isTimeoutError(err) {
+				_, _ = b.tg.SendMessage(msg.Chat.ID, "⚠️ 群聊记录较多或网络波动导致总结超时，请稍后重试或尝试指定较短时间（如 /summary 2h）。", "", msg.MessageID, nil)
+			} else {
+				_, _ = b.tg.SendMessage(msg.Chat.ID, "概括失败，暂时无法完成请求，请稍后重试。", "", msg.MessageID, nil)
+			}
 			return
 		}
 
@@ -156,20 +196,7 @@ func (b *Bot) handleSummary(msg *telegram.Message) {
 			},
 		)
 
-		htmlContent := format.RichBlocksToHTML(blocks)
-		chunks := telegram.SplitMessage(htmlContent, 4000)
-		for _, chunk := range chunks {
-			_, err = b.tg.SendMessage(msg.Chat.ID, chunk, "HTML", msg.MessageID, nil)
-			if err != nil {
-				// Telegram 拒收复杂富文本时降级为纯文本兜底
-				plain := format.RichBlocksToPlainText(blocks)
-				pChunks := telegram.SplitMessage(plain, 4000)
-				for _, pChunk := range pChunks {
-					_, _ = b.tg.SendMessage(msg.Chat.ID, pChunk, "", msg.MessageID, nil)
-				}
-				break
-			}
-		}
+		_ = b.sendRichMessage(msg.Chat.ID, blocks, raw, msg.MessageID, nil)
 	}()
 }
 
@@ -207,13 +234,12 @@ func (b *Bot) handleAsk(msg *telegram.Message) {
 
 	statusMsg, _ := b.tg.SendMessage(msg.Chat.ID, "⏳ 收到提问，正在分析近期群聊并解答，请稍候...", "", msg.MessageID, nil)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
-	defer cancel()
-
-	b.tg.StartTypingKeeper(ctx, msg.Chat.ID)
-
 	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 		defer cancel()
+
+		b.tg.StartTypingKeeper(ctx, msg.Chat.ID)
+
 		messages, err := b.storage.GetRecentMessages(groupID, 1000, 0)
 		if err != nil || len(messages) == 0 {
 			if statusMsg != nil {
@@ -225,7 +251,9 @@ func (b *Bot) handleAsk(msg *telegram.Message) {
 
 		contextInfo := fmt.Sprintf("所在群组: %s (ID: %s)\n提问者: %s", msg.Chat.Title, groupID, getUserDisplayName(msg.From))
 		if msg.ReplyToMessage != nil {
-			contextInfo += fmt.Sprintf("\n【重点引用的消息】发言人: %s，内容: %s", getUserDisplayName(msg.ReplyToMessage.From), msg.ReplyToMessage.Text)
+			repliedLink := telegram.GetMessageLink(groupID, msg.ReplyToMessage.MessageID)
+			contextInfo += fmt.Sprintf("\n【重点引用的消息】\n• 直达链接: %s\n• 发言人: %s\n• 内容: %s",
+				repliedLink, getUserDisplayName(msg.ReplyToMessage.From), msg.ReplyToMessage.Text)
 		}
 
 		raw, err := b.ai.AskChat(ctx, messages, question, contextInfo)
@@ -234,8 +262,24 @@ func (b *Bot) handleAsk(msg *telegram.Message) {
 		}
 
 		if err != nil {
-			errText := fmt.Sprintf("❌ 回答失败: %v", err)
-			_, _ = b.tg.SendMessage(msg.Chat.ID, errText, "", msg.MessageID, nil)
+			b.notifySuperAdminsError(AdminAlertDetails{
+				Scene:      "/ask 提问解答",
+				GroupID:    groupID,
+				GroupTitle: msg.Chat.Title,
+				UserID:     userID,
+				UserName:   getUserDisplayName(msg.From),
+				MessageID:  msg.MessageID,
+				Error:      err,
+				Payload:    question,
+			})
+
+			if isSafetyBlockError(err) {
+				_, _ = b.tg.SendMessage(msg.Chat.ID, "⚠️ 该提问或相关聊天内容触发了大模型的内容安全审查策略，暂时无法回答。", "", msg.MessageID, nil)
+			} else if isTimeoutError(err) {
+				_, _ = b.tg.SendMessage(msg.Chat.ID, "⚠️ 本次提问分析超时，可能因涉及内容较多或网络波动，请稍后重试或缩小提问范围。", "", msg.MessageID, nil)
+			} else {
+				_, _ = b.tg.SendMessage(msg.Chat.ID, "回答失败，AI 服务暂时无法完成请求，请稍后重试。", "", msg.MessageID, nil)
+			}
 			return
 		}
 
@@ -261,19 +305,7 @@ func (b *Bot) handleAsk(msg *telegram.Message) {
 			},
 		)
 
-		htmlContent := format.RichBlocksToHTML(blocks)
-		chunks := telegram.SplitMessage(htmlContent, 4000)
-		for _, chunk := range chunks {
-			_, err = b.tg.SendMessage(msg.Chat.ID, chunk, "HTML", msg.MessageID, nil)
-			if err != nil {
-				plain := format.RichBlocksToPlainText(blocks)
-				pChunks := telegram.SplitMessage(plain, 4000)
-				for _, pChunk := range pChunks {
-					_, _ = b.tg.SendMessage(msg.Chat.ID, pChunk, "", msg.MessageID, nil)
-				}
-				break
-			}
-		}
+		_ = b.sendRichMessage(msg.Chat.ID, blocks, raw, msg.MessageID, nil)
 	}()
 }
 
@@ -315,50 +347,10 @@ func (b *Bot) handleQuery(msg *telegram.Message) {
 	}
 
 	totalPages := int(math.Ceil(float64(totalCount) / float64(pageSize)))
-	htmlText, markup := buildQueryPageHTML(groupID, keyword, results, totalCount, page, totalPages)
-	_, _ = b.tg.SendMessage(msg.Chat.ID, htmlText, "HTML", msg.MessageID, markup)
-}
+	blocks := format.BuildQueryRichBlocks(keyword, totalCount, results, page, pageSize)
+	markup := telegram.GenerateQueryPaginationKeyboard(keyword, page, totalPages)
 
-func buildQueryPageHTML(groupID, keyword string, results []*storage.Message, totalCount, page, totalPages int) (string, *telegram.InlineKeyboardMarkup) {
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("🔍 关键词「<b>%s</b>」检索结果（共 %d 条，第 %d/%d 页）：\n\n",
-		html.EscapeString(keyword), totalCount, page, totalPages))
-
-	for i, m := range results {
-		cleanContent := m.Content
-		if len([]rune(cleanContent)) > 100 {
-			cleanContent = string([]rune(cleanContent)[:100]) + "..."
-		}
-		link := telegram.GetMessageLink(m.GroupID, m.MessageID)
-		sb.WriteString(fmt.Sprintf("%d. <b>%s</b>: %s <a href=\"%s\">[直达]</a>\n",
-			i+1, html.EscapeString(m.UserName), html.EscapeString(cleanContent), link))
-	}
-
-	var markup *telegram.InlineKeyboardMarkup
-	if totalPages > 1 {
-		var buttons []telegram.InlineKeyboardButton
-		if page > 1 {
-			buttons = append(buttons, telegram.InlineKeyboardButton{
-				Text:         "⬅️ 上一页",
-				CallbackData: fmt.Sprintf("qp:%d:%s", page-1, keyword),
-			})
-		}
-		buttons = append(buttons, telegram.InlineKeyboardButton{
-			Text:         fmt.Sprintf("%d/%d", page, totalPages),
-			CallbackData: "noop",
-		})
-		if page < totalPages {
-			buttons = append(buttons, telegram.InlineKeyboardButton{
-				Text:         "下一页 ➡️",
-				CallbackData: fmt.Sprintf("qp:%d:%s", page+1, keyword),
-			})
-		}
-		markup = &telegram.InlineKeyboardMarkup{
-			InlineKeyboard: [][]telegram.InlineKeyboardButton{buttons},
-		}
-	}
-
-	return sb.String(), markup
+	_ = b.sendRichMessage(msg.Chat.ID, blocks, "", msg.MessageID, markup)
 }
 
 func (b *Bot) handleStatus(msg *telegram.Message) {
@@ -381,12 +373,43 @@ func (b *Bot) handleStatus(msg *telegram.Message) {
 		sb.WriteString("👤 <b>身份</b>：普通用户\n")
 	}
 
+	// 连通性测试
+	d1Latency, d1Err := b.storage.Ping()
+	d1LatencyText := fmt.Sprintf("%dms", d1Latency.Milliseconds())
+	if d1Err != nil {
+		d1LatencyText = "异常"
+	}
+
+	aiLatencyText := "未配置"
+	if b.cfg.AIAPIKey != "" {
+		aiStart := time.Now()
+		req, _ := http.NewRequestWithContext(context.Background(), "GET", strings.TrimRight(b.cfg.AIBaseURL, "/")+"/models", nil)
+		req.Header.Set("Authorization", "Bearer "+b.cfg.AIAPIKey)
+		client := &http.Client{Timeout: 5 * time.Second}
+		res, err := client.Do(req)
+		aiLatency := time.Since(aiStart).Milliseconds()
+		if err == nil {
+			_ = res.Body.Close()
+			if res.StatusCode == http.StatusOK || res.StatusCode == http.StatusUnauthorized {
+				aiLatencyText = fmt.Sprintf("正常 (%dms)", aiLatency)
+			} else {
+				aiLatencyText = fmt.Sprintf("异常 (%d, %dms)", res.StatusCode, aiLatency)
+			}
+		} else {
+			aiLatencyText = "连接超时/异常"
+		}
+	}
+
+	sb.WriteString("\n⚡ <b>系统连通性诊断：</b>\n")
+	sb.WriteString(fmt.Sprintf("• SQLite 数据库延迟：%s\n", d1LatencyText))
+	sb.WriteString(fmt.Sprintf("• AI 接口状态：%s\n", aiLatencyText))
+
 	quotaStatus, _ := b.quota.GetUserQuotaStatus(userID)
 	if quotaStatus != nil {
 		if quotaStatus.IsPrivileged {
-			sb.WriteString("⚡ <b>指令配额</b>：无限制（特权用户）\n")
+			sb.WriteString("\n⚡ <b>指令配额</b>：无限制（特权用户）\n")
 		} else {
-			sb.WriteString(fmt.Sprintf("📊 <b>今日配额</b>：\n• /summary: %d/%d\n• /ask: %d/%d\n• /query: %d/%d\n",
+			sb.WriteString(fmt.Sprintf("\n📊 <b>今日使用配额（次日 00:00 自动刷新）：</b>\n• 总结 (/summary): %d/%d 次\n• 问答 (/ask): %d/%d 次\n• 检索 (/query): %d/%d 次\n",
 				quotaStatus.Summary.Current, quotaStatus.Summary.Limit,
 				quotaStatus.Ask.Current, quotaStatus.Ask.Limit,
 				quotaStatus.Query.Current, quotaStatus.Query.Limit,

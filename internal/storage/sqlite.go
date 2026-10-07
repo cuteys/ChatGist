@@ -409,3 +409,10 @@ func (s *Storage) GetDatabaseStorageStats() (*StorageStats, error) {
 		GroupStats:      groupStats,
 	}, nil
 }
+
+func (s *Storage) Ping() (time.Duration, error) {
+	start := time.Now()
+	err := s.db.Ping()
+	return time.Since(start), err
+}
+

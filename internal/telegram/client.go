@@ -130,6 +130,14 @@ func (c *Client) EditMessageText(chatID int64, messageID int64, text string, par
 	return &msg, err
 }
 
+func (c *Client) SendRichMessageRaw(payload SendRichMessagePayload) error {
+	return c.post("sendRichMessage", payload, nil)
+}
+
+func (c *Client) EditRichMessageRaw(payload EditRichMessagePayload) error {
+	return c.post("editRichMessage", payload, nil)
+}
+
 func (c *Client) DeleteMessage(chatID int64, messageID int64) error {
 	req := map[string]interface{}{
 		"chat_id":    chatID,
@@ -273,4 +281,101 @@ func ToSuperscript(num int) string {
 		}
 	}
 	return sb.String()
+}
+
+// GenerateQueryPaginationKeyboard 构造关键词检索的分页内联键盘
+func GenerateQueryPaginationKeyboard(keyword string, currentPage int, totalPages int) *InlineKeyboardMarkup {
+	if totalPages <= 1 {
+		return nil
+	}
+
+	safeKeyword := keyword
+	runes := []rune(keyword)
+	if len(runes) > 15 {
+		safeKeyword = string(runes[:15])
+	}
+
+	var row1 []InlineKeyboardButton
+	if totalPages <= 5 {
+		for i := 1; i <= totalPages; i++ {
+			text := fmt.Sprintf("%d", i)
+			cb := fmt.Sprintf("qp:%d:%s", i, safeKeyword)
+			if i == currentPage {
+				text = fmt.Sprintf("【%d】", i)
+				cb = "noop"
+			}
+			row1 = append(row1, InlineKeyboardButton{Text: text, CallbackData: cb})
+		}
+	} else {
+		// 首页
+		p1Text := "1"
+		p1Cb := fmt.Sprintf("qp:1:%s", safeKeyword)
+		if currentPage == 1 {
+			p1Text = "【1】"
+			p1Cb = "noop"
+		}
+		row1 = append(row1, InlineKeyboardButton{Text: p1Text, CallbackData: p1Cb})
+
+		start := currentPage - 1
+		if start < 2 {
+			start = 2
+		}
+		end := currentPage + 1
+		if end > totalPages-1 {
+			end = totalPages - 1
+		}
+
+		if currentPage <= 3 {
+			start = 2
+			end = 4
+		} else if currentPage >= totalPages-2 {
+			start = totalPages - 3
+			end = totalPages - 1
+		}
+
+		if start > 2 {
+			row1 = append(row1, InlineKeyboardButton{Text: "...", CallbackData: "noop"})
+		}
+
+		for i := start; i <= end; i++ {
+			text := fmt.Sprintf("%d", i)
+			cb := fmt.Sprintf("qp:%d:%s", i, safeKeyword)
+			if i == currentPage {
+				text = fmt.Sprintf("【%d】", i)
+				cb = "noop"
+			}
+			row1 = append(row1, InlineKeyboardButton{Text: text, CallbackData: cb})
+		}
+
+		if end < totalPages-1 {
+			row1 = append(row1, InlineKeyboardButton{Text: "...", CallbackData: "noop"})
+		}
+
+		// 末页
+		lastText := fmt.Sprintf("%d", totalPages)
+		lastCb := fmt.Sprintf("qp:%d:%s", totalPages, safeKeyword)
+		if currentPage == totalPages {
+			lastText = fmt.Sprintf("【%d】", totalPages)
+			lastCb = "noop"
+		}
+		row1 = append(row1, InlineKeyboardButton{Text: lastText, CallbackData: lastCb})
+	}
+
+	prevCb := fmt.Sprintf("qp:%d:%s", currentPage-1, safeKeyword)
+	if currentPage <= 1 {
+		prevCb = "noop"
+	}
+	nextCb := fmt.Sprintf("qp:%d:%s", currentPage+1, safeKeyword)
+	if currentPage >= totalPages {
+		nextCb = "noop"
+	}
+
+	row2 := []InlineKeyboardButton{
+		{Text: "⬅️ 上一页", CallbackData: prevCb},
+		{Text: "下一页 ➡️", CallbackData: nextCb},
+	}
+
+	return &InlineKeyboardMarkup{
+		InlineKeyboard: [][]InlineKeyboardButton{row1, row2},
+	}
 }

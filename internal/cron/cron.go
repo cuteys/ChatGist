@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cuteys/ChatGist/internal/ai"
@@ -77,6 +78,105 @@ func (r *Runner) Start(ctx context.Context) {
 	}()
 }
 
+func (r *Runner) sanitizeSecrets(text string) string {
+	res := text
+	if r.cfg.AIAPIKey != "" {
+		res = strings.ReplaceAll(res, r.cfg.AIAPIKey, "[REDACTED]")
+	}
+	if r.cfg.AIBaseURL != "" {
+		res = strings.ReplaceAll(res, r.cfg.AIBaseURL, "[REDACTED]")
+	}
+	if r.cfg.TelegramBotToken != "" {
+		res = strings.ReplaceAll(res, r.cfg.TelegramBotToken, "[REDACTED]")
+	}
+	return res
+}
+
+func (r *Runner) notifySuperAdminsError(scene, groupID, groupName string, err error) {
+	if len(r.cfg.AdminUserIDs) == 0 || err == nil {
+		return
+	}
+
+	sanitizedErr := r.sanitizeSecrets(err.Error())
+	runes := []rune(sanitizedErr)
+	if len(runes) > 1500 {
+		sanitizedErr = string(runes[:1500]) + "...[TRUNCATED]"
+	}
+
+	loc := time.FixedZone("CST", 8*3600)
+	timeStr := time.Now().In(loc).Format("2006-01-02 15:04:05")
+
+	text := fmt.Sprintf("🚨 【ChatGist 系统异常告警】\n• 触发场景: %s\n• 发生群组: %s (ID: %s)\n• 发生时间: %s (北京时间)\n\n📋 错误信息与堆栈:\n```\n%s\n```",
+		scene, groupName, groupID, timeStr, sanitizedErr)
+
+	for _, adminIDStr := range r.cfg.AdminUserIDs {
+		adminIDStr = strings.TrimSpace(adminIDStr)
+		if adminIDStr == "" {
+			continue
+		}
+		adminID, parseErr := strconv.ParseInt(adminIDStr, 10, 64)
+		if parseErr != nil {
+			continue
+		}
+		_, sendErr := r.tg.SendMessage(adminID, text, "Markdown", 0, nil)
+		if sendErr != nil {
+			_, _ = r.tg.SendMessage(adminID, text, "", 0, nil)
+		}
+	}
+}
+
+func (r *Runner) sendRichMessage(chatID int64, blocks []format.RichBlock, rawMarkdown string) error {
+	chatIDStr := strconv.FormatInt(chatID, 10)
+
+	// 1. 尝试原生 AST blocks 模式
+	astReq := telegram.SendRichMessagePayload{
+		ChatID: chatIDStr,
+		RichMessage: &telegram.RichMessageContent{
+			Blocks: blocks,
+		},
+	}
+	if err := r.tg.SendRichMessageRaw(astReq); err == nil {
+		return nil
+	}
+
+	// 2. 尝试原生 Markdown 模式
+	if rawMarkdown != "" {
+		mdReq := telegram.SendRichMessagePayload{
+			ChatID: chatIDStr,
+			RichMessage: &telegram.RichMessageContent{
+				Markdown: rawMarkdown,
+			},
+		}
+		if err := r.tg.SendRichMessageRaw(mdReq); err == nil {
+			return nil
+		}
+	}
+
+	// 3. HTML 模式降级
+	htmlText := format.RichBlocksToHTML(blocks)
+	chunks := telegram.SplitMessage(htmlText, 4000)
+	htmlOk := true
+
+	for _, chunk := range chunks {
+		_, err := r.tg.SendMessage(chatID, chunk, "HTML", 0, nil)
+		if err != nil {
+			htmlOk = false
+			break
+		}
+	}
+	if htmlOk {
+		return nil
+	}
+
+	// 4. 纯文本兜底
+	plainText := format.RichBlocksToPlainText(blocks)
+	plainChunks := telegram.SplitMessage(plainText, 4000)
+	for _, chunk := range plainChunks {
+		_, _ = r.tg.SendMessage(chatID, chunk, "", 0, nil)
+	}
+	return nil
+}
+
 func (r *Runner) executeDailyTasks(ctx context.Context) {
 	log.Println("[Cron] Executing daily scheduled tasks...")
 
@@ -110,6 +210,7 @@ func (r *Runner) executeDailyTasks(ctx context.Context) {
 			cancel()
 			if err != nil {
 				log.Printf("[Cron] Failed to summarize for group %s (%s): %v", g.GroupName, g.GroupID, err)
+				r.notifySuperAdminsError("每日定时总结 (00:00 Cron)", g.GroupID, g.GroupName, err)
 				continue
 			}
 
@@ -135,11 +236,7 @@ func (r *Runner) executeDailyTasks(ctx context.Context) {
 				},
 			)
 
-			htmlContent := format.RichBlocksToHTML(blocks)
-			chunks := telegram.SplitMessage(htmlContent, 4000)
-			for _, chunk := range chunks {
-				_, _ = r.tg.SendMessage(chatID, chunk, "HTML", 0, nil)
-			}
+			_ = r.sendRichMessage(chatID, blocks, raw)
 			time.Sleep(2 * time.Second) // 群组间发送间隔避让 Telegram API 限速
 		}
 	}

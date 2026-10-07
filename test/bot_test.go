@@ -137,4 +137,31 @@ func TestFormatAndParsing(t *testing.T) {
 	if superscript != "¹²" {
 		t.Errorf("Expected ¹², got %s", superscript)
 	}
+
+	// 抽屉与表格富文本解析测试
+	detailsMd := `<details>
+<summary>议题一：架构方案</summary>
+
+| 模块 | 职责 |
+| :--- | :--- |
+| Bot | 调度与路由 |
+| AI | 大模型推理 |
+
+- [x] 协程生命周期已修复
+</details>`
+	detailBlocks := format.AggregateMarkdownToRichBlocks(detailsMd)
+	if len(detailBlocks) == 0 || detailBlocks[0].Type != format.BlockDetails {
+		t.Errorf("Expected BlockDetails, got %v", detailBlocks)
+	}
+	detailHtml := format.RichBlocksToHTML(detailBlocks)
+	if detailHtml == "" {
+		t.Errorf("Expected non-empty HTML for details")
+	}
+
+	// 分页键盘按键生成测试
+	kb := telegram.GenerateQueryPaginationKeyboard("部署", 1, 3)
+	if kb == nil || len(kb.InlineKeyboard) != 2 {
+		t.Errorf("Expected 2 rows of pagination keyboard, got %v", kb)
+	}
 }
+

@@ -21,6 +21,12 @@ func getTextString(text interface{}) string {
 		if t, ok := v["text"]; ok {
 			return getTextString(t)
 		}
+	case []interface{}:
+		var sb strings.Builder
+		for _, part := range v {
+			sb.WriteString(getTextString(part))
+		}
+		return sb.String()
 	}
 	return fmt.Sprintf("%v", text)
 }
@@ -34,21 +40,23 @@ func formatInlineTextToHTML(text interface{}) string {
 		return EscapeHTML(v)
 	case map[string]interface{}:
 		tp, _ := v["type"].(string)
-		subText := getTextString(v["text"])
+		subText := formatInlineTextToHTML(v["text"])
 		switch tp {
 		case "bold":
-			return fmt.Sprintf("<b>%s</b>", EscapeHTML(subText))
+			return fmt.Sprintf("<b>%s</b>", subText)
 		case "italic":
-			return fmt.Sprintf("<i>%s</i>", EscapeHTML(subText))
+			return fmt.Sprintf("<i>%s</i>", subText)
 		case "code":
-			return fmt.Sprintf("<code>%s</code>", EscapeHTML(subText))
+			return fmt.Sprintf("<code>%s</code>", EscapeHTML(getTextString(v["text"])))
 		case "marked":
-			return fmt.Sprintf("<b>[%s]</b>", EscapeHTML(subText))
+			return fmt.Sprintf("<b>[%s]</b>", subText)
+		case "bot_command":
+			return fmt.Sprintf("<code>%s</code>", EscapeHTML(getTextString(v["text"])))
 		case "url", "link":
 			u, _ := v["url"].(string)
-			return fmt.Sprintf("<a href=\"%s\">%s</a>", EscapeHTML(u), EscapeHTML(subText))
+			return fmt.Sprintf("<a href=\"%s\">%s</a>", EscapeHTML(u), subText)
 		default:
-			return EscapeHTML(subText)
+			return subText
 		}
 	case []interface{}:
 		var sb strings.Builder
@@ -61,6 +69,7 @@ func formatInlineTextToHTML(text interface{}) string {
 	}
 }
 
+// RichBlocksToHTML 将 AST 转换为 Telegram 兼容的 HTML 格式
 func RichBlocksToHTML(blocks []RichBlock) string {
 	var parts []string
 
@@ -69,28 +78,28 @@ func RichBlocksToHTML(blocks []RichBlock) string {
 		case BlockParagraph:
 			parts = append(parts, formatInlineTextToHTML(block.Text))
 		case BlockHeading:
-			parts = append(parts, fmt.Sprintf("\n<b>📌 %s</b>\n", formatInlineTextToHTML(block.Text)))
+			parts = append(parts, fmt.Sprintf("<b>📌 %s</b>", formatInlineTextToHTML(block.Text)))
 		case BlockQuote:
 			parts = append(parts, fmt.Sprintf("<blockquote>%s</blockquote>", RichBlocksToHTML(block.Blocks)))
 		case BlockDivider:
-			parts = append(parts, "\n━━━━━━━━━━━━━━━━━━━━\n")
+			parts = append(parts, "━━━━━━━━━━━━━━━━━━━━")
 		case BlockDetails:
 			summary := block.Summary
-			if summary == "" {
+			if strings.TrimSpace(summary) == "" {
 				summary = "详细内容"
 			}
-			parts = append(parts, fmt.Sprintf("\n<blockquote expandable><b>🔽 【%s】</b>\n%s</blockquote>\n", EscapeHTML(summary), RichBlocksToHTML(block.Blocks)))
+			parts = append(parts, fmt.Sprintf("<blockquote expandable><b>🔽 【%s】</b>\n%s</blockquote>", EscapeHTML(summary), RichBlocksToHTML(block.Blocks)))
 		case BlockTable:
 			if len(block.Cells) > 0 {
 				var tableLines []string
 				for _, row := range block.Cells {
 					var rowParts []string
 					for _, cell := range row {
+						cellHtml := formatInlineTextToHTML(cell.Text)
 						if cell.IsHeader {
-							rowParts = append(rowParts, fmt.Sprintf("<b>%s</b>", EscapeHTML(cell.Text)))
-						} else {
-							rowParts = append(rowParts, EscapeHTML(cell.Text))
+							cellHtml = fmt.Sprintf("<b>%s</b>", cellHtml)
 						}
+						rowParts = append(rowParts, cellHtml)
 					}
 					tableLines = append(tableLines, strings.Join(rowParts, " | "))
 				}
@@ -116,6 +125,7 @@ func RichBlocksToHTML(blocks []RichBlock) string {
 	return strings.TrimSpace(strings.Join(parts, "\n\n"))
 }
 
+// RichBlocksToPlainText 将 AST 降级为干净易读的纯文本
 func RichBlocksToPlainText(blocks []RichBlock) string {
 	var lines []string
 
@@ -130,12 +140,16 @@ func RichBlocksToPlainText(blocks []RichBlock) string {
 		case BlockDivider:
 			lines = append(lines, "------------------------")
 		case BlockDetails:
-			lines = append(lines, fmt.Sprintf("\n🔽 【%s】\n%s", block.Summary, RichBlocksToPlainText(block.Blocks)))
+			summary := block.Summary
+			if strings.TrimSpace(summary) == "" {
+				summary = "详细内容"
+			}
+			lines = append(lines, fmt.Sprintf("\n🔽 【%s】\n%s", summary, RichBlocksToPlainText(block.Blocks)))
 		case BlockTable:
 			for _, row := range block.Cells {
 				var rowParts []string
 				for _, cell := range row {
-					rowParts = append(rowParts, cell.Text)
+					rowParts = append(rowParts, getTextString(cell.Text))
 				}
 				lines = append(lines, strings.Join(rowParts, " | "))
 			}
