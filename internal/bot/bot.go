@@ -98,6 +98,10 @@ func (b *Bot) Start(ctx context.Context) error {
 }
 
 func (b *Bot) startPolling(ctx context.Context) error {
+	// 启动长轮询前自动解绑旧 Webhook（避免切换部署时与旧 Worker 的 Webhook 产生冲突）
+	if err := b.tg.DeleteWebhook(false); err != nil {
+		log.Printf("[Bot] Notice: deleteWebhook returned: %v (continuing)", err)
+	}
 	log.Println("[Bot] Long Polling started successfully.")
 	var offset int64 = 0
 

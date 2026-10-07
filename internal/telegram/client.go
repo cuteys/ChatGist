@@ -84,6 +84,14 @@ func (c *Client) GetUpdates(offset int64, limit int, timeoutSec int) ([]Update, 
 	return updates, err
 }
 
+func (c *Client) DeleteWebhook(dropPendingUpdates bool) error {
+	req := map[string]interface{}{
+		"drop_pending_updates": dropPendingUpdates,
+	}
+	var res bool
+	return c.post("deleteWebhook", req, &res)
+}
+
 func (c *Client) SendMessage(chatID int64, text string, parseMode string, replyToMessageID int64, markup *InlineKeyboardMarkup) (*Message, error) {
 	req := map[string]interface{}{
 		"chat_id": chatID,
