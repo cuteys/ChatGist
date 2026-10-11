@@ -240,7 +240,14 @@ func (b *Bot) handleAsk(msg *telegram.Message) {
 
 		b.tg.StartTypingKeeper(ctx, msg.Chat.ID)
 
-		messages, err := b.storage.GetRecentMessages(groupID, 1000, 0)
+		var messages []*storage.Message
+		var err error
+		if msg.ReplyToMessage != nil {
+			messages, err = b.storage.GetMessagesAround(groupID, msg.ReplyToMessage.MessageID, msg.ReplyToMessage.Date*1000, 200, 100)
+		}
+		if err != nil || len(messages) == 0 {
+			messages, err = b.storage.GetRecentMessages(groupID, 300, 0)
+		}
 		if err != nil || len(messages) == 0 {
 			if statusMsg != nil {
 				_ = b.tg.DeleteMessage(msg.Chat.ID, statusMsg.MessageID)
@@ -252,8 +259,12 @@ func (b *Bot) handleAsk(msg *telegram.Message) {
 		contextInfo := fmt.Sprintf("所在群组: %s (ID: %s)\n提问者: %s", msg.Chat.Title, groupID, getUserDisplayName(msg.From))
 		if msg.ReplyToMessage != nil {
 			repliedLink := telegram.GetMessageLink(groupID, msg.ReplyToMessage.MessageID)
+			repliedText := strings.TrimSpace(msg.ReplyToMessage.Text)
+			if repliedText == "" {
+				repliedText = strings.TrimSpace(msg.ReplyToMessage.Caption)
+			}
 			contextInfo += fmt.Sprintf("\n【重点引用的消息】\n• 直达链接: %s\n• 发言人: %s\n• 内容: %s",
-				repliedLink, getUserDisplayName(msg.ReplyToMessage.From), msg.ReplyToMessage.Text)
+				repliedLink, getUserDisplayName(msg.ReplyToMessage.From), repliedText)
 		}
 
 		raw, err := b.ai.AskChat(ctx, messages, question, contextInfo)

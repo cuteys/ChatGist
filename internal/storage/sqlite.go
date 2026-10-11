@@ -231,6 +231,60 @@ func (s *Storage) GetRecentMessages(groupID string, limit int, sinceTimeStamp in
 	return list, nil
 }
 
+func (s *Storage) GetMessagesAround(groupID string, targetMsgID int64, fallbackTime int64, beforeLimit, afterLimit int) ([]*Message, error) {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+
+	var targetTime int64
+	_ = s.db.QueryRow("SELECT timeStamp FROM Messages WHERE groupId = ? AND messageId = ?", groupID, targetMsgID).Scan(&targetTime)
+	if targetTime <= 0 {
+		targetTime = fallbackTime
+	}
+	if targetTime <= 0 {
+		return nil, nil
+	}
+
+	// 以引用消息为锚点截取前 N 条（含目标本身）与后 M 条，兼顾同秒消息按 messageId 严格定序
+	query := `
+		SELECT id, groupId, timeStamp, userName, content, messageId, groupName, messageTime FROM (
+			SELECT * FROM (
+				SELECT id, groupId, timeStamp, userName, content, messageId, groupName, messageTime
+				FROM Messages
+				WHERE groupId = ? AND (timeStamp < ? OR (timeStamp = ? AND messageId <= ?))
+				ORDER BY timeStamp DESC, messageId DESC
+				LIMIT ?
+			)
+			UNION ALL
+			SELECT * FROM (
+				SELECT id, groupId, timeStamp, userName, content, messageId, groupName, messageTime
+				FROM Messages
+				WHERE groupId = ? AND (timeStamp > ? OR (timeStamp = ? AND messageId > ?))
+				ORDER BY timeStamp ASC, messageId ASC
+				LIMIT ?
+			)
+		)
+		ORDER BY timeStamp ASC, messageId ASC
+	`
+	rows, err := s.db.Query(query,
+		groupID, targetTime, targetTime, targetMsgID, beforeLimit+1,
+		groupID, targetTime, targetTime, targetMsgID, afterLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var list []*Message
+	for rows.Next() {
+		m := &Message{}
+		if err := rows.Scan(&m.ID, &m.GroupID, &m.TimeStamp, &m.UserName, &m.Content, &m.MessageID, &m.GroupName, &m.MessageTime); err != nil {
+			return nil, err
+		}
+		list = append(list, m)
+	}
+	return list, nil
+}
+
 func (s *Storage) GetMessagesBetween(groupID string, startTime, endTime int64) ([]*Message, error) {
 	s.mux.RLock()
 	defer s.mux.RUnlock()
@@ -415,4 +469,3 @@ func (s *Storage) Ping() (time.Duration, error) {
 	err := s.db.Ping()
 	return time.Since(start), err
 }
-

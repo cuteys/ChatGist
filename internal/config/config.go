@@ -7,27 +7,27 @@ import (
 )
 
 type Config struct {
-	TelegramBotToken        string
-	SecretTelegramAPIToken  string
-	AIAPIKey                string
-	AIModel                 string
-	AIBaseURL               string
-	AdminUserIDs            []string
-	SystemPromptSummary     string
-	SystemPromptAsk         string
-	LimitSummary            int
-	LimitAsk                int
-	LimitQuery              int
-	UserDailyLimit          int
-	LimitGroupMessages      int
-	LimitGroupImages        int
-	ReasoningEffort         string
-	DBPath                  string
-	Mode                    string // 运行模式：polling 或 webhook
-	Port                    string
-	WebhookURL              string
-	CronEnabled             bool
-	CronHourBeijing         int
+	TelegramBotToken       string
+	SecretTelegramAPIToken string
+	AIAPIKey               string
+	AIModel                string
+	AIBaseURL              string
+	AdminUserIDs           []string
+	SystemPromptSummary    string
+	SystemPromptAsk        string
+	LimitSummary           int
+	LimitAsk               int
+	LimitQuery             int
+	UserDailyLimit         int
+	LimitGroupMessages     int
+	LimitGroupImages       int
+	ReasoningEffort        string
+	DBPath                 string
+	Mode                   string // 运行模式：polling 或 webhook
+	Port                   string
+	WebhookURL             string
+	CronEnabled            bool
+	CronHourBeijing        int
 }
 
 func getEnv(key, defaultVal string) string {

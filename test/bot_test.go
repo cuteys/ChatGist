@@ -1,11 +1,13 @@
 package test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/cuteys/ChatGist/internal/bot"
 	"github.com/cuteys/ChatGist/internal/config"
 	"github.com/cuteys/ChatGist/internal/format"
 	"github.com/cuteys/ChatGist/internal/quota"
@@ -112,6 +114,65 @@ func TestStorageAndWhitelistAndQuota(t *testing.T) {
 	if !store.IsDuplicateUpdate(12345) {
 		t.Errorf("Update 12345 should be duplicate on second check")
 	}
+
+	// 6. 消息编辑覆盖入库与指令编辑拦截测试
+	b := bot.New(cfg, store, wl, q, nil, nil)
+	b.ProcessUpdate(&telegram.Update{
+		UpdateID: 20001,
+		EditedMessage: &telegram.Message{
+			MessageID: 1,
+			Date:      now / 1000,
+			Chat:      &telegram.Chat{ID: -100999, Type: "supergroup", Title: "TestGroup"},
+			From:      &telegram.User{ID: 30003, FirstName: "Alice"},
+			Text:      "Edited message content without old keyword",
+		},
+	})
+
+	_, oldCount, err := store.QueryMessages("-100999", "test", 10, 0)
+	if err != nil || oldCount != 0 {
+		t.Errorf("Expected old keyword count=0 after edit, got %d (err=%v)", oldCount, err)
+	}
+	editedRes, newCount, err := store.QueryMessages("-100999", "Edited", 10, 0)
+	if err != nil || newCount != 1 || len(editedRes) != 1 {
+		t.Errorf("Expected new keyword count=1 after edit, got %d (err=%v)", newCount, err)
+	}
+
+	// 编辑为 / 指令时应直接忽略，不覆盖原记录且不触发命令
+	b.ProcessUpdate(&telegram.Update{
+		UpdateID: 20002,
+		EditedMessage: &telegram.Message{
+			MessageID: 1,
+			Date:      now / 1000,
+			Chat:      &telegram.Chat{ID: -100999, Type: "supergroup", Title: "TestGroup"},
+			From:      &telegram.User{ID: 30003, FirstName: "Alice"},
+			Text:      "/summary 50",
+		},
+	})
+	_, stillCount, err := store.QueryMessages("-100999", "Edited", 10, 0)
+	if err != nil || stillCount != 1 {
+		t.Errorf("Slash command edit should be ignored, expected count=1, got %d (err=%v)", stillCount, err)
+	}
+
+	// 7. 锚点前后窗口查询测试（GetMessagesAround）
+	for i := 2; i <= 10; i++ {
+		_ = store.SaveMessage(&storage.Message{
+			ID:          fmt.Sprintf("-100999_%d", i),
+			GroupID:     "-100999",
+			TimeStamp:   now + int64(i*1000),
+			UserName:    "Bob",
+			Content:     "Msg",
+			MessageID:   int64(i),
+			GroupName:   "TestGroup",
+			MessageTime: "2026-10-07 10:00:00",
+		})
+	}
+	around, err := store.GetMessagesAround("-100999", 5, 0, 2, 3)
+	if err != nil || len(around) != 6 {
+		t.Fatalf("Expected 6 messages (2 before + target #5 + 3 after), got %d (err=%v)", len(around), err)
+	}
+	if around[0].MessageID != 3 || around[2].MessageID != 5 || around[5].MessageID != 8 {
+		t.Errorf("Unexpected around window IDs: first=%d, target=%d, last=%d", around[0].MessageID, around[2].MessageID, around[5].MessageID)
+	}
 }
 
 func TestFormatAndParsing(t *testing.T) {
@@ -164,4 +225,3 @@ func TestFormatAndParsing(t *testing.T) {
 		t.Errorf("Expected 2 rows of pagination keyboard, got %v", kb)
 	}
 }
-

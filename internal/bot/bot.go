@@ -193,6 +193,19 @@ func (b *Bot) ProcessUpdate(u *telegram.Update) {
 		return
 	}
 
+	if u.EditedMessage != nil {
+		text := strings.TrimSpace(u.EditedMessage.Text)
+		if text == "" && u.EditedMessage.Caption != "" {
+			text = strings.TrimSpace(u.EditedMessage.Caption)
+		}
+		// 忽略指令类消息编辑，防止重复触发命令执行或扣减配额
+		if strings.HasPrefix(text, "/") {
+			return
+		}
+		b.handleIngest(u.EditedMessage)
+		return
+	}
+
 	msg := u.Message
 	if msg == nil {
 		return
