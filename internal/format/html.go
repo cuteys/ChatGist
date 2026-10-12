@@ -21,6 +21,9 @@ func getTextString(text interface{}) string {
 		if t, ok := v["text"]; ok {
 			return getTextString(t)
 		}
+		if expr, ok := v["expression"].(string); ok {
+			return expr
+		}
 	case []interface{}:
 		var sb strings.Builder
 		for _, part := range v {
@@ -52,6 +55,9 @@ func formatInlineTextToHTML(text interface{}) string {
 			return fmt.Sprintf("<b>[%s]</b>", subText)
 		case "bot_command":
 			return fmt.Sprintf("<code>%s</code>", EscapeHTML(getTextString(v["text"])))
+		case "mathematical_expression":
+			expr, _ := v["expression"].(string)
+			return fmt.Sprintf("<code>%s</code>", EscapeHTML(expr))
 		case "url", "link":
 			u, _ := v["url"].(string)
 			return fmt.Sprintf("<a href=\"%s\">%s</a>", EscapeHTML(u), subText)
@@ -83,6 +89,8 @@ func RichBlocksToHTML(blocks []RichBlock) string {
 			parts = append(parts, fmt.Sprintf("<blockquote>%s</blockquote>", RichBlocksToHTML(block.Blocks)))
 		case BlockDivider:
 			parts = append(parts, "━━━━━━━━━━━━━━━━━━━━")
+		case BlockMath:
+			parts = append(parts, fmt.Sprintf("<pre>%s</pre>", EscapeHTML(block.Expression)))
 		case BlockDetails:
 			summary := block.Summary
 			if strings.TrimSpace(summary) == "" {
@@ -139,6 +147,8 @@ func RichBlocksToPlainText(blocks []RichBlock) string {
 			lines = append(lines, fmt.Sprintf("【概览】%s", RichBlocksToPlainText(block.Blocks)))
 		case BlockDivider:
 			lines = append(lines, "------------------------")
+		case BlockMath:
+			lines = append(lines, block.Expression)
 		case BlockDetails:
 			summary := block.Summary
 			if strings.TrimSpace(summary) == "" {

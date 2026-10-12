@@ -18,6 +18,7 @@ const (
 	BlockDetails   RichBlockType = "details"
 	BlockTable     RichBlockType = "table"
 	BlockList      RichBlockType = "list"
+	BlockMath      RichBlockType = "mathematical_expression"
 )
 
 type RichTableCell struct {
@@ -37,6 +38,7 @@ type RichListItem struct {
 type RichBlock struct {
 	Type       RichBlockType     `json:"type"`
 	Text       interface{}       `json:"text,omitempty"` // 单行文本或内联样式
+	Expression string            `json:"expression,omitempty"`
 	Size       int               `json:"size,omitempty"`
 	Summary    string            `json:"summary,omitempty"`
 	Blocks     []RichBlock       `json:"blocks,omitempty"`
