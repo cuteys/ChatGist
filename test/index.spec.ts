@@ -79,7 +79,28 @@ describe("JPEG validation", () => {
 });
 
 import { extractAllOGInfo } from "../src/og";
-import { formatBeijingTime, getCompletionOptions, getReasoningEffortLadder } from "../src/index";
+import { formatBeijingTime, getCompletionOptions, getReasoningEffortLadder, dispatchContent } from "../src/index";
+import { calcRequestDiagnostics } from "../src/logModelError";
+
+describe("dispatchContent and calcRequestDiagnostics", () => {
+	it("should ignore svg data URLs and strip trailing metadata from raster images", () => {
+		const svgMsg = "image: data:image/svg+xml;base64,PHN2Zy%2B\ntwitter:card: summary";
+		expect(dispatchContent(svgMsg)).toEqual([{ type: "text", text: svgMsg }]);
+
+		const photoWithTrailing = "Caption text\n\ndata:image/jpeg;base64,AAAA\ntrailing note";
+		expect(dispatchContent(photoWithTrailing)).toEqual([
+			{ type: "text", text: "Caption text" },
+			{ type: "image_url", image_url: { url: "data:image/jpeg;base64,AAAA" } },
+			{ type: "text", text: "trailing note" },
+		]);
+
+		const diag = calcRequestDiagnostics([
+			{ userName: "Alice", content: svgMsg },
+			{ userName: "Bob", content: photoWithTrailing },
+		]);
+		expect(diag).toContain("消息 2 条 | 图片 1 张");
+	});
+});
 
 describe("OG info security", () => {
 	it("should reject private and local hosts without fetching", async () => {

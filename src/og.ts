@@ -48,19 +48,29 @@ export async function extractAllOGInfo(url: string): Promise<string> {
 
 		class MetaHandler {
 			element(element: Element) {
-				const propertyValue = element.getAttribute("property");
-				if (propertyValue?.startsWith("og:")) {
-					const contentValue = element.getAttribute("content");
-					if (contentValue) {
-						ogData.set(propertyValue.replace("og:", ""), contentValue);
-					}
-					element.remove();
-				}
-				const name = element.getAttribute("name");
-				const contentValue = element.getAttribute("content");
+				const prop = (element.getAttribute("property") || "").toLowerCase().trim();
+				const name = (element.getAttribute("name") || "").toLowerCase().trim();
+				const content = (element.getAttribute("content") || "").trim();
 
-				if (name && contentValue) {
-					ogData.set(name, contentValue);
+				// 忽略空值与内联 data: URI，防止如 data:image/svg+xml 混入正文触发多模态解析失败
+				if (!content || content.toLowerCase().startsWith("data:")) {
+					return;
+				}
+
+				if (prop === "og:title" || prop === "og:description" || prop === "og:site_name" || prop === "og:type") {
+					ogData.set(prop.slice(3), content);
+					element.remove();
+					return;
+				}
+
+				if ((name === "description" || name === "twitter:description") && !ogData.has("description")) {
+					ogData.set("description", content);
+					element.remove();
+				} else if (name === "twitter:title" && !ogData.has("title")) {
+					ogData.set("title", content);
+					element.remove();
+				} else if (name === "application-name" && !ogData.has("site_name")) {
+					ogData.set("site_name", content);
 					element.remove();
 				}
 			}
@@ -71,10 +81,13 @@ export async function extractAllOGInfo(url: string): Promise<string> {
 			return url;
 		}
 		let ret = "";
-		for (const [key, value] of ogData.entries()) {
-			ret += `${key}: ${value}\n`;
+		for (const key of ["title", "site_name", "type", "description"]) {
+			const value = ogData.get(key);
+			if (value) {
+				ret += `${key}: ${value}\n`;
+			}
 		}
-		return `${url} 的相关信息为:\n` + ret;
+		return `${url} 的相关信息为:\n` + ret.trimEnd();
 	} catch (error) {
 		return url;
 	}

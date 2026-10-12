@@ -3,7 +3,7 @@ import OpenAI from "openai";
 import { Buffer } from 'node:buffer';
 import { detectImageMimeType } from './image';
 import { extractAllOGInfo } from "./og";
-import { logModelError, notifySuperAdminsError, calcRequestDiagnostics } from './logModelError';
+import { logModelError, notifySuperAdminsError, calcRequestDiagnostics, extractEmbeddedImage } from './logModelError';
 import {
 	deleteTelegramMessage,
 	getMessageLink,
@@ -130,19 +130,20 @@ export async function isDuplicateUpdate(env: Env, updateId?: number): Promise<bo
 
 type ChatMessagePart = { type: "text"; text: string } | { type: "image_url"; image_url: { url: string } };
 
-function dispatchContent(content: string): ChatMessagePart[] {
-	const imgIdx = content.indexOf("data:image/");
-	if (imgIdx !== -1) {
+export function dispatchContent(content: string): ChatMessagePart[] {
+	const extracted = extractEmbeddedImage(content);
+	if (extracted) {
 		const parts: ChatMessagePart[] = [];
-		const textPart = content.slice(0, imgIdx).trim();
-		if (textPart) {
-			parts.push({ type: "text", text: textPart });
+		if (extracted.textBefore) {
+			parts.push({ type: "text", text: extracted.textBefore });
 		}
-		const imgPart = content.slice(imgIdx).trim();
 		parts.push({
 			type: "image_url",
-			image_url: { url: imgPart },
+			image_url: { url: extracted.imgDataUrl },
 		});
+		if (extracted.textAfter) {
+			parts.push({ type: "text", text: extracted.textAfter });
+		}
 		return parts;
 	}
 	return [

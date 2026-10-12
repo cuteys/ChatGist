@@ -83,6 +83,47 @@ export interface AdminAlertDetails {
 	error: unknown;
 }
 
+const SUPPORTED_IMAGE_PREFIXES = [
+	'data:image/jpeg;base64,',
+	'data:image/png;base64,',
+	'data:image/webp;base64,',
+];
+
+export function extractEmbeddedImage(content: string): {
+	textBefore: string;
+	imgDataUrl: string;
+	textAfter: string;
+} | null {
+	let imgIdx = -1;
+	let matchedPrefix = '';
+	for (const prefix of SUPPORTED_IMAGE_PREFIXES) {
+		const idx = content.indexOf(prefix);
+		if (idx !== -1 && (imgIdx === -1 || idx < imgIdx)) {
+			imgIdx = idx;
+			matchedPrefix = prefix;
+		}
+	}
+	if (imgIdx === -1) {
+		return null;
+	}
+
+	const rest = content.slice(imgIdx);
+	const wsMatch = rest.search(/\s/);
+	const candidate = wsMatch === -1 ? rest : rest.slice(0, wsMatch);
+	const textAfter = wsMatch === -1 ? '' : rest.slice(wsMatch).trim();
+	const b64Payload = candidate.slice(matchedPrefix.length);
+
+	if (!b64Payload || !/^[A-Za-z0-9+/=_-]+$/.test(b64Payload)) {
+		return null;
+	}
+
+	return {
+		textBefore: content.slice(0, imgIdx).trim(),
+		imgDataUrl: candidate,
+		textAfter,
+	};
+}
+
 export function calcRequestDiagnostics(results: any[]): string {
 	let imageCount = 0;
 	let textChars = 0;
@@ -91,10 +132,10 @@ export function calcRequestDiagnostics(results: any[]): string {
 		const uname = String(r?.userName || '');
 		const content = String(r?.content || '');
 		textChars += uname.length;
-		if (content.includes('data:image/')) {
+		const extracted = extractEmbeddedImage(content);
+		if (extracted) {
 			imageCount++;
-			const idx = content.indexOf('data:image/');
-			textChars += content.slice(0, idx).trim().length;
+			textChars += extracted.textBefore.length + extracted.textAfter.length;
 		} else {
 			textChars += content.length;
 		}
