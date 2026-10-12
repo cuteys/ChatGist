@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"regexp"
 	"strings"
+
+	"github.com/cuteys/ChatGist/internal/latex"
 )
 
 var codeFenceRegex = regexp.MustCompile("(?s)^```(?:json)?\\s*(.*?)\\s*```$")
@@ -19,6 +21,7 @@ func ParseRichInline(text string) interface{} {
 	if text == "" {
 		return ""
 	}
+	text = latex.EscapeLaTeX(text)
 
 	matches := inlineTokenRegex.FindAllStringSubmatchIndex(text, -1)
 	if len(matches) == 0 {
@@ -171,7 +174,7 @@ func AggregateMarkdownToRichBlocks(content string) []RichBlock {
 				}
 			}
 
-			summary := strings.TrimSpace(raw[m[2]:m[3]])
+			summary := latex.EscapeLaTeX(strings.TrimSpace(raw[m[2]:m[3]]))
 			inner := strings.TrimSpace(raw[m[4]:m[5]])
 			innerBlocks := parseMarkdownSectionBlocks(inner)
 			if len(innerBlocks) == 0 {
