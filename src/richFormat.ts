@@ -5,7 +5,8 @@ export type RichTextInline =
 	| { type: 'bold'; text: RichText }
 	| { type: 'italic'; text: RichText }
 	| { type: 'code'; text: string }
-	| { type: 'marked'; text: string }
+	| { type: 'marked'; text: RichText }
+	| { type: 'mathematical_expression'; expression: string }
 	| { type: 'url'; text: string | RichText; url: string }
 	| { type: 'link'; text: string | RichText; url: string }
 	| { type: 'bot_command'; text: string; bot_command?: string };
@@ -65,6 +66,11 @@ export interface RichBlockList {
 	items: RichListItem[];
 }
 
+export interface RichBlockMath {
+	type: 'mathematical_expression';
+	expression: string;
+}
+
 export type RichBlock =
 	| RichBlockParagraph
 	| RichBlockHeading
@@ -72,7 +78,8 @@ export type RichBlock =
 	| RichBlockDivider
 	| RichBlockDetails
 	| RichBlockTable
-	| RichBlockList;
+	| RichBlockList
+	| RichBlockMath;
 
 export interface InputRichMessage {
 	blocks: RichBlock[];
@@ -227,10 +234,169 @@ export async function deleteTelegramMessage(
 // 3. 本地富文本聚合引擎与 Markdown 解析器
 // ==========================================
 
-export function parseRichInline(text: string): RichText {
+const mathCommandHintRegex = /\\[a-zA-Z]{2,}|[_^{}]/;
+const pureCurrencyNumRegex = /^[0-9]+([.,][0-9]+)*\s*[a-zA-Z%]*$/;
+const mathPlaceholderFindRegex = /\x00MATH(\d+)\x00/g;
+
+function isAlnumByte(ch: string): boolean {
+	if (!ch) return false;
+	const c = ch.charCodeAt(0);
+	return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
+function isDigitByte(ch: string): boolean {
+	if (!ch) return false;
+	const c = ch.charCodeAt(0);
+	return c >= 48 && c <= 57;
+}
+
+function isLikelyInlineMath(inner: string): boolean {
+	const trimmed = inner.trim();
+	if (!trimmed || trimmed.includes('\n')) return false;
+	if (pureCurrencyNumRegex.test(trimmed)) return false;
+	return true;
+}
+
+function extractBacktickMath(code: string): string | null {
+	const trimmed = code.trim();
+	for (const [open, close] of [['$$', '$$'], ['\\[', '\\]'], ['\\(', '\\)'], ['$', '$']] as const) {
+		if (trimmed.startsWith(open) && trimmed.endsWith(close) && trimmed.length > open.length + close.length) {
+			const inner = trimmed.slice(open.length, trimmed.length - close.length).trim();
+			if (isLikelyInlineMath(inner)) return inner;
+		}
+	}
+	if (mathCommandHintRegex.test(trimmed) && !trimmed.includes('://') && !trimmed.includes('/root/')) {
+		return trimmed;
+	}
+	return null;
+}
+
+function extractInlineMathPlaceholders(text: string): { masked: string; mathExprs: string[] } {
+	if (!text.includes('$') && !text.includes('\\') && !text.includes('`')) {
+		return { masked: text, mathExprs: [] };
+	}
+	const mathExprs: string[] = [];
+	let out = '';
+	let i = 0;
+	const n = text.length;
+
+	const addPlaceholder = (expr: string) => {
+		const idx = mathExprs.length;
+		mathExprs.push(expr.trim());
+		out += `\x00MATH${idx}\x00`;
+	};
+
+	while (i < n) {
+		if (text[i] === '`') {
+			const endIdx = text.indexOf('`', i + 1);
+			if (endIdx !== -1) {
+				const codeContent = text.slice(i + 1, endIdx);
+				const expr = extractBacktickMath(codeContent);
+				if (expr) {
+					addPlaceholder(expr);
+				} else {
+					out += text.slice(i, endIdx + 1);
+				}
+				i = endIdx + 1;
+				continue;
+			}
+		}
+
+		if (i + 1 < n && text[i] === '\\' && (text[i + 1] === '(' || text[i + 1] === '[')) {
+			const closeDelim = text[i + 1] === '(' ? '\\)' : '\\]';
+			const endIdx = text.indexOf(closeDelim, i + 2);
+			if (endIdx !== -1) {
+				const inner = text.slice(i + 2, endIdx);
+				if (isLikelyInlineMath(inner)) {
+					addPlaceholder(inner);
+					i = endIdx + 2;
+					continue;
+				}
+			}
+		}
+
+		if (i + 1 < n && text[i] === '$' && text[i + 1] === '$') {
+			const endIdx = text.indexOf('$$', i + 2);
+			if (endIdx !== -1) {
+				const inner = text.slice(i + 2, endIdx);
+				if (isLikelyInlineMath(inner)) {
+					addPlaceholder(inner);
+					i = endIdx + 2;
+					continue;
+				}
+			}
+		}
+
+		if (text[i] === '$') {
+			const prevChar = i > 0 ? text[i - 1] : '';
+			const nextChar = i + 1 < n ? text[i + 1] : '';
+			if (!isAlnumByte(prevChar) && prevChar !== '\\' && prevChar !== '$' && nextChar !== '' && nextChar !== ' ' && nextChar !== '	' && nextChar !== '$') {
+				let foundEnd = -1;
+				let j = i + 1;
+				while (j < n) {
+					if (text[j] === '\\') {
+						j += 2;
+						continue;
+					}
+					if (text[j] === '$') {
+						const beforeClose = text[j - 1];
+						const afterClose = j + 1 < n ? text[j + 1] : '';
+						if (beforeClose !== ' ' && beforeClose !== '	' && !isDigitByte(afterClose) && afterClose !== '$') {
+							foundEnd = j;
+						}
+						break;
+					}
+					j++;
+				}
+				if (foundEnd !== -1) {
+					const inner = text.slice(i + 1, foundEnd);
+					if (isLikelyInlineMath(inner)) {
+						addPlaceholder(inner);
+						i = foundEnd + 1;
+						continue;
+					}
+				}
+			}
+		}
+
+		out += text[i];
+		i++;
+	}
+
+	return { masked: out, mathExprs };
+}
+
+function expandMathPlaceholders(segment: string, mathExprs: string[]): RichTextPart[] {
+	if (!segment) return [];
+	if (mathExprs.length === 0 || !segment.includes('\x00MATH')) {
+		return [segment];
+	}
+	const res: RichTextPart[] = [];
+	let last = 0;
+	let m: RegExpExecArray | null;
+	const rx = new RegExp(mathPlaceholderFindRegex.source, 'g');
+	while ((m = rx.exec(segment)) !== null) {
+		if (m.index > last) {
+			res.push(segment.slice(last, m.index));
+		}
+		const idx = parseInt(m[1], 10);
+		if (idx >= 0 && idx < mathExprs.length) {
+			res.push({
+				type: 'mathematical_expression',
+				expression: mathExprs[idx],
+			});
+		}
+		last = rx.lastIndex;
+	}
+	if (last < segment.length) {
+		res.push(segment.slice(last));
+	}
+	return res;
+}
+
+function parseInlineWithMath(text: string, mathExprs: string[]): RichText {
 	if (!text) return '';
 
-	// 匹配链接、Telegram 消息直达链接、粗体、斜体、行内代码、高亮、指令
 	const tokenRegex = /(\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|https?:\/\/(?:t\.me\/c|tme\.cat)\/[^\s,，。！!？?)]+|\*\*([^*]+)\*\*|__([^_]+)__|`([^`]+)`|==([^=]+)==|\*([^*]+)\*|_([^_]+)_|(?:\/([a-zA-Z0-9_]{1,64})))/g;
 
 	const parts: RichTextPart[] = [];
@@ -242,7 +408,7 @@ export function parseRichInline(text: string): RichText {
 		const matchEnd = tokenRegex.lastIndex;
 
 		if (matchStart > lastIndex) {
-			parts.push(text.slice(lastIndex, matchStart));
+			parts.push(...expandMathPlaceholders(text.slice(lastIndex, matchStart), mathExprs));
 		}
 
 		const fullMatch = match[0];
@@ -251,66 +417,106 @@ export function parseRichInline(text: string): RichText {
 			const linkText = match[2];
 			parts.push({
 				type: 'url',
-				text: linkText.includes('*') || linkText.includes('_') || linkText.includes('`')
-					? parseRichInline(linkText)
+				text: linkText.includes('*') || linkText.includes('_') || linkText.includes('`') || linkText.includes('\x00MATH')
+					? parseInlineWithMath(linkText, mathExprs)
 					: linkText,
 				url: fixLink(match[3]),
 			});
 		} else if (fullMatch.startsWith('http://') || fullMatch.startsWith('https://')) {
-			// 纯链接文本转换为超链接
 			parts.push({
 				type: 'url',
 				text: '💬 原文',
 				url: fixLink(fullMatch),
 			});
 		} else if (match[4] || match[5]) {
-			// 粗体
 			const boldText = match[4] || match[5];
 			parts.push({
 				type: 'bold',
-				text: boldText.includes('[') || boldText.includes('`')
-					? parseRichInline(boldText)
+				text: boldText.includes('[') || boldText.includes('`') || boldText.includes('\x00MATH')
+					? parseInlineWithMath(boldText, mathExprs)
 					: boldText,
 			});
 		} else if (match[6]) {
-			// 行内代码
 			parts.push({
 				type: 'code',
 				text: match[6],
 			});
 		} else if (match[7]) {
-			// 重点标记
 			parts.push({
 				type: 'marked',
-				text: match[7],
+				text: parseInlineWithMath(match[7], mathExprs),
 			});
 		} else if (match[8] || match[9]) {
-			// 斜体
 			parts.push({
 				type: 'italic',
-				text: match[8] || match[9],
+				text: parseInlineWithMath(match[8] || match[9], mathExprs),
 			});
 		} else if (match[10]) {
-			// Bot Command
 			parts.push({
 				type: 'bot_command',
 				text: `/${match[10]}`,
 				bot_command: match[10],
 			});
 		} else {
-			parts.push(fullMatch);
+			parts.push(...expandMathPlaceholders(fullMatch, mathExprs));
 		}
 
 		lastIndex = matchEnd;
 	}
 
 	if (lastIndex < text.length) {
-		parts.push(text.slice(lastIndex));
+		parts.push(...expandMathPlaceholders(text.slice(lastIndex), mathExprs));
 	}
 
 	if (parts.length === 0) return '';
 	if (parts.length === 1) return parts[0];
 	return parts;
+}
+
+export function parseRichInline(text: string): RichText {
+	if (!text) return '';
+	const { masked, mathExprs } = extractInlineMathPlaceholders(text);
+	return parseInlineWithMath(masked, mathExprs);
+}
+
+function tryParseBlockMath(lines: string[], startIdx: number): { block: RichBlockMath; nextIdx: number } | null {
+	const tLine = lines[startIdx].trim();
+	if (tLine.startsWith('`') && tLine.endsWith('`') && tLine.length > 2) {
+		const innerCode = tLine.slice(1, -1).trim();
+		const expr = extractBacktickMath(innerCode);
+		if (expr && (innerCode.startsWith('$$') || innerCode.startsWith('\\['))) {
+			return { block: { type: 'mathematical_expression', expression: expr }, nextIdx: startIdx + 1 };
+		}
+	}
+
+	for (const [open, close] of [['$$', '$$'], ['\\[', '\\]']] as const) {
+		if (!tLine.startsWith(open)) continue;
+		if (tLine.endsWith(close) && tLine.length > open.length + close.length) {
+			const inner = tLine.slice(open.length, tLine.length - close.length).trim();
+			if (!inner.includes(close) && isLikelyInlineMath(inner)) {
+				return { block: { type: 'mathematical_expression', expression: inner }, nextIdx: startIdx + 1 };
+			}
+		}
+		if (tLine === open || !tLine.slice(open.length).includes(close)) {
+			const mathLines: string[] = [];
+			const firstRem = tLine.slice(open.length).trim();
+			if (firstRem) mathLines.push(firstRem);
+			for (let j = startIdx + 1; j < lines.length; j++) {
+				const cur = lines[j].trim();
+				if (cur.endsWith(close)) {
+					const lastRem = cur.slice(0, cur.length - close.length).trim();
+					if (lastRem) mathLines.push(lastRem);
+					const expr = mathLines.join('\n').trim();
+					if (expr) {
+						return { block: { type: 'mathematical_expression', expression: expr }, nextIdx: j + 1 };
+					}
+					break;
+				}
+				mathLines.push(lines[j]);
+			}
+		}
+	}
+	return null;
 }
 
 export function parseMarkdownSectionBlocks(content: string): RichBlock[] {
@@ -327,6 +533,14 @@ export function parseMarkdownSectionBlocks(content: string): RichBlock[] {
 
 		if (!line) {
 			i++;
+			continue;
+		}
+
+		// 0. 块级数学公式 ($$...$$ 或 \[...\])
+		const mathParsed = tryParseBlockMath(lines, i);
+		if (mathParsed) {
+			blocks.push(mathParsed.block);
+			i = mathParsed.nextIdx;
 			continue;
 		}
 
@@ -495,6 +709,7 @@ export function parseMarkdownSectionBlocks(content: string): RichBlock[] {
 		while (
 			i < lines.length &&
 			lines[i].trim() &&
+			!tryParseBlockMath(lines, i) &&
 			!lines[i].trim().match(/^#{1,6}\s+/) &&
 			!/^[-*_]{3,}$/.test(lines[i].trim()) &&
 			!lines[i].trim().startsWith('>') &&
@@ -785,6 +1000,9 @@ export function richTextToString(text: RichText): string {
 		return text.map(richTextToString).join('');
 	}
 	if (typeof text === 'object' && text !== null) {
+		if ('expression' in text && typeof (text as any).expression === 'string') {
+			return (text as any).expression;
+		}
 		if ('text' in text) {
 			return richTextToString((text as any).text);
 		}
@@ -814,7 +1032,9 @@ export function richTextToHtml(text: RichText): string {
 			case 'code':
 				return `<code>${escapeHtml(text.text)}</code>`;
 			case 'marked':
-				return `<b>[${escapeHtml(text.text)}]</b>`;
+				return `<b>[${richTextToHtml(text.text)}]</b>`;
+			case 'mathematical_expression':
+				return `<code>${escapeHtml(text.expression)}</code>`;
 			case 'url':
 			case 'link':
 				return `<a href="${escapeHtml(text.url)}">${typeof text.text === 'string' ? escapeHtml(text.text) : richTextToHtml(text.text)}</a>`;
@@ -841,6 +1061,9 @@ export function richBlocksToHtml(blocks: RichBlock[]): string {
 				break;
 			case 'paragraph':
 				parts.push(richTextToHtml(block.text));
+				break;
+			case 'mathematical_expression':
+				parts.push(`<pre>${escapeHtml(block.expression)}</pre>`);
 				break;
 			case 'divider':
 				parts.push('\n━━━━━━━━━━━━━━━━━━━━\n');
@@ -892,6 +1115,10 @@ export function richBlocksToPlainText(blocks: RichBlock[]): string {
 			}
 			case 'paragraph': {
 				lines.push(richTextToString(block.text));
+				break;
+			}
+			case 'mathematical_expression': {
+				lines.push(block.expression);
 				break;
 			}
 			case 'divider': {
@@ -1262,7 +1489,7 @@ export function buildAdminsRichBlocks(
 			envCells.push([
 				{ text: `${idx + 1}`, align: 'center', valign: 'middle' },
 				{ text: { type: 'code', text: id }, align: 'center', valign: 'middle' },
-				{ text: { type: 'marked', text: '超级管理员 (SuperAdmin)' }, align: 'center', valign: 'middle' },
+				{ text: { type: 'marked', text: '超级管理员' }, align: 'center', valign: 'middle' },
 			]);
 		});
 		blocks.push({
@@ -1358,12 +1585,14 @@ export function buildQueryRichBlocks(
 		let rawContent = (r.content || '').replace(/\s+/g, ' ').trim();
 		const strippedContent = rawContent.replace(/^回复\s*https?:\/\/\S+?(?::\s*|\s+|$)/, '').trim();
 		rawContent = strippedContent || (rawContent.startsWith('回复 ') ? '[回复消息]' : rawContent);
-		const preview = rawContent.length > 24 ? rawContent.slice(0, 24) + '...' : (rawContent || '-');
+		const preview = rawContent.length > 15 ? rawContent.slice(0, 15) : (rawContent || '-');
 		const link = r.messageId ? getMessageLink(r) : '';
+		const rawName = (r.userName || '匿名').trim();
+		const userName = rawName.length > 8 ? rawName.slice(0, 8) : rawName;
 
 		tableRows.push([
 			{ text: `${globalIdx}`, align: 'center', valign: 'middle' },
-			{ text: { type: 'bold', text: r.userName || '匿名' }, align: 'left', valign: 'middle' },
+			{ text: { type: 'bold', text: userName }, align: 'left', valign: 'middle' },
 			{
 				text: link
 					? [{ type: 'url', text: preview, url: link }]

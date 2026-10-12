@@ -577,4 +577,20 @@ describe('richFormat tests', () => {
 		const listBlock = blocks.find((b) => b.type === 'list');
 		expect(listBlock).toBeDefined();
 	});
+
+	it('parses Telegram 10.1 mathematical_expression inline and block nodes without breaking currency', async () => {
+		const { aggregateMarkdownToRichBlocks, parseRichInline } = await import('../src/richFormat');
+
+		const inlineParsed = parseRichInline('价格是 $100，公式是 $E = mc^2$ 以及 \\(\\alpha + \\beta\\)');
+		expect(Array.isArray(inlineParsed)).toBe(true);
+		const parts = inlineParsed as any[];
+		expect(parts.some((p) => typeof p === 'string' && p.includes('$100'))).toBe(true);
+		expect(parts.some((p) => p?.type === 'mathematical_expression' && p.expression === 'E = mc^2')).toBe(true);
+		expect(parts.some((p) => p?.type === 'mathematical_expression' && p.expression === '\\alpha + \\beta')).toBe(true);
+
+		const blockParsed = aggregateMarkdownToRichBlocks('下面是块级公式：\n\n$$\n\\int_0^\\infty e^{-x^2} dx = \\frac{\\sqrt{\\pi}}{2}\n$$');
+		const mathBlock = blockParsed.find((b) => b.type === 'mathematical_expression') as any;
+		expect(mathBlock).toBeDefined();
+		expect(mathBlock.expression).toContain('\\int_0^\\infty');
+	});
 });

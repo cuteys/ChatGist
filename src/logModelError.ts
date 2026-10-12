@@ -78,7 +78,31 @@ export interface AdminAlertDetails {
 	userId?: string;
 	userName?: string;
 	messageId?: number;
+	payload?: string;
+	diagnostics?: string;
 	error: unknown;
+}
+
+export function calcRequestDiagnostics(results: any[]): string {
+	let imageCount = 0;
+	let textChars = 0;
+	let estBytes = 0;
+	for (const r of results || []) {
+		const uname = String(r?.userName || '');
+		const content = String(r?.content || '');
+		textChars += uname.length;
+		if (content.includes('data:image/')) {
+			imageCount++;
+			const idx = content.indexOf('data:image/');
+			textChars += content.slice(0, idx).trim().length;
+		} else {
+			textChars += content.length;
+		}
+		estBytes += uname.length + content.length + 64;
+	}
+	const kb = estBytes / 1024;
+	const sizeStr = kb >= 1024 ? `${(kb / 1024).toFixed(2)} MB` : `${kb.toFixed(1)} KB`;
+	return `消息 ${(results || []).length} 条 | 图片 ${imageCount} 张 | 文本 ${textChars} 字 | 约 ${sizeStr}`;
 }
 
 function formatBeijingTime(timestamp: number): string {
@@ -117,6 +141,8 @@ export async function notifySuperAdminsError(
 		(details.groupTitle ? `• 发生群组: ${details.groupTitle} (ID: ${details.groupId || '未知'})\n` : (details.groupId ? `• 发生群组: ID ${details.groupId}\n` : '')) +
 		(details.userName ? `• 触发用户: ${details.userName} (ID: ${details.userId || '未知'})\n` : (details.userId ? `• 触发用户: ID ${details.userId}\n` : '')) +
 		(directLink ? `• 目标对话: ${directLink}\n` : '') +
+		(details.payload ? `• 请求内容: ${details.payload.slice(0, 300)}\n` : '') +
+		(details.diagnostics ? `• 请求负载: ${details.diagnostics}\n` : '') +
 		`• 发生时间: ${timeStr} (北京时间)\n` +
 		`• 异常类型: ${errName}\n\n` +
 		`📋 错误信息与堆栈:\n` +

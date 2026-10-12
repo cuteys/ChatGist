@@ -1417,7 +1417,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			expect(historyTurn.role).toBe('user');
 			const oldImageTurn = historyTurn.content.find((item: any) => item.text && item.text.includes('OLDIMAGE'));
 			expect(oldImageTurn).toBeUndefined();
-			const maskedTurn = historyTurn.content.find((item: any) => item.text === '[历史图片]');
+			const maskedTurn = historyTurn.content.find((item: any) => item.text && item.text.includes('[历史图片]'));
 			expect(maskedTurn).toBeDefined();
 
 			// Question turn (messages[2]): must be an array containing the target image
@@ -2046,7 +2046,7 @@ describe('Worker fetch whitelist gatekeeping', () => {
 		}
 	});
 
-	it('should use anchor context (300 before + target + 200 after) when user replies to an older message', async () => {
+	it('should use anchor context (200 before + target + 100 after) when user replies to an older message', async () => {
 		const groupId = '-100888888';
 		await addGroupToWhitelist(testEnv, groupId, 'Authorized Group', '10001');
 
@@ -2134,20 +2134,21 @@ describe('Worker fetch whitelist gatekeeping', () => {
 			const historyTurn = capturedAiMessages[1];
 			expect(historyTurn.role).toBe('user');
 			const textItems = historyTurn.content.filter((c: any) => c.type === 'text');
+			const combinedText = textItems.map((c: any) => c.text).join('\n');
 
 			// Target message itself must be present
-			expect(textItems.some((item: any) => item.text === '被引用的核心讨论')).toBe(true);
+			expect(combinedText).toContain('被引用的核心讨论');
 
-			// Out-of-window messages: oldest before msg 1-50 should NOT be present (only 51-350 = 300 items)
-			expect(textItems.some((item: any) => item.text === '前置消息 1')).toBe(false);
-			expect(textItems.some((item: any) => item.text === '前置消息 50')).toBe(false);
-			expect(textItems.some((item: any) => item.text === '前置消息 51')).toBe(true);
-			expect(textItems.some((item: any) => item.text === '前置消息 350')).toBe(true);
+			// Out-of-window messages: oldest before msg 1-150 should NOT be present (only 151-350 = 200 items)
+			expect(combinedText).not.toContain('前置消息 1\n');
+			expect(combinedText).not.toContain('前置消息 150\n');
+			expect(combinedText).toContain('前置消息 151\n');
+			expect(combinedText).toContain('前置消息 350\n');
 
-			// Out-of-window messages: newest after msg 201-250 should NOT be present (only 1-200 = 200 items)
-			expect(textItems.some((item: any) => item.text === '后置消息 200')).toBe(true);
-			expect(textItems.some((item: any) => item.text === '后置消息 201')).toBe(false);
-			expect(textItems.some((item: any) => item.text === '后置消息 250')).toBe(false);
+			// Out-of-window messages: newest after msg 101-250 should NOT be present (only 1-100 = 100 items)
+			expect(combinedText).toContain('后置消息 100\n');
+			expect(combinedText).not.toContain('后置消息 101\n');
+			expect(combinedText).not.toContain('后置消息 250\n');
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
@@ -2584,7 +2585,8 @@ describe('Worker fetch whitelist gatekeeping', () => {
 
 			const saved = await testEnv.DB.prepare('SELECT * FROM Messages WHERE messageId = 4001').first<any>();
 			expect(saved).toBeDefined();
-			expect(saved.content).toMatch(/^data:image\/jpeg;base64,/);
+			expect(saved.content).toContain('帮我看看架构');
+			expect(saved.content).toContain('data:image/jpeg;base64,');
 		} finally {
 			globalThis.fetch = originalFetch;
 		}

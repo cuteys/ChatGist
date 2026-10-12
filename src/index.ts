@@ -3,7 +3,7 @@ import OpenAI from "openai";
 import { Buffer } from 'node:buffer';
 import { detectImageMimeType } from './image';
 import { extractAllOGInfo } from "./og";
-import { logModelError, notifySuperAdminsError } from './logModelError';
+import { logModelError, notifySuperAdminsError, calcRequestDiagnostics } from './logModelError';
 import {
 	deleteTelegramMessage,
 	getMessageLink,
@@ -128,19 +128,50 @@ export async function isDuplicateUpdate(env: Env, updateId?: number): Promise<bo
 	return false;
 }
 
-function dispatchContent(content: string): { type: "text", text: string } | { type: "image_url", image_url: { url: string } } {
-	if (content.startsWith("data:image/")) {
-		return {
+type ChatMessagePart = { type: "text"; text: string } | { type: "image_url"; image_url: { url: string } };
+
+function dispatchContent(content: string): ChatMessagePart[] {
+	const imgIdx = content.indexOf("data:image/");
+	if (imgIdx !== -1) {
+		const parts: ChatMessagePart[] = [];
+		const textPart = content.slice(0, imgIdx).trim();
+		if (textPart) {
+			parts.push({ type: "text", text: textPart });
+		}
+		const imgPart = content.slice(imgIdx).trim();
+		parts.push({
 			type: "image_url",
-			image_url: {
-				url: content,
-			},
-		};
+			image_url: { url: imgPart },
+		});
+		return parts;
 	}
-	return {
-		type: "text",
-		text: content,
+	return [
+		{
+			type: "text",
+			text: content,
+		},
+	];
+}
+
+export function compactContent(parts: ChatMessagePart[]): ChatMessagePart[] {
+	const compacted: ChatMessagePart[] = [];
+	let textBuffer: string[] = [];
+	const flushText = () => {
+		if (textBuffer.length > 0) {
+			compacted.push({ type: "text", text: textBuffer.join("\n") });
+			textBuffer = [];
+		}
 	};
+	for (const part of parts) {
+		if (part.type === "text") {
+			textBuffer.push(part.text);
+		} else {
+			flushText();
+			compacted.push(part);
+		}
+	}
+	flushText();
+	return compacted;
 }
 
 export const GROUP_COMMANDS = [
@@ -283,6 +314,29 @@ function getGenModel(env: Env) {
 		...(baseURL ? { baseURL } : {}),
 		timeout: 52000,
 		maxRetries: 0,
+		fetch: async (input: any, init?: any) => {
+			const res = await globalThis.fetch(input, init);
+			const urlStr = typeof input === 'string' ? input : (input?.url || '');
+			if (!res.ok || !urlStr.includes('/chat/completions')) return res;
+			const ct = res.headers?.get?.('content-type') || '';
+			if (!ct.includes('text/event-stream')) {
+				try {
+					const rawText = await res.clone().text();
+					const trimmed = rawText.trim();
+					if (trimmed.startsWith('{') && !trimmed.startsWith('data:')) {
+						const ssePayload = `data: ${trimmed}\n\ndata: [DONE]\n\n`;
+						const headers = new Headers(res.headers);
+						headers.set('content-type', 'text/event-stream; charset=utf-8');
+						return new Response(ssePayload, {
+							status: res.status,
+							statusText: res.statusText,
+							headers,
+						});
+					}
+				} catch (_) {}
+			}
+			return res;
+		},
 	});
 }
 
@@ -347,7 +401,7 @@ const SYSTEM_PROMPTS = {
 5. 严禁使用 Markdown 引用语法（> ）或代码块包裹总结，直接以普通段落形式输出；
 6. 输出纯 Markdown 文本，无需其他废话。`,
 
-	answerQuestion: `你是一个群聊智能问答助手。你的任务是基于提供的群聊记录精准回答用户的问题。
+	answerQuestion: `你是一个客观、敏锐、一针见血的群聊智能问答助手。你的任务是基于提供的群聊记录精准回答用户的问题。
 
 群聊记录格式如下：
 ====================
@@ -356,17 +410,21 @@ const SYSTEM_PROMPTS = {
 相应链接
 ====================
 
-【回答规范】
-1. 结合群聊实际发言，给出清晰、准确、条理分明的回答，并适当使用友好的 Emoji（如 💡 📌 🔍 🛠️ ✅ 🧪 💥 等）；
-2. 凡是引用群友发言或作为回答依据的内容，将对应原消息的“相应链接”直接自然地嵌入到关键词或短语中（例如：群友 [Alice 提到](相应链接)...，或者参考 [该方案配置](相应链接)），无需单独在句末追加“[💬 原文]”；
-3. 链接必须 100% 来源于输入中的真实“相应链接”，严禁杜撰；
-4. 若群聊中未提及相关信息，请明确说明未找到相关记录；
-5. 输入中包含【当前提问上下文】（所在群组、提问者身份与提问时间）。若用户在提问中提及“我”、“我们群”、“本群”等主语，请结合提问者与群组信息在群聊记录中进行精准匹配与解答；
-6. 排版与原生富文本规范：
-   - 简短问答：直接以清晰精炼的段落回答，无需强行使用折叠组件；
-   - 分项/报告类问答（如“毒舌评价”、“总结/盘点”、“人物画像”、“方案对比”等包含多个维度或要点的问题）：
-     必须以 1-2 句生动精炼的概述开头，核心分析各要点必须使用 <details><summary>生动的主题/外号/维度标题</summary>详细论述与要点</details> 原生抽屉组件进行折叠排版；
-   - 独立总结结语：若包含一句话总结、评价金句或结语，必须独立置于所有 </details> 闭合标签之后（严禁置于任何 <details> 内部），且严禁使用引用语法（> ）或代码块包裹，直接以普通段落形式输出。`
+【核心准则与回答规范】
+1. 客观犀利、去谄媚：
+   - 保持客观中立，实事求是，直接切入核心问题，严禁任何形式的阿谀奉承、讨好迎合或端水式和稀泥；
+   - 若提问者本人在群内的发言存在事实错误、逻辑漏洞、双标或情绪化偏见，请直接基于群聊记录坦率指出，绝不顺从提问者的主观倾向；
+   - 严禁输出“这个问题很有深度”、“您观察得很仔细”、“大家说得都很有道理”等机械套话；
+2. 链接自然内嵌：
+   - 凡是引用群友发言或作为回答依据的内容，必须将对应原消息的“相应链接”直接自然地嵌入到关键词、动作或短语中（例如：群友 [Alice 指出](相应链接)...，或者参考 [该配置方案](相应链接)），严禁在句末或括号中单独追加“[💬 原文]”；
+   - 链接必须 100% 来源于输入中的真实“相应链接”，严禁杜撰；若群聊中未提及相关信息，请直接说明未找到相关记录；
+3. 上下文身份感知：
+   - 输入中包含【当前提问上下文】（所在群组、提问者身份与提问时间）。当提问中出现“我”、“我们群”、“刚才那个人”等指代时，结合上下文精准定位对应人物与事件；
+4. 原生富文本与折叠抽屉排版（重要）：
+   - 禁止输出顶部一级大标题（# 标题），直接以 1-2 句犀利精炼的核心结论/定性回答开篇；
+   - 只要回答涉及多条依据、多个维度、多方观点对比、时间线梳理、人物评价或具体方案步骤，必须使用 <details><summary>🎯 维度/观点/阶段标题（简明有洞察力）</summary>详细论据与展开分析</details> 原生抽屉组件进行分块折叠排版，保持主界面清爽；
+   - 抽屉内部可结合列表、加粗或 Markdown 表格清晰呈现细节；仅当问题极其简单（如单一数值查询、单句事实确认且总字数不足 80 字）时，才可省略抽屉直接作答；
+   - 独立总结结语：在所有 </details> 闭合标签之后，必须独立输出一段 1-2 句的一针见血总结点评（严禁包裹在任何 <details> 内部，严禁使用 > 引用块或代码块包裹）。`
 };
 
 function getSystemPrompt(env: Env, type: 'summary' | 'ask'): string {
@@ -420,13 +478,20 @@ async function withTemporaryStatus<T>(
 		console.error("Failed to send temporary status message:", e);
 	}
 
+	let typingTimer: ReturnType<typeof setInterval> | undefined;
 	if (botToken && chatId) {
 		await sendChatAction(botToken, chatId, 'typing');
+		typingTimer = setInterval(() => {
+			sendChatAction(botToken, chatId, 'typing').catch(() => {});
+		}, 4000);
 	}
 
 	try {
 		return await task();
 	} finally {
+		if (typingTimer) {
+			clearInterval(typingTimer);
+		}
 		if (statusMessageId && botToken && chatId) {
 			await deleteTelegramMessage(botToken, chatId, statusMessageId);
 		}
@@ -490,7 +555,7 @@ export function formatChatHistoryForAi(
 	quotedMessageId?: number
 ) {
 	let lastDate: string | null = null;
-	return results.flatMap((r: any) => {
+	const parts = results.flatMap((r: any) => {
 		const rawTimeStr = r.messageTime || (r.timeStamp ? formatBeijingTime(r.timeStamp) : "");
 		let displayTime = rawTimeStr;
 		if (rawTimeStr) {
@@ -507,19 +572,21 @@ export function formatChatHistoryForAi(
 			}
 		}
 		const sender = displayTime ? `${r.userName} [${displayTime}]:` : `${r.userName}:`;
-		let content = r.content;
-		if (typeof content === "string" && content.startsWith("data:image/")) {
-			if (quotedMessageId) {
-				content = Number(r.messageId) === Number(quotedMessageId) ? "[目标引用图片]" : "[历史图片]";
-			}
+		let content = String(r.content || "");
+		if (content.includes("data:image/") && quotedMessageId) {
+			const imgIdx = content.indexOf("data:image/");
+			const textPrefix = content.slice(0, imgIdx).trim();
+			const placeholder = Number(r.messageId) === Number(quotedMessageId) ? "[目标引用图片]" : "[历史图片]";
+			content = textPrefix ? `${textPrefix}\n${placeholder}` : placeholder;
 		}
 		return [
-			dispatchContent(`====================`),
-			dispatchContent(sender),
-			dispatchContent(content),
-			dispatchContent(getMessageLink(r)),
+			...dispatchContent(`====================`),
+			...dispatchContent(sender),
+			...dispatchContent(content),
+			...dispatchContent(getMessageLink(r)),
 		];
 	});
+	return compactContent(parts);
 }
 
 export async function callChatModelWithReasoningRetry(
@@ -548,12 +615,50 @@ export async function callChatModelWithReasoningRetry(
 		const attempt = i + 1;
 		const effort = ladder[i];
 		try {
-			const result: any = await getGenModel(env).chat.completions.create({
+			const responseStream: any = await getGenModel(env).chat.completions.create({
 				model: params.model,
 				messages,
+				stream: true,
 				...getCompletionOptions(params.model, effort, false),
-			});
+			}) as any;
 
+			if (responseStream && typeof responseStream[Symbol.asyncIterator] === 'function') {
+				let content = '';
+				let finishReason = '';
+				let chunkCount = 0;
+				let lastChunk: any = null;
+				for await (const chunk of responseStream) {
+					chunkCount++;
+					lastChunk = chunk;
+					const choice = chunk?.choices?.[0];
+					if (choice?.finish_reason) {
+						finishReason = choice.finish_reason;
+					}
+					const delta = choice?.delta?.content ?? choice?.message?.content;
+					if (typeof delta === 'string') {
+						content += delta;
+					}
+				}
+
+				if (finishReason === 'content_filter' || finishReason === 'safety') {
+					const err: any = new Error('CONTENT_FILTER_TRIGGERED');
+					err.isSafetyBlock = true;
+					err.rawResult = lastChunk;
+					throw err;
+				}
+
+				if (!content.trim()) {
+					const isSafety = isSafetyBlockError(lastChunk) || chunkCount === 0;
+					const err: any = new Error(isSafety ? 'CONTENT_FILTER_TRIGGERED' : 'EMPTY_CHOICES_RETURNED');
+					err.isSafetyBlock = isSafety;
+					err.rawResult = lastChunk;
+					throw err;
+				}
+
+				return { content, rawResult: lastChunk };
+			}
+
+			const result = responseStream;
 			if (!result || !Array.isArray(result.choices) || result.choices.length === 0) {
 				const isSafety = isSafetyBlockError(result);
 				const err: any = new Error(isSafety ? 'CONTENT_FILTER_TRIGGERED' : 'EMPTY_CHOICES_RETURNED');
@@ -819,7 +924,7 @@ function getRoleHelpText(env: Env, userId: string, superAdmin: boolean, admin: b
 			`• /ask &lt;问题&gt; - 基于群聊记录提问并回答\n` +
 			`• /query &lt;关键词&gt; - 检索群聊历史消息\n\n` +
 			`💬 <b>私聊指令：</b>\n` +
-			`• /status - 检查运行状态与群组存储统计\n` +
+			`• /status - 检查机器人运行状态\n` +
 			`• /help - 查看本使用帮助\n\n` +
 			`ℹ️ 您的 Telegram 用户 ID 为：<code>${userId}</code>`;
 	}
@@ -1067,38 +1172,41 @@ export default {
 		for (let i = 0; i < groups.length; i += BATCH_SIZE) {
 			const batch = groups.slice(i, i + BATCH_SIZE);
 			await Promise.all(
-				batch.map(async (group) => {
-					try {
-						const { results } = await env.DB.prepare(
-							'SELECT * FROM Messages WHERE groupId=? AND timeStamp >= ? ORDER BY timeStamp ASC'
-						)
-							.bind(group.groupId, Date.now() - 24 * 60 * 60 * 1000)
-							.all();
+			batch.map(async (group) => {
+				let groupResults: any[] = [];
+				try {
+					const { results } = await env.DB.prepare(
+						'SELECT * FROM Messages WHERE groupId=? AND timeStamp >= ? ORDER BY timeStamp ASC'
+					)
+						.bind(group.groupId, Date.now() - 24 * 60 * 60 * 1000)
+						.all();
 
-						if (!results || results.length === 0) return;
+					if (!results || results.length === 0) return;
+					groupResults = results;
 
-						const { blocks, raw } = await generateSummaryRichMessage(
-							env,
-							results,
-							model,
-							'每日定时总结：过去 24 小时活跃群聊概览'
-						);
+					const { blocks, raw } = await generateSummaryRichMessage(
+						env,
+						results,
+						model,
+						'每日定时总结：过去 24 小时活跃群聊概览'
+					);
 
-						await sendTelegramRichMessage(getTelegramToken(env), group.groupId, blocks, { rawMarkdown: raw });
-					} catch (err) {
-						console.error(`Error processing scheduled summary for group ${group.groupId}:`, err);
-						await notifySuperAdminsError(
-							getTelegramToken(env),
-							getSuperAdminIds(env),
-							{
-								scene: '每日定时总结 (00:00 Cron)',
-								groupId: group.groupId,
-								error: err,
-							},
-							[getApiKey(env), getTelegramToken(env)]
-						);
-					}
-				})
+					await sendTelegramRichMessage(getTelegramToken(env), group.groupId, blocks, { rawMarkdown: raw });
+				} catch (err) {
+					console.error(`Error processing scheduled summary for group ${group.groupId}:`, err);
+					await notifySuperAdminsError(
+						getTelegramToken(env),
+						getSuperAdminIds(env),
+						{
+							scene: '每日定时总结 (00:00 Cron)',
+							groupId: group.groupId,
+							diagnostics: calcRequestDiagnostics(groupResults),
+							error: err,
+						},
+						[getApiKey(env), getTelegramToken(env)]
+					);
+				}
+			})
 			);
 		}
 		console.debug("Scheduled cron completed.");
@@ -1142,6 +1250,10 @@ export default {
 			}
 
 			if (!body?.message && body?.edited_message) {
+				const editText = (body.edited_message.text || body.edited_message.caption || "").trim();
+				if (editText.startsWith("/")) {
+					return new Response("ok");
+				}
 				body.message = body.edited_message;
 			}
 
@@ -1301,7 +1413,7 @@ export default {
 					statusText += '👤 身份：普通用户\n';
 				}
 
-				if (admin) {
+				if (superAdmin) {
 					try {
 						const storageStats = await getDatabaseStorageStats(env);
 						const percent = ((storageStats.totalBytes / storageStats.limitBytes) * 100).toFixed(1);
@@ -1328,6 +1440,8 @@ export default {
 					} catch (e: any) {
 						console.error("Failed to get storage stats in /status:", e);
 					}
+				} else if (admin) {
+					statusText += `\n✨ 特权：享有无限次群聊总结、提问与检索特权\n`;
 				}
 
 				if (superAdmin) {
@@ -1519,7 +1633,7 @@ export default {
 							SELECT * FROM Messages
 							WHERE groupId = ? AND timeStamp < ?
 							ORDER BY timeStamp DESC
-							LIMIT 300
+							LIMIT 200
 						`).bind(groupId, targetTime).all<any>();
 
 						const targetPromise = env.DB.prepare(`
@@ -1530,7 +1644,7 @@ export default {
 							SELECT * FROM Messages
 							WHERE groupId = ? AND timeStamp > ?
 							ORDER BY timeStamp ASC
-							LIMIT 200
+							LIMIT 100
 						`).bind(groupId, targetTime).all<any>();
 
 						const [beforeRes, targetRes, afterRes] = await Promise.all([beforePromise, targetPromise, afterPromise]);
@@ -1554,7 +1668,7 @@ export default {
 							SELECT * FROM Messages
 							WHERE groupId=?
 							ORDER BY timeStamp DESC
-							LIMIT 1000
+							LIMIT 300
 						)
 						SELECT * FROM latest_pool
 						ORDER BY timeStamp ASC
@@ -1588,8 +1702,13 @@ export default {
 							if (dbMsg.messageTime) repliedTime = dbMsg.messageTime;
 							else if (dbMsg.timeStamp) repliedTime = formatBeijingTime(dbMsg.timeStamp);
 
-							if (typeof dbMsg.content === "string" && dbMsg.content.startsWith("data:image/")) {
-								quotedImageContent = dbMsg.content;
+							if (typeof dbMsg.content === "string" && dbMsg.content.includes("data:image/")) {
+								const imgIdx = dbMsg.content.indexOf("data:image/");
+								const prefix = dbMsg.content.slice(0, imgIdx).trim();
+								quotedImageContent = dbMsg.content.slice(imgIdx).trim();
+								if (!repliedContent && prefix) {
+									repliedContent = prefix;
+								}
 							} else if (!repliedContent && dbMsg.content) {
 								repliedContent = dbMsg.content;
 							}
@@ -1689,6 +1808,8 @@ export default {
 										userId,
 										userName: getUserName(msg),
 										messageId: msg.message_id,
+										payload: question,
+										diagnostics: calcRequestDiagnostics(results),
 										error: e,
 									},
 									[getApiKey(env), botToken]
@@ -1871,6 +1992,8 @@ export default {
 										userId,
 										userName: getUserName(msg),
 										messageId: msg.message_id,
+										payload: quoteNotice,
+										diagnostics: calcRequestDiagnostics(results),
 										error: e,
 									},
 									[getApiKey(env), botToken]
@@ -1948,7 +2071,10 @@ export default {
 							return new Response('ok');
 						}
 
-						const content = `data:${mimeType};base64,` + Buffer.from(file).toString("base64");
+						const base64Data = `data:${mimeType};base64,` + Buffer.from(file).toString("base64");
+						const caption = (msg.caption || "").trim();
+						const rawPhotoContent = caption ? `${caption}\n${base64Data}` : base64Data;
+						const content = attachMessageContext(rawPhotoContent, msg, groupId);
 						const timeStamp = msg.date ? msg.date * 1000 : Date.now();
 						await saveMessage(env, { groupId, messageId, userName, content, groupName, timeStamp });
 						return new Response('ok');
