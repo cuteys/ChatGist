@@ -76,14 +76,66 @@ func (d ChatDiagnostics) Format() string {
 	return fmt.Sprintf("消息 %d 条 | 图片 %d 张 | 文本 %d 字 | 约 %.1f KB", d.MessageCount, d.ImageCount, d.TextCharCount, kb)
 }
 
+var supportedImagePrefixes = []string{
+	"data:image/jpeg;base64,",
+	"data:image/png;base64,",
+	"data:image/webp;base64,",
+}
+
+func isValidStandardBase64(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// extractEmbeddedImage 仅提取合法位图 Base64 并按空白字符截断，避免将网页 SVG 或尾部文本误作图片发送导致上游解码 400
+func extractEmbeddedImage(content string) (textBefore, imgDataURL, textAfter string, ok bool) {
+	imgIdx := -1
+	matchedPrefix := ""
+	for _, prefix := range supportedImagePrefixes {
+		if idx := strings.Index(content, prefix); idx != -1 && (imgIdx == -1 || idx < imgIdx) {
+			imgIdx = idx
+			matchedPrefix = prefix
+		}
+	}
+	if imgIdx == -1 {
+		return content, "", "", false
+	}
+
+	rest := content[imgIdx:]
+	endIdx := strings.IndexAny(rest, " 	\r\n")
+	var candidate string
+	var after string
+	if endIdx == -1 {
+		candidate = rest
+	} else {
+		candidate = rest[:endIdx]
+		after = strings.TrimSpace(rest[endIdx:])
+	}
+
+	b64Payload := candidate[len(matchedPrefix):]
+	if !isValidStandardBase64(b64Payload) {
+		return content, "", "", false
+	}
+
+	return strings.TrimSpace(content[:imgIdx]), candidate, after, true
+}
+
 func CalcDiagnostics(messages []*storage.Message) ChatDiagnostics {
 	diag := ChatDiagnostics{MessageCount: len(messages)}
 	for _, m := range messages {
 		diag.TextCharCount += len([]rune(m.UserName))
-		if imgIdx := strings.Index(m.Content, "data:image/"); imgIdx != -1 {
+		if before, _, after, ok := extractEmbeddedImage(m.Content); ok {
 			diag.ImageCount++
-			textPart := strings.TrimSpace(m.Content[:imgIdx])
-			diag.TextCharCount += len([]rune(textPart))
+			diag.TextCharCount += len([]rune(before)) + len([]rune(after))
 		} else {
 			diag.TextCharCount += len([]rune(m.Content))
 		}
@@ -130,17 +182,15 @@ func (c *Client) BuildChatHistoryParts(messages []*storage.Message) []openai.Cha
 			Text: "====================\n" + sender,
 		})
 
-		if imgIdx := strings.Index(m.Content, "data:image/"); imgIdx != -1 {
+		if textBefore, imgPart, textAfter, ok := extractEmbeddedImage(m.Content); ok {
 			// 分离文字说明与 Base64 图片，防止带配文或回复的消息将 Base64 作为纯文本泄露至上下文
-			textPart := strings.TrimSpace(m.Content[:imgIdx])
-			if textPart != "" {
+			if textBefore != "" {
 				parts = append(parts, openai.ChatMessagePart{
 					Type: openai.ChatMessagePartTypeText,
-					Text: textPart,
+					Text: textBefore,
 				})
 			}
 
-			imgPart := strings.TrimSpace(m.Content[imgIdx:])
 			parts = append(parts, openai.ChatMessagePart{
 				Type: openai.ChatMessagePartTypeImageURL,
 				ImageURL: &openai.ChatMessageImageURL{
@@ -148,6 +198,13 @@ func (c *Client) BuildChatHistoryParts(messages []*storage.Message) []openai.Cha
 					Detail: openai.ImageURLDetailAuto,
 				},
 			})
+
+			if textAfter != "" {
+				parts = append(parts, openai.ChatMessagePart{
+					Type: openai.ChatMessagePartTypeText,
+					Text: textAfter,
+				})
+			}
 		} else {
 			parts = append(parts, openai.ChatMessagePart{
 				Type: openai.ChatMessagePartTypeText,

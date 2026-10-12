@@ -76,30 +76,46 @@ func ExtractOGInfo(targetURL string) string {
 	}
 
 	ogData := make(map[string]string)
-	var title string
+	var pageTitle string
 
 	var traverse func(*html.Node)
 	traverse = func(n *html.Node) {
 		if n.Type == html.ElementNode {
-			if n.Data == "title" && n.FirstChild != nil && title == "" {
-				title = strings.TrimSpace(n.FirstChild.Data)
+			if n.Data == "title" && n.FirstChild != nil && pageTitle == "" {
+				pageTitle = strings.TrimSpace(n.FirstChild.Data)
 			}
 			if n.Data == "meta" {
 				var prop, name, content string
 				for _, attr := range n.Attr {
 					switch strings.ToLower(attr.Key) {
 					case "property":
-						prop = attr.Val
+						prop = strings.ToLower(strings.TrimSpace(attr.Val))
 					case "name":
-						name = attr.Val
+						name = strings.ToLower(strings.TrimSpace(attr.Val))
 					case "content":
-						content = attr.Val
+						content = strings.TrimSpace(attr.Val)
 					}
 				}
-				if strings.HasPrefix(prop, "og:") && content != "" {
-					ogData[strings.TrimPrefix(prop, "og:")] = content
-				} else if name != "" && content != "" {
-					ogData[name] = content
+				// 忽略空值与内联 data: URI，防止如 data:image/svg+xml 混入正文触发多模态解析失败
+				if content != "" && !strings.HasPrefix(strings.ToLower(content), "data:") {
+					switch prop {
+					case "og:title", "og:description", "og:site_name", "og:type":
+						ogData[strings.TrimPrefix(prop, "og:")] = content
+					}
+					switch name {
+					case "description", "twitter:description":
+						if ogData["description"] == "" {
+							ogData["description"] = content
+						}
+					case "twitter:title":
+						if ogData["title"] == "" {
+							ogData["title"] = content
+						}
+					case "application-name":
+						if ogData["site_name"] == "" {
+							ogData["site_name"] = content
+						}
+					}
 				}
 			}
 		}
@@ -109,17 +125,19 @@ func ExtractOGInfo(targetURL string) string {
 	}
 	traverse(doc)
 
-	if len(ogData) == 0 && title == "" {
+	if pageTitle != "" && ogData["title"] == "" {
+		ogData["title"] = pageTitle
+	}
+	if len(ogData) == 0 {
 		return targetURL
 	}
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("%s 的相关信息为:\n", targetURL))
-	if title != "" && ogData["title"] == "" {
-		sb.WriteString(fmt.Sprintf("title: %s\n", title))
-	}
-	for k, v := range ogData {
-		sb.WriteString(fmt.Sprintf("%s: %s\n", k, v))
+	for _, k := range []string{"title", "site_name", "type", "description"} {
+		if v := ogData[k]; v != "" {
+			sb.WriteString(fmt.Sprintf("%s: %s\n", k, v))
+		}
 	}
 	return strings.TrimSpace(sb.String())
 }

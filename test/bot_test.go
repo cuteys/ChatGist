@@ -226,17 +226,20 @@ func TestFormatAndParsing(t *testing.T) {
 		t.Errorf("Expected 2 rows of pagination keyboard, got %v", kb)
 	}
 
-	// 相邻纯文本合并与负载诊断测试
+	// 相邻纯文本合并与负载诊断测试（含忽略网页 SVG data:image 与截断图片尾部文本）
 	aiClient := ai.New(&config.Config{})
 	sampleMsgs := []*storage.Message{
 		{GroupID: "-100999", MessageID: 1, UserName: "Alice", Content: "First text", TimeStamp: 1700000000000},
-		{GroupID: "-100999", MessageID: 2, UserName: "Bob", Content: "Second text", TimeStamp: 1700000005000},
-		{GroupID: "-100999", MessageID: 3, UserName: "Carol", Content: "Photo caption\ndata:image/jpeg;base64,AAAA", TimeStamp: 1700000010000},
+		{GroupID: "-100999", MessageID: 2, UserName: "Bob", Content: "image: data:image/svg+xml;base64,PHN2Zy%2B\ntwitter:card: summary", TimeStamp: 1700000005000},
+		{GroupID: "-100999", MessageID: 3, UserName: "Carol", Content: "Photo caption\ndata:image/jpeg;base64,AAAA\ntrailing note", TimeStamp: 1700000010000},
 	}
 	parts := aiClient.BuildChatHistoryParts(sampleMsgs)
-	// 前两条纯文本 + 第三条图片前的文字说明应合并为 1 个 text 节点，随后 1 个 image_url 节点，最后 1 个链接 text 节点，共 3 个节点
+	// 前两条纯文本（含 SVG 文本）+ 第三条图片前的文字说明应合并为 1 个 text 节点，随后 1 个 image_url 节点，最后尾部文本与链接合并为 1 个 text 节点，共 3 个节点
 	if len(parts) != 3 {
 		t.Errorf("Expected 3 compacted parts (text, image_url, text), got %d", len(parts))
+	}
+	if parts[1].ImageURL == nil || parts[1].ImageURL.URL != "data:image/jpeg;base64,AAAA" {
+		t.Errorf("Expected clean image URL without trailing text, got %+v", parts[1].ImageURL)
 	}
 	diag := ai.CalcDiagnostics(sampleMsgs)
 	if diag.MessageCount != 3 || diag.ImageCount != 1 {
