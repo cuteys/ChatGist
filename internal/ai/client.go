@@ -61,6 +61,62 @@ func formatMessageTime(ts int64, defaultStr string) string {
 	return t.Format("2006-01-02 15:04:05")
 }
 
+type ChatDiagnostics struct {
+	MessageCount   int
+	ImageCount     int
+	TextCharCount  int
+	EstimatedBytes int
+}
+
+func (d ChatDiagnostics) Format() string {
+	kb := float64(d.EstimatedBytes) / 1024.0
+	if kb >= 1024.0 {
+		return fmt.Sprintf("消息 %d 条 | 图片 %d 张 | 文本 %d 字 | 约 %.2f MB", d.MessageCount, d.ImageCount, d.TextCharCount, kb/1024.0)
+	}
+	return fmt.Sprintf("消息 %d 条 | 图片 %d 张 | 文本 %d 字 | 约 %.1f KB", d.MessageCount, d.ImageCount, d.TextCharCount, kb)
+}
+
+func CalcDiagnostics(messages []*storage.Message) ChatDiagnostics {
+	diag := ChatDiagnostics{MessageCount: len(messages)}
+	for _, m := range messages {
+		diag.TextCharCount += len([]rune(m.UserName))
+		if imgIdx := strings.Index(m.Content, "data:image/"); imgIdx != -1 {
+			diag.ImageCount++
+			textPart := strings.TrimSpace(m.Content[:imgIdx])
+			diag.TextCharCount += len([]rune(textPart))
+		} else {
+			diag.TextCharCount += len([]rune(m.Content))
+		}
+		diag.EstimatedBytes += len(m.UserName) + len(m.Content) + 64
+	}
+	return diag
+}
+
+// CompactChatMessageParts 将相邻纯文本节点合并为单个文本节点以精简多模态数组开销
+func CompactChatMessageParts(parts []openai.ChatMessagePart) []openai.ChatMessagePart {
+	var compacted []openai.ChatMessagePart
+	var textBuf []string
+	flushText := func() {
+		if len(textBuf) > 0 {
+			compacted = append(compacted, openai.ChatMessagePart{
+				Type: openai.ChatMessagePartTypeText,
+				Text: strings.Join(textBuf, "\n"),
+			})
+			textBuf = nil
+		}
+	}
+	for _, p := range parts {
+		if p.Type == openai.ChatMessagePartTypeText {
+			textBuf = append(textBuf, p.Text)
+		} else {
+			flushText()
+			compacted = append(compacted, p)
+		}
+	}
+	flushText()
+	return compacted
+}
+
 func (c *Client) BuildChatHistoryParts(messages []*storage.Message) []openai.ChatMessagePart {
 	var parts []openai.ChatMessagePart
 
@@ -105,7 +161,7 @@ func (c *Client) BuildChatHistoryParts(messages []*storage.Message) []openai.Cha
 		})
 	}
 
-	return parts
+	return CompactChatMessageParts(parts)
 }
 
 func (c *Client) CallChatModelWithReasoningRetry(ctx context.Context, systemPrompt string, historyParts []openai.ChatMessagePart, userQuestion string) (string, error) {

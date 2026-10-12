@@ -12,14 +12,15 @@ import (
 )
 
 type AdminAlertDetails struct {
-	Scene      string
-	GroupID    string
-	GroupTitle string
-	UserID     string
-	UserName   string
-	MessageID  int64
-	Error      error
-	Payload    string
+	Scene       string
+	GroupID     string
+	GroupTitle  string
+	UserID      string
+	UserName    string
+	MessageID   int64
+	Error       error
+	Payload     string
+	Diagnostics string
 }
 
 func (b *Bot) sanitizeSecrets(text string) string {
@@ -72,6 +73,17 @@ func (b *Bot) notifySuperAdminsError(details AdminAlertDetails) {
 	}
 	if directLink != "" {
 		sb.WriteString(fmt.Sprintf("• 目标对话: %s\n", directLink))
+	}
+	if details.Payload != "" {
+		sanitizedPayload := b.sanitizeSecrets(details.Payload)
+		pRunes := []rune(sanitizedPayload)
+		if len(pRunes) > 300 {
+			sanitizedPayload = string(pRunes[:300]) + "..."
+		}
+		sb.WriteString(fmt.Sprintf("• 请求内容: %s\n", sanitizedPayload))
+	}
+	if details.Diagnostics != "" {
+		sb.WriteString(fmt.Sprintf("• 请求负载: %s\n", details.Diagnostics))
 	}
 	sb.WriteString(fmt.Sprintf("• 发生时间: %s (北京时间)\n\n", timeStr))
 	sb.WriteString("📋 错误信息与堆栈:\n```\n")

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cuteys/ChatGist/internal/ai"
 	"github.com/cuteys/ChatGist/internal/bot"
 	"github.com/cuteys/ChatGist/internal/config"
 	"github.com/cuteys/ChatGist/internal/format"
@@ -223,5 +224,22 @@ func TestFormatAndParsing(t *testing.T) {
 	kb := telegram.GenerateQueryPaginationKeyboard("部署", 1, 3)
 	if kb == nil || len(kb.InlineKeyboard) != 2 {
 		t.Errorf("Expected 2 rows of pagination keyboard, got %v", kb)
+	}
+
+	// 相邻纯文本合并与负载诊断测试
+	aiClient := ai.New(&config.Config{})
+	sampleMsgs := []*storage.Message{
+		{GroupID: "-100999", MessageID: 1, UserName: "Alice", Content: "First text", TimeStamp: 1700000000000},
+		{GroupID: "-100999", MessageID: 2, UserName: "Bob", Content: "Second text", TimeStamp: 1700000005000},
+		{GroupID: "-100999", MessageID: 3, UserName: "Carol", Content: "Photo caption\ndata:image/jpeg;base64,AAAA", TimeStamp: 1700000010000},
+	}
+	parts := aiClient.BuildChatHistoryParts(sampleMsgs)
+	// 前两条纯文本 + 第三条图片前的文字说明应合并为 1 个 text 节点，随后 1 个 image_url 节点，最后 1 个链接 text 节点，共 3 个节点
+	if len(parts) != 3 {
+		t.Errorf("Expected 3 compacted parts (text, image_url, text), got %d", len(parts))
+	}
+	diag := ai.CalcDiagnostics(sampleMsgs)
+	if diag.MessageCount != 3 || diag.ImageCount != 1 {
+		t.Errorf("Unexpected diagnostics: %+v", diag)
 	}
 }

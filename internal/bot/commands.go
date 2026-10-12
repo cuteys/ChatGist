@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cuteys/ChatGist/internal/ai"
 	"github.com/cuteys/ChatGist/internal/format"
 	"github.com/cuteys/ChatGist/internal/storage"
 	"github.com/cuteys/ChatGist/internal/telegram"
@@ -153,14 +154,15 @@ func (b *Bot) handleSummary(msg *telegram.Message) {
 		if err != nil {
 			// 脱敏并将详细堆栈仅推送到管理员私信
 			b.notifySuperAdminsError(AdminAlertDetails{
-				Scene:      "/summary 群聊概括",
-				GroupID:    groupID,
-				GroupTitle: msg.Chat.Title,
-				UserID:     userID,
-				UserName:   getUserDisplayName(msg.From),
-				MessageID:  msg.MessageID,
-				Error:      err,
-				Payload:    quoteNotice,
+				Scene:       "/summary 群聊概括",
+				GroupID:     groupID,
+				GroupTitle:  msg.Chat.Title,
+				UserID:      userID,
+				UserName:    getUserDisplayName(msg.From),
+				MessageID:   msg.MessageID,
+				Error:       err,
+				Payload:     quoteNotice,
+				Diagnostics: ai.CalcDiagnostics(messages).Format(),
 			})
 
 			// 群聊内彻底脱敏，仅反馈安全友好的提示
@@ -274,14 +276,15 @@ func (b *Bot) handleAsk(msg *telegram.Message) {
 
 		if err != nil {
 			b.notifySuperAdminsError(AdminAlertDetails{
-				Scene:      "/ask 提问解答",
-				GroupID:    groupID,
-				GroupTitle: msg.Chat.Title,
-				UserID:     userID,
-				UserName:   getUserDisplayName(msg.From),
-				MessageID:  msg.MessageID,
-				Error:      err,
-				Payload:    question,
+				Scene:       "/ask 提问解答",
+				GroupID:     groupID,
+				GroupTitle:  msg.Chat.Title,
+				UserID:      userID,
+				UserName:    getUserDisplayName(msg.From),
+				MessageID:   msg.MessageID,
+				Error:       err,
+				Payload:     question,
+				Diagnostics: ai.CalcDiagnostics(messages).Format(),
 			})
 
 			if isSafetyBlockError(err) {

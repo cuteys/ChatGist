@@ -92,7 +92,7 @@ func (r *Runner) sanitizeSecrets(text string) string {
 	return res
 }
 
-func (r *Runner) notifySuperAdminsError(scene, groupID, groupName string, err error) {
+func (r *Runner) notifySuperAdminsError(scene, groupID, groupName, diagnostics string, err error) {
 	if len(r.cfg.AdminUserIDs) == 0 || err == nil {
 		return
 	}
@@ -106,8 +106,13 @@ func (r *Runner) notifySuperAdminsError(scene, groupID, groupName string, err er
 	loc := time.FixedZone("CST", 8*3600)
 	timeStr := time.Now().In(loc).Format("2006-01-02 15:04:05")
 
-	text := fmt.Sprintf("🚨 【ChatGist 系统异常告警】\n• 触发场景: %s\n• 发生群组: %s (ID: %s)\n• 发生时间: %s (北京时间)\n\n📋 错误信息与堆栈:\n```\n%s\n```",
-		scene, groupName, groupID, timeStr, sanitizedErr)
+	diagLine := ""
+	if diagnostics != "" {
+		diagLine = fmt.Sprintf("• 请求负载: %s\n", diagnostics)
+	}
+
+	text := fmt.Sprintf("🚨 【ChatGist 系统异常告警】\n• 触发场景: %s\n• 发生群组: %s (ID: %s)\n%s• 发生时间: %s (北京时间)\n\n📋 错误信息与堆栈:\n```\n%s\n```",
+		scene, groupName, groupID, diagLine, timeStr, sanitizedErr)
 
 	for _, adminIDStr := range r.cfg.AdminUserIDs {
 		adminIDStr = strings.TrimSpace(adminIDStr)
@@ -210,7 +215,7 @@ func (r *Runner) executeDailyTasks(ctx context.Context) {
 			cancel()
 			if err != nil {
 				log.Printf("[Cron] Failed to summarize for group %s (%s): %v", g.GroupName, g.GroupID, err)
-				r.notifySuperAdminsError("每日定时总结 (00:00 Cron)", g.GroupID, g.GroupName, err)
+				r.notifySuperAdminsError("每日定时总结 (00:00 Cron)", g.GroupID, g.GroupName, ai.CalcDiagnostics(messages).Format(), err)
 				continue
 			}
 
